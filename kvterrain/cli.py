@@ -42,6 +42,7 @@ def cmd_build(a):
             "width_scale": a.river_width_scale,
             "lake_ramp_radius_m": a.lake_ramp_radius,
             "lake_max_depth_m": a.lake_max_depth,
+            "river_depth_scale": a.river_depth_scale,
         }
         if a.demo:
             water_opts["fetcher"] = _water.synthetic_water_features
@@ -56,11 +57,13 @@ def cmd_build(a):
     print(f"\nwrote {res.tiles_written} tiles to {a.out}  "
           f"range [{res.height_min:.1f}, {res.height_max:.1f}] m")
     if a.water:
-        wm = res.manifest.get("water", {})
-        print(f"  + water: {wm.get('lake_count', 0)} lakes, "
-              f".water tiles alongside every .r16 (© NVE)")
-        print(f"  + synthetic lake beds: radius {a.lake_ramp_radius:.1f} m, "
-              f"max depth {a.lake_max_depth:.1f} m")
+        wm = res.manifest.get("water_surface", {})
+        print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
+              f".wsurf tiles alongside every .r16 (© NVE)")
+        print(f"  + lake beds carved flat {a.lake_max_depth:.1f} m below the known "
+              f"NVE surface (bevel radius {a.lake_ramp_radius:.1f} m)")
+        print(f"  + river surface raised above the DTM channel by stream order "
+              f"(× {a.river_depth_scale:g})")
 
 
 def cmd_validate(a):
@@ -125,6 +128,9 @@ def main(argv=None):
     b.add_argument("--water", action="store_true")
     b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
     b.add_argument("--river-width-scale", type=float, default=1.0, dest="river_width_scale")
+    b.add_argument("--river-depth-scale", type=float, default=1.0, dest="river_depth_scale",
+                   help="scales how far river surfaces sit above the DTM channel bed "
+                        "(per stream order); >1 = deeper/more opaque rivers")
     b.add_argument("--lake-ramp-radius", type=float, default=10.0, dest="lake_ramp_radius",
                    help="shore-to-max-depth distance in metres for synthetic lake beds")
     b.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",

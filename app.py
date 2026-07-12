@@ -60,7 +60,7 @@ with st.sidebar:
     st.subheader("Water (NVE)")
     want_water = st.toggle("Fetch rivers & lakes", value=True,
                            help="Also fetch NVE Elvenett + Innsjødatabase and write a "
-                                ".water mask tile beside every height tile.")
+                                ".wsurf water-surface tile beside every height tile.")
     main_rivers = st.toggle("Include main rivers (hovedelv) for size", value=True,
                             disabled=not want_water,
                             help="Second pass that upgrades main-river size class.")
@@ -68,6 +68,14 @@ with st.sidebar:
                                   disabled=not want_water,
                                   help="Scales modelled channel widths → how many "
                                        "pixels each river seeds.")
+    river_depth_scale = st.slider("River surface raise ×", 0.25, 4.0, 1.0, 0.25,
+                                  disabled=not want_water,
+                                  help="Scales how far each river's surface sits above "
+                                       "the DTM channel bed (by stream order). Rivers "
+                                       "aren't carved, so this is what gives them visible "
+                                       "depth/opacity — bigger fills the incised channel "
+                                       "and reads more solid. Sized like the lake carve so "
+                                       "it survives the renderer's height compression.")
     lake_ramp_radius = st.slider("Lake shore bevel (m)", 0.5, 40.0, 10.0, 0.5,
                                  disabled=not want_water,
                                  help="Width of the shore bevel where the lake bed "
@@ -145,11 +153,13 @@ with col_info:
         ox, oy = plan.origin_x, plan.origin_y
         st.caption(f"SW origin (UTM): {ox:,.1f}, {oy:,.1f}")
         if want_water:
-            water_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 5 / 1e6
-            st.caption(f"+ water: {plan.total_tiles()} .water tiles "
-                       f"(≈ {water_mb:,.1f} MB, 5 bytes/sample) from NVE")
+            wsurf_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 2 / 1e6
+            st.caption(f"+ water surface: {plan.total_tiles()} .wsurf tiles "
+                       f"(≈ {wsurf_mb:,.1f} MB, u16) from NVE")
             st.caption(f"+ lake beds carved flat {lake_max_depth:.0f} m below the "
                        f"known NVE surface ({lake_ramp_radius:.0f} m shore bevel)")
+            st.caption(f"+ river surfaces raised above the DTM channel by stream "
+                       f"order (× {river_depth_scale:g})")
         if plan.fetch_pixels() > 60_000 * 60_000:
             st.warning("Very large area — consider the bulk DTM1 download instead.")
 
@@ -195,9 +205,9 @@ if go and plan is not None:
         # ---- water pass runs BEFORE the height pyramid is built -----------
         # Lakes/rivers must exist so the bed can be carved and the water-surface
         # field computed against `leaf` before build_pyramid() locks it in.
-        water_levels = None
         water_leaf = None
         surface_levels = None
+        lake_count = 0
         if want_water:
             prog.progress(0.99, text="fetching + rasterising rivers & lakes…")
             from kvterrain import water as kvwater
@@ -209,6 +219,7 @@ if go and plan is not None:
                          plan, include_main_rivers=main_rivers))
             water_leaf = kvwater.rasterize_water(
                 plan, feats, width_scale=river_width_scale)
+            lake_count = len(water_leaf.lake_table)
 
             lake_surf = water_leaf.lake_surface_moh()          # NVE hoyde
             leaf = bathymetry.carve_lake_beds(
@@ -217,14 +228,16 @@ if go and plan is not None:
                 plan.spacing_m,
                 surface_moh=lake_surf,
                 carve_depth_m=lake_max_depth,
+                ramp_radius_m=lake_ramp_radius,
             )
-            # Unified per-pixel water surface (lakes = hoyde, rivers = DTM-estimated).
+            # Unified per-pixel water surface: lakes = authoritative NVE hoyde,
+            # rivers = leaf-DTM bed raised by stream order (× river_depth_scale) so
+            # they sit visibly above the incised channel instead of at terrain height.
             river_surf = kvws.river_surface_moh(
-                plan, feats, water_leaf, leaf, lake_surface=lake_surf)
+                plan, feats, water_leaf, leaf,
+                depth_scale=river_depth_scale, lake_surface=lake_surf)
             water_surface = kvws.combine_water_surface(lake_surf, river_surf)
             surface_levels = kvws.build_surface_pyramid(water_surface, plan.num_levels)
-
-            water_levels = kvwater.build_water_pyramid(water_leaf, plan.num_levels)
 
         prog.progress(1.0, text="building pyramid + slicing tiles…")
         levels = core.build_pyramid(leaf, plan.num_levels)
@@ -233,21 +246,18 @@ if go and plan is not None:
                                 height_min=hmin, height_max=hmax,
                                 source_kind=source_kind)
 
-        if water_levels is not None:
-            from kvterrain import water as kvwater
-            wres = kvwater.export_water_tiles(plan, water_levels, out_dir,
-                                              width_scale=river_width_scale)
-            res.manifest["water"] = wres.water_manifest
-            res.manifest["water"]["synthetic_lake_bathymetry"] = {
-                "enabled": True,
-                "carve_depth_m": float(lake_max_depth),
-                "method": "flat_below_known_surface_with_shore_bevel",
-            }
         if surface_levels is not None:
             from kvterrain import watersurface as kvws
-            res.manifest["water_surface"] = kvws.export_surface_tiles(
+            wsurf = kvws.export_surface_tiles(
                 plan, surface_levels, out_dir, res.height_min, res.height_max)
-        if water_levels is not None or surface_levels is not None:
+            wsurf["lake_count"] = lake_count
+            wsurf["lake_bathymetry"] = {
+                "enabled": True,
+                "carve_depth_m": float(lake_max_depth),
+                "shore_bevel_m": float(lake_ramp_radius),
+                "method": "flat_below_known_surface_with_shore_bevel",
+            }
+            res.manifest["water_surface"] = wsurf
             with open(os.path.join(out_dir, "manifest.json"), "w") as _f:
                 json.dump(res.manifest, _f, indent=2)
 
@@ -265,28 +275,33 @@ if go and plan is not None:
         coarse = levels[-1]
         norm = np.clip((coarse - res.height_min) /
                        max(res.height_max - res.height_min, 1e-6), 0, 1)
-        prev_cols = st.columns(2) if water_levels is not None else [st]
+        have_water = want_water and water_leaf is not None
+        prev_cols = st.columns(2) if have_water else [st]
         prev_cols[0].image(np.nan_to_num(norm), caption="Height root (coarsest)",
                            clamp=True, width=260)
 
-        if water_levels is not None:
-            wc = water_levels[-1]
-            rgb = np.zeros((*wc.type.shape, 3), dtype=np.float32)
-            rgb[wc.type == kvwater.TYPE_LAKE] = (0.10, 0.35, 0.85)
-            rmask = wc.type == kvwater.TYPE_RIVER
-            inten = 0.4 + 0.6 * (wc.weight.astype(np.float32) / 8.0)
+        if have_water:
+            from kvterrain import water as kvwater
+            # Preview straight from the leaf masks (the categorical pyramid is gone);
+            # stride down so the thumbnail stays small on big regions.
+            stride = max(1, max(water_leaf.type.shape) // 480)
+            wtype = water_leaf.type[::stride, ::stride]
+            wweight = water_leaf.weight[::stride, ::stride]
+            rgb = np.zeros((*wtype.shape, 3), dtype=np.float32)
+            rgb[wtype == kvwater.TYPE_LAKE] = (0.10, 0.35, 0.85)
+            rmask = wtype == kvwater.TYPE_RIVER
+            inten = 0.4 + 0.6 * (wweight.astype(np.float32) / 8.0)
             rgb[..., 0][rmask] = 0.0
             rgb[..., 1][rmask] = 0.7 * inten[rmask]
             rgb[..., 2][rmask] = 1.0 * inten[rmask]
-            prev_cols[1].image(np.clip(rgb, 0, 1), caption="Water root (blue=lake, cyan=river)",
+            prev_cols[1].image(np.clip(rgb, 0, 1), caption="Water (blue=lake, cyan=river)",
                                clamp=True, width=260)
-            wm = res.manifest["water"]
-            st.caption(f"Water: {wm['lake_count']} lake(s); .water tiles "
-                       f"(5 bytes/sample: type,weight,flow,lake_id) beside every "
-                       f".r16. {kvwater.WATER_ATTRIBUTION}.")
-            st.caption(f"Water surface: per-pixel .wsurf tiles (moh); lakes from NVE "
-                       f"hoyde, rivers DTM-estimated. Bed carved {lake_max_depth:.0f} m "
-                       f"below surface ({lake_ramp_radius:.0f} m bevel).")
+            st.caption(f"Water surface: {lake_count} lake(s); per-pixel .wsurf tiles "
+                       f"(u16 m.o.h.) beside every .r16. Lakes use NVE hoyde; rivers "
+                       f"sit on the DTM channel raised by stream order "
+                       f"(× {river_depth_scale:g}). {kvwater.WATER_ATTRIBUTION}.")
+            st.caption(f"Lake beds carved flat {lake_max_depth:.0f} m below the known "
+                       f"NVE surface ({lake_ramp_radius:.0f} m shore bevel).")
 
         st.download_button("Download tiles + manifest (zip)", buf,
                            file_name="kvterrain_tiles.zip", mime="application/zip")

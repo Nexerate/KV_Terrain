@@ -47,11 +47,22 @@ TYPE_LAKE = kvwater.TYPE_LAKE     # 2
 
 # How far the river surface sits above its (already-incised) bed, in metres, by
 # Strahler order. Rivers are NOT carved — the DTM already contains the channel and
-# ravine — so this bump is the ONLY thing that gives a river visible depth
-# (depth = surface - terrain). Sized to the runtime's depth-fade so bigger rivers
-# render more opaque: order 1 -> 1 m, 2 -> 2 m, 3+ -> 3 m (depth_for_order clamps any
-# order above the table's max to the max, so orders 4-8 also get 3 m).
-DEFAULT_DEPTH_BY_ORDER = {1: 1.0, 2: 2.0, 3: 3.0}
+# ravine — so this raise is the ONLY thing that gives a river visible depth
+# (depth = surface - terrain), and it must clear the renderer's opaque threshold.
+#
+# Sizing rationale (mirrors the lake carve, which uses ~20 m real so it survives a
+# 1:5 vertical compression -> ~4 units and reads opaque): a 1-3 m raise was far
+# below that threshold, so rivers rendered essentially transparent — the symptom
+# that motivated this table. The raise now ramps with stream order so big rivers,
+# which sit in deep incised channels, fill those channels and read solidly opaque,
+# while small streams (shallow/no channel) get just a few metres and don't balloon
+# a wide sheet of water over flat ground. depth_for_order clamps any order beyond
+# the table ends, so orders past 8 also get the order-8 value. The whole table is
+# multiplied by `depth_scale` (UI "River surface raise ×" / CLI --river-depth-scale)
+# for per-renderer tuning without editing code.
+DEFAULT_DEPTH_BY_ORDER = {
+    1: 3.0, 2: 4.5, 3: 6.0, 4: 8.0, 5: 11.0, 6: 14.0, 7: 18.0, 8: 22.0,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -307,9 +318,9 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
                          hmin: float, hmax: float, *, writer=None) -> dict:
     """
     Slice every surface pyramid level into (tile_cells+1)² tiles and write each as a
-    raw little-endian u16 `.wsurf` array beside the matching `.r16`/`.water` tile.
-    Returns a manifest fragment describing the encoding. Mirrors export_water_tiles'
-    tiling exactly so files line up 1:1.
+    raw little-endian u16 `.wsurf` array beside the matching `.r16` tile.
+    Returns a manifest fragment describing the encoding. Uses the same
+    core.north_up_tile_slice tiling as the height export so files line up 1:1.
     """
     TC = plan.tile_cells
     TS = TC + 1
@@ -333,7 +344,7 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
                 write(os.path.join(out_dir, rel), packed)
                 tiles_written += 1
 
-    return {
+    manifest = {
         "tile_suffix": ".wsurf",
         "dtype": "u16le",
         "packing": "same [height_min_m, height_max_m] as .r16, mapped to [0,65534]",
@@ -343,5 +354,13 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
         "runtime": "surface = (code==65535) ? NO_WATER : height_min_m + code/65534*(height_max_m-height_min_m); "
                    "depth = max(0, surface - terrain_height). Unifies lakes and rivers; "
                    "no rim scan, no rain-fill, valid across terrain edits.",
+        "lake_surface": "authoritative NVE hoyde (metres above sea level)",
+        "river_surface": "leaf-DTM bed + a raise by stream order (see river_raise_by_order_m), "
+                         "so depth = raise everywhere along a channel; pinned to the lake "
+                         "surface where a river meets a lake.",
+        "river_raise_by_order_m": {str(k): v for k, v in DEFAULT_DEPTH_BY_ORDER.items()},
         "tiles_written": tiles_written,
     }
+    # Provenance for the NVE-derived water (no .water tile carries it any more).
+    manifest.update(kvwater.water_source_manifest())
+    return manifest

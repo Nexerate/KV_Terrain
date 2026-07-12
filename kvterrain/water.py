@@ -4,11 +4,23 @@ kvterrain.water
 
 River + lake water masks aligned pixel-for-pixel with the R16 height tiles.
 
-Goal: instead of seeding a hydraulic simulation from *every* terrain pixel, seed
-only where water actually is. This module fetches NVE's national hydrology
-vectors, rasterises them onto the SAME corner-centered sample lattice the height
-pipeline uses (`core.GridPlan`), builds the same quad-tree pyramid, and writes a
-companion `.water` tile next to every `.r16` height tile.
+This module fetches NVE's national hydrology vectors and rasterises them onto the
+SAME corner-centered sample lattice the height pipeline uses (`core.GridPlan`).
+The result is an in-memory `WaterGrid` (per-pixel `type`, river `weight`, and
+`lake_id` + `lake_table`) that downstream passes consume:
+
+  * `bathymetry.carve_lake_beds`  reads `type` to carve lake bowls, and
+  * `watersurface`                reads `type` + `weight` (stream order) and
+                                  `lake_surface_moh()` to build the per-pixel
+                                  `.wsurf` water-surface field that is actually
+                                  written to disk.
+
+There is NO on-disk `.water` tile any more. The runtime consumes water purely as
+the `.wsurf` surface-elevation field (depth = max(0, surface - terrain)); the old
+categorical `.water` record (type/weight/flow/lake_id) and its quad-tree pyramid
+have been removed. `weight` (stream order) is still carried in memory because the
+river surface raise is sized by it; the old `flow` bearing byte is gone with the
+tile it served.
 
 Sources (open data, ArcGIS REST MapServers — same service family as the height
 ImageServer, so we query them the same way and let the server reproject to the
@@ -22,24 +34,13 @@ plan's UTM zone via `outSR`):
 * Lakes — NVE **Innsjødatabase**, ~243k lake polygons; lakes > 2500 m² carry a
   unique national number (løpenummer).
 
-What each `.water` sample encodes (see WATER_DTYPE): a water `type`
-(land/river/lake), a river `weight` (relative size, from stream order), a river
-`flow` bearing (for bootstrapping the sim's velocity field), and a `lake_id`
-(local index into a per-export lake table, so the sim can treat all samples of
-one lake as a single body without its own flood-fill).
-
 Conventions match core.py exactly: corner-centered ("pixel is a point"), one
-assembled array then sliced into shared-edge tiles, north-up rows. Categorical
-data can't be [1 2 1]-averaged, so the pyramid uses a **winner-take-all**
-decimation (lake > river > land; among rivers the largest wins) centered on the
-retained even vertex — same registration guarantee as the height decimation, but
-it never lets a thin river evaporate at coarse levels.
+assembled array sliced into shared-edge tiles, north-up rows.
 
 Field/attribute names on the live services are not contractually stable; every
-attribute read here is *optional* and the pipeline degrades gracefully (flow is
-derived from geometry, size falls back to a main/minor split). Endpoints, layer
-indices and candidate field names are constants below — adjust if NVE renames
-things.
+attribute read here is *optional* and the pipeline degrades gracefully (size
+falls back to a main/minor split). Endpoints, layer indices and candidate field
+names are constants below — adjust if NVE renames things.
 
 Data © NVE (Elvenett / Innsjødatabase).
 """
@@ -47,7 +48,6 @@ Data © NVE (Elvenett / Innsjødatabase).
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -107,15 +107,7 @@ TYPE_LAND = 0
 TYPE_RIVER = 1
 TYPE_LAKE = 2
 
-# One packed little-endian record per sample, itemsize 5. numpy keeps this
-# unpadded (align=False), so `.tofile()` yields a raw headerless 5-byte stride
-# your terrain system can read as: type,u8 | weight,u8 | flow,u8 | lake_id,u16le.
-WATER_DTYPE = np.dtype(
-    [("type", "u1"), ("weight", "u1"), ("flow", "u1"), ("lake_id", "<u2")]
-)
-assert WATER_DTYPE.itemsize == 5
-
-# Relative river size -> full channel width in metres. `weight` stored per sample
+# Relative river size -> full channel width in metres. `weight` carried per sample
 # IS the stream order (clamped 1..255); this table only drives how wide the
 # centerline is buffered before rasterising, so bigger rivers seed more pixels.
 DEFAULT_WIDTH_BY_ORDER = {
@@ -123,16 +115,6 @@ DEFAULT_WIDTH_BY_ORDER = {
 }
 DEFAULT_ORDER_MAIN = 5      # assumed order for a 'hovedelv' segment lacking an order attr
 DEFAULT_ORDER_MINOR = 2     # assumed order for an 'elvenett' segment lacking an order attr
-
-
-def encode_bearing(deg: float) -> int:
-    """Compass bearing (0°=N, clockwise) -> uint8 [0,255]  (byte * 360/256 = deg)."""
-    return int(round((deg % 360.0) / 360.0 * 256.0)) % 256
-
-
-def decode_bearing(byte: int) -> float:
-    """uint8 flow byte -> compass bearing in degrees (inverse of encode_bearing)."""
-    return (byte / 256.0) * 360.0
 
 
 def order_to_width_m(order: int, width_by_order: dict, scale: float) -> float:
@@ -173,10 +155,14 @@ class WaterFeatures:
 
 @dataclass
 class WaterGrid:
-    """North-up assembled masks, shape (SY, SX) each; lake_table maps id->info."""
+    """North-up assembled masks, shape (SY, SX) each; lake_table maps id->info.
+
+    `weight` is the per-pixel river stream order (clamped 1..255; 0 off-river),
+    which `watersurface` reads to size the river-surface raise. The old `flow`
+    bearing byte was dropped together with the `.water` tile it served.
+    """
     type: np.ndarray           # u1
     weight: np.ndarray         # u1
-    flow: np.ndarray           # u1
     lake_id: np.ndarray        # u2
     lake_table: dict           # {local_id:int -> {lopenr,navn,area_m2,hoyde_moh}}
 
@@ -430,7 +416,7 @@ def rasterize_water(
     """
     Rasterise rivers (buffered by size) and lakes onto the leaf (SY,SX) grid.
     Priority at overlaps is lake > river; among rivers the larger (higher order)
-    wins, and its flow bearing/weight are the ones kept.
+    wins, and its weight (stream order) is the one kept.
     """
     from shapely.geometry import LineString, Polygon
     from rasterio.features import rasterize
@@ -442,9 +428,10 @@ def rasterize_water(
 
     # ---- rivers -----------------------------------------------------------
     # One shapely polygon per sub-segment (each straight piece between two
-    # vertices), so flow bearing is piecewise-exact along a meandering river.
+    # vertices) buffered to the channel width, so a meandering river is covered
+    # piece-by-piece. Only `weight` (stream order) is burned now — the surface
+    # raise downstream is sized by it; flow bearing is no longer produced.
     weight_shapes = []   # (polygon, order)
-    flow_shapes = []     # (polygon, flow_byte)
     for seg in feats.rivers:
         xy = seg.xy
         if xy.shape[0] < 2:
@@ -455,26 +442,19 @@ def rasterize_water(
             (x0, y0), (x1, y1) = xy[k], xy[k + 1]
             if x0 == x1 and y0 == y1:
                 continue
-            # compass bearing: 0°=N, clockwise. dx=E, dy=N.
-            bearing = math.degrees(math.atan2(x1 - x0, y1 - y0)) % 360.0
             poly = LineString([(x0, y0), (x1, y1)]).buffer(
                 half, cap_style=2, join_style=2)  # flat caps, mitre joins
             if poly.is_empty:
                 continue
             weight_shapes.append((poly, int(seg.order)))
-            flow_shapes.append((poly, encode_bearing(bearing)))
 
     # Burn larger rivers LAST so they win (rasterize is last-write per pixel).
     order_sort = np.argsort([w for _, w in weight_shapes], kind="stable") \
         if weight_shapes else np.array([], dtype=int)
     weight_arr = np.zeros(shape, dtype=np.uint8)
-    flow_arr = np.zeros(shape, dtype=np.uint8)
     if len(order_sort):
         w_sorted = [weight_shapes[i] for i in order_sort]
-        f_sorted = [flow_shapes[i] for i in order_sort]
         rasterize(w_sorted, out=weight_arr, transform=transform,
-                  all_touched=all_touched_rivers, merge_alg=_replace())
-        rasterize(f_sorted, out=flow_arr, transform=transform,
                   all_touched=all_touched_rivers, merge_alg=_replace())
 
     type_arr = np.where(weight_arr > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
@@ -513,13 +493,12 @@ def rasterize_water(
                   all_touched=False, merge_alg=_replace())
 
     # lake > river priority: where a lake covers a sample, it's a lake, and the
-    # river bytes there are cleared (decoder reads them only when type==RIVER).
+    # river weight there is cleared (weight is read only when type==RIVER).
     lake_mask = lake_id_arr > 0
     type_arr[lake_mask] = TYPE_LAKE
     weight_arr[lake_mask] = 0
-    flow_arr[lake_mask] = 0
 
-    return WaterGrid(type_arr, weight_arr, flow_arr, lake_id_arr, lake_table)
+    return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table)
 
 
 def _replace():
@@ -528,140 +507,16 @@ def _replace():
 
 
 # --------------------------------------------------------------------------- #
-# Pyramid: winner-take-all decimation, centered on retained even vertices      #
+# Water source description (for the .wsurf manifest; no .water tiles are written)
 # --------------------------------------------------------------------------- #
 
-def decimate_water_corner(g: WaterGrid) -> WaterGrid:
+def water_source_manifest(width_scale: float = 1.0) -> dict:
     """
-    Downsample categorical water masks (SY,SX)->(SY/2+1,SX/2+1) keeping, in the
-    3x3 neighbourhood centered on each retained even vertex, the highest-priority
-    feature: lake beats river beats land; among rivers the largest weight wins and
-    carries its own flow bearing. Parent sample (i,j) lands exactly on child
-    (2i,2j) — same registration as core.decimate_corner — but thin rivers survive.
+    Metadata describing where the water masks came from and how rivers were
+    buffered. The runtime no longer reads a `.water` tile — this just travels in
+    the manifest beside the `.wsurf` (water_surface) section for provenance.
     """
-    T, W, F, L = g.type, g.weight, g.flow, g.lake_id
-    SY, SX = T.shape
-    PY = (SY - 1) // 2 + 1
-    PX = (SX - 1) // 2 + 1
-    rc = 2 * np.arange(PY)
-    cc = 2 * np.arange(PX)
-
-    Ts, Ws, Fs, Ls = [], [], [], []
-    for di in (-1, 0, 1):
-        r = np.clip(rc + di, 0, SY - 1)
-        for dj in (-1, 0, 1):
-            c = np.clip(cc + dj, 0, SX - 1)
-            sel = np.ix_(r, c)
-            Ts.append(T[sel]); Ws.append(W[sel]); Fs.append(F[sel]); Ls.append(L[sel])
-    T9 = np.stack(Ts); W9 = np.stack(Ws); F9 = np.stack(Fs); L9 = np.stack(Ls)  # (9,PY,PX)
-
-    lake_present = (T9 == TYPE_LAKE).any(0)
-    lake_id_max = np.where(T9 == TYPE_LAKE, L9, 0).max(0).astype(np.uint16)
-
-    river_present = (T9 == TYPE_RIVER).any(0)
-    # rank rivers by weight; non-river neighbours score -1 so they never win.
-    river_rank = np.where(T9 == TYPE_RIVER, W9.astype(np.int16), -1)
-    pick = np.argmax(river_rank, axis=0)                       # (PY,PX)
-    picked_w = np.take_along_axis(W9, pick[None], 0)[0]
-    picked_f = np.take_along_axis(F9, pick[None], 0)[0]
-
-    out_T = np.zeros((PY, PX), np.uint8)
-    out_W = np.zeros((PY, PX), np.uint8)
-    out_F = np.zeros((PY, PX), np.uint8)
-    out_L = np.zeros((PY, PX), np.uint16)
-
-    out_T[river_present] = TYPE_RIVER
-    out_W[river_present] = picked_w[river_present]
-    out_F[river_present] = picked_f[river_present]
-
-    out_T[lake_present] = TYPE_LAKE
-    out_L[lake_present] = lake_id_max[lake_present]
-    out_W[lake_present] = 0
-    out_F[lake_present] = 0
-
-    return WaterGrid(out_T, out_W, out_F, out_L, g.lake_table)
-
-
-def build_water_pyramid(leaf: WaterGrid, num_levels: int) -> list:
-    levels = [leaf]
-    cur = leaf
-    for _ in range(1, num_levels):
-        cur = decimate_water_corner(cur)
-        levels.append(cur)
-    return levels
-
-
-# --------------------------------------------------------------------------- #
-# Slice + pack: cut each level into (tile_cells+1)^2 .water tiles              #
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class WaterPackResult:
-    tiles_written: int
-    lake_count: int
-    water_manifest: dict
-
-
-def _pack_tile(g: WaterGrid, r0: int, c0: int, TS: int) -> np.ndarray:
-    rec = np.zeros((TS, TS), dtype=WATER_DTYPE)
-    sl = (slice(r0, r0 + TS), slice(c0, c0 + TS))
-    rec["type"] = g.type[sl]
-    rec["weight"] = g.weight[sl]
-    rec["flow"] = g.flow[sl]
-    rec["lake_id"] = g.lake_id[sl]
-    return rec
-
-
-def export_water_tiles(
-    plan: core.GridPlan, levels: list, out_dir: str, *,
-    width_scale: float = 1.0, writer: Optional[Callable[[str, np.ndarray], None]] = None,
-) -> WaterPackResult:
-    """
-    Slice every water pyramid level into (tile_cells+1)² tiles with shared edges
-    and write each as a raw little-endian `.water` record array. Returns the
-    manifest section describing the encoding + the per-export lake table.
-    `writer(path, record_array)` is injectable for tests.
-    """
-    TC = plan.tile_cells
-    TS = TC + 1
-
-    def _default_writer(path: str, rec: np.ndarray) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        rec.tofile(path)
-
-    write = writer or _default_writer
-
-    manifest_levels = []
-    tiles_written = 0
-    for lvl, g in enumerate(levels):
-        spacing = plan.spacing_m * (2 ** lvl)
-        tiles_x = max(1, plan.leaf_tiles_x // (2 ** lvl))
-        tiles_y = max(1, plan.leaf_tiles_y // (2 ** lvl))
-        SY = g.type.shape[0]
-
-        level_entry = {
-            "level": lvl, "spacing_m": spacing,
-            "tiles_x": tiles_x, "tiles_y": tiles_y, "tile_samples": TS, "tiles": [],
-        }
-        for ty in range(tiles_y):
-            for tx in range(tiles_x):
-                r0, c0, _ = core.north_up_tile_slice(SY, TC, tx, ty)
-                rec = _pack_tile(g, r0, c0, TS)
-                rel = f"L{lvl}/{tx}_{ty}.water"
-                write(os.path.join(out_dir, rel), rec)
-                tiles_written += 1
-                bx0 = plan.origin_x + tx * TC * spacing
-                by0 = plan.origin_y + ty * TC * spacing
-                level_entry["tiles"].append({
-                    "x": tx, "y": ty,
-                    "key": core.quadkey(lvl, tx, ty, plan.num_levels),
-                    "file": rel,
-                    "bbox_utm": [bx0, by0, bx0 + TC * spacing, by0 + TC * spacing],
-                })
-        manifest_levels.append(level_entry)
-
-    lake_table = levels[0].lake_table
-    water_manifest = {
+    return {
         "attribution": WATER_ATTRIBUTION,
         "license": WATER_LICENSE,
         "sources": {
@@ -669,77 +524,15 @@ def export_water_tiles(
                       f"{RIVER_LAYER_MAIN} hovedelv)",
             "lakes": f"{LAKE_SERVICE} (layer {LAKE_LAYER} Innsjodatabase)",
         },
-        "tile_suffix": ".water",
-        "record_bytes": WATER_DTYPE.itemsize,
-        "record_layout": [
-            {"name": "type", "type": "u8",
-             "values": {"0": "land", "1": "river", "2": "lake"}},
-            {"name": "weight", "type": "u8",
-             "meaning": "river stream order (relative size); 0 unless type==river"},
-            {"name": "flow", "type": "u8",
-             "meaning": "river flow bearing; degrees = flow*360/256, 0=N clockwise; "
-                        "valid only when type==river"},
-            {"name": "lake_id", "type": "u16le",
-             "meaning": "local index into lake_table; 0 unless type==lake"},
-        ],
-        "row_order": "north_to_south",
-        "byte_order": "little_endian",
         "width_model": {
             "note": "centerline buffered to this FULL width (m) by stream order, "
-                    "then scaled; drives pixel coverage only, not 'weight'.",
+                    "then scaled; drives pixel coverage only.",
             "scale": width_scale,
             "width_by_order_m": DEFAULT_WIDTH_BY_ORDER,
             "default_order_main": DEFAULT_ORDER_MAIN,
             "default_order_minor": DEFAULT_ORDER_MINOR,
         },
-        "lake_count": len(lake_table),
-        "lake_table": {str(k): v for k, v in lake_table.items()},
-        "lake_surface": {
-            "field": "hoyde_moh",
-            "units": "metres_above_sea_level",
-            "source": f"{LAKE_SERVICE} (layer {LAKE_LAYER} Innsjodatabase, attr 'hoyde')",
-            "runtime": "for a lake pixel, water surface = lake_table[lake_id].hoyde_moh; "
-                       "depth = max(0, hoyde_moh - terrain_height). No rim discovery or "
-                       "fill is required. null => surface unknown for that lake (rare); "
-                       "the export's carved bed still defines a usable surface via the "
-                       "shore-estimate fallback.",
-        },
-        "levels": manifest_levels,
     }
-    return WaterPackResult(tiles_written, len(lake_table), water_manifest)
-
-
-# --------------------------------------------------------------------------- #
-# One-shot convenience (called by core.run_export when include_water=True)      #
-# --------------------------------------------------------------------------- #
-
-def run_water_export(
-    plan: core.GridPlan, out_dir: str, *,
-    fetcher: Optional[WaterFetcher] = None,
-    features: Optional[WaterFeatures] = None,
-    include_main_rivers: bool = True,
-    width_scale: float = 1.0,
-    width_by_order: Optional[dict] = None,
-    writer: Optional[Callable[[str, np.ndarray], None]] = None,
-    progress: Optional[Callable[[int, int, str], None]] = None,
-) -> dict:
-    """
-    Fetch (or accept) water features, rasterise to the leaf grid, build the
-    pyramid, write `.water` tiles, and return the manifest 'water' section.
-    """
-    if features is None:
-        if fetcher is not None:
-            features = fetcher(plan)
-        else:
-            features = fetch_water_features(
-                plan, include_main_rivers=include_main_rivers, progress=progress)
-
-    leaf = rasterize_water(plan, features,
-                           width_by_order=width_by_order, width_scale=width_scale)
-    levels = build_water_pyramid(leaf, plan.num_levels)
-    res = export_water_tiles(plan, levels, out_dir,
-                             width_scale=width_scale, writer=writer)
-    return res.water_manifest
 
 
 # --------------------------------------------------------------------------- #
@@ -753,7 +546,7 @@ def synthetic_water_features(plan: core.GridPlan) -> WaterFeatures:
     lake sits near the centre.
     """
     x0, y0, x1, y1 = plan.bbox_utm
-    # Diagonal river SW->NE (flow to the NE), a few vertices so bearing varies.
+    # Diagonal river SW->NE, a few vertices so it meanders across the region.
     river = RiverSeg(
         xy=np.array([
             [x0 + 0.10 * (x1 - x0), y0 + 0.10 * (y1 - y0)],

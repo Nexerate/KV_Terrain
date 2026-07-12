@@ -452,8 +452,10 @@ def run_export(
     leaf = assemble_region(plan, fetcher, server_url,
                            max_fetch_px=max_fetch_px, progress=progress)
 
-    water_section = None
     surface_levels = None
+    lake_count = 0
+    carve_depth_m = 0.0
+    bevel_px = 0
     if include_water:
         from . import water, bathymetry, watersurface
         opts = dict(water_opts or {})
@@ -466,18 +468,21 @@ def run_export(
             bevel_px = max(1, int(round(float(opts.pop("lake_ramp_radius_m")) / plan.spacing_m)))
         depth_scale = float(opts.pop("river_depth_scale", 1.0))
 
+        # Pop the rasterise-only keys so they never leak into fetch_water_features
+        # (which doesn't accept them). What remains in `opts` is fetch kwargs only.
+        raster_opts = {}
+        for k in ("width_by_order", "width_scale", "all_touched_rivers"):
+            if k in opts:
+                raster_opts[k] = opts.pop(k)
+
         if features is None:
             if fetcher_water is not None:
                 features = fetcher_water(plan)
             else:
                 features = water.fetch_water_features(plan, progress=progress, **opts)
 
-        raster_opts = {}
-        for k in ("width_by_order", "width_scale", "all_touched_rivers"):
-            if k in opts:
-                raster_opts[k] = opts[k]
-
         water_leaf = water.rasterize_water(plan, features, **raster_opts)
+        lake_count = len(water_leaf.lake_table)
         lake_surf = water_leaf.lake_surface_moh()          # authoritative NVE hoyde
         leaf = bathymetry.carve_lake_beds(
             leaf,
@@ -487,23 +492,14 @@ def run_export(
             carve_depth_m=carve_depth_m,
             bevel_px=bevel_px,
         )
-        # Unified water surface (lakes = hoyde, rivers = DTM-estimated along channel),
-        # then its water-only pyramid. Rivers sample the *leaf* bed, so this must run
-        # on `leaf` before the height pyramid is built.
+        # Unified water surface (lakes = NVE hoyde, rivers = leaf-DTM bed + a raise
+        # by stream order), then its water-only pyramid. Rivers sample the *leaf*
+        # bed, so this must run on `leaf` before the height pyramid is built.
         river_surf = watersurface.river_surface_moh(
             plan, features, water_leaf, leaf,
             depth_scale=depth_scale, lake_surface=lake_surf)
         water_surface = watersurface.combine_water_surface(lake_surf, river_surf)
         surface_levels = watersurface.build_surface_pyramid(water_surface, plan.num_levels)
-
-        water_levels = water.build_water_pyramid(water_leaf, plan.num_levels)
-        wres = water.export_water_tiles(
-            plan,
-            water_levels,
-            out_dir,
-            width_scale=float(opts.get("width_scale", 1.0)),
-        )
-        water_section = wres.water_manifest
 
     levels = build_pyramid(leaf, plan.num_levels)
     res = export_tiles(plan, levels, out_dir,
@@ -511,15 +507,20 @@ def run_export(
                        height_min=height_min, height_max=height_max,
                        source_kind=source_kind)
 
-    if water_section is not None:
-        res.manifest["water"] = water_section
     if surface_levels is not None:
         # .wsurf packs on the SAME [height_min, height_max] as the .r16 tiles, so it
         # can only be written now that export_tiles has finalised that range.
         from . import watersurface
-        res.manifest["water_surface"] = watersurface.export_surface_tiles(
+        wsurf = watersurface.export_surface_tiles(
             plan, surface_levels, out_dir, res.height_min, res.height_max)
-    if water_section is not None or surface_levels is not None:
+        wsurf["lake_count"] = lake_count
+        wsurf["lake_bathymetry"] = {
+            "enabled": True,
+            "carve_depth_m": float(carve_depth_m),
+            "bevel_px": int(bevel_px),
+            "method": "flat_below_known_surface_with_shore_bevel",
+        }
+        res.manifest["water_surface"] = wsurf
         import os
         with open(os.path.join(out_dir, "manifest.json"), "w") as f:
             json.dump(res.manifest, f, indent=2)
