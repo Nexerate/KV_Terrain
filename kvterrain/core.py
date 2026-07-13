@@ -321,6 +321,82 @@ def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int
     return row0, col0, TS
 
 
+# --------------------------------------------------------------------------- #
+# Dense tile-atlas layout                                                      #
+#                                                                              #
+# A whole export can be concatenated into ONE dense blob per data type instead #
+# of thousands of per-tile files, read at runtime by a pure-arithmetic byte    #
+# offset. These helpers ARE the format contract: they must agree, exactly, with#
+# the runtime's TilesAtLevel / offset arithmetic. They take primitives (not a  #
+# GridPlan) so a consumer can recompute every offset from the manifest header  #
+# alone — no per-tile offset table is written or needed.                        #
+#                                                                              #
+#   tileBytes           = tile_samples * tile_samples * 2                       #
+#   tilesCount(l)       = tilesX(l) * tilesY(l)                                 #
+#   levelByteBase(L)    = tileBytes * Σ_{l=0}^{L-1} tilesCount(l)               #
+#   tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes    #
+#                                                                              #
+# Levels are concatenated ascending (L0 finest first). Within a level, tiles   #
+# are row-major: index = y * tilesX(L) + x. Intra-tile bytes are unchanged from #
+# the per-tile files (LE u16, tile_samples², north->south rows).               #
+# --------------------------------------------------------------------------- #
+
+ATLAS_FORMAT = "dense_v1"
+ATLAS_HEIGHT_FILE = "heights.atlas"
+ATLAS_SURFACE_FILE = "surface.atlas"
+
+
+def tiles_at_level(leaf_tiles_x: int, leaf_tiles_y: int, level: int) -> tuple[int, int]:
+    """(tilesX, tilesY) at a pyramid level. MUST match the runtime's TilesAtLevel
+    and the per-level grid used by export_tiles / export_surface_tiles."""
+    return (max(1, int(leaf_tiles_x) // (2 ** level)),
+            max(1, int(leaf_tiles_y) // (2 ** level)))
+
+
+def atlas_tile_bytes(tile_samples: int) -> int:
+    return int(tile_samples) * int(tile_samples) * 2
+
+
+def atlas_level_byte_bases(
+    leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+) -> list[int]:
+    """Byte offset at which each level begins (prefix sum over tile counts).
+    Length == num_levels; every value is a Python int (unbounded, so no int32
+    overflow — the runtime side must use a 64-bit type)."""
+    tb = atlas_tile_bytes(tile_samples)
+    bases: list[int] = []
+    acc = 0
+    for lvl in range(int(num_levels)):
+        bases.append(acc)
+        tx, ty = tiles_at_level(leaf_tiles_x, leaf_tiles_y, lvl)
+        acc += tb * tx * ty
+    return bases
+
+
+def atlas_total_bytes(
+    leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+) -> int:
+    """Exact size a dense atlas file must have. The export self-check asserts the
+    written file matches this; a mismatch means the grid wasn't dense (ragged)."""
+    tb = atlas_tile_bytes(tile_samples)
+    total = 0
+    for lvl in range(int(num_levels)):
+        tx, ty = tiles_at_level(leaf_tiles_x, leaf_tiles_y, lvl)
+        total += tb * tx * ty
+    return total
+
+
+def atlas_tile_offset(
+    leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+    level: int, x: int, y: int,
+) -> int:
+    """Byte offset of tile (x, y) at `level` inside a dense atlas."""
+    tx, _ = tiles_at_level(leaf_tiles_x, leaf_tiles_y, level)
+    base = atlas_level_byte_bases(
+        leaf_tiles_x, leaf_tiles_y, num_levels, tile_samples)[level]
+    return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples)
+
+
 def pack_r16(value_m: np.ndarray, hmin: float, hmax: float) -> np.ndarray:
     rng = max(hmax - hmin, 1e-6)
     norm = (value_m - hmin) / rng
@@ -338,6 +414,9 @@ def export_tiles(
     height_max: Optional[float] = None,
     source_kind: str = "DTM",
     writer: Optional[Callable[[str, np.ndarray], None]] = None,
+    write_atlas: bool = True,
+    write_per_tile: bool = True,
+    atlas_name: str = ATLAS_HEIGHT_FILE,
 ) -> PackResult:
     import os
 
@@ -361,10 +440,18 @@ def export_tiles(
     manifest_levels = []
     tiles_written = 0
 
-    for lvl, arr in enumerate(levels):
+    # Dense atlas: one blob for the whole export, tiles concatenated in exactly the
+    # level-then-row-major order this loop already visits them, so a plain sequential
+    # append reproduces the §4 offset layout with no seeking. Opened once here.
+    atlas_fh = None
+    if write_atlas:
+        os.makedirs(out_dir, exist_ok=True)
+        atlas_fh = open(os.path.join(out_dir, atlas_name), "wb")
+
+    try:
+      for lvl, arr in enumerate(levels):
         spacing = plan.spacing_m * (2 ** lvl)
-        tiles_x = max(1, plan.leaf_tiles_x // (2 ** lvl))
-        tiles_y = max(1, plan.leaf_tiles_y // (2 ** lvl))
+        tiles_x, tiles_y = tiles_at_level(plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
         arr_filled = np.where(np.isfinite(arr), arr, nodata_fill_m)
 
         level_entry = {
@@ -386,7 +473,12 @@ def export_tiles(
                 assert sub.shape == (TS, TS), f"bad slice {sub.shape} L{lvl} {tx},{ty}"
                 a16 = pack_r16(sub, height_min, height_max)
                 rel = f"L{lvl}/{tx}_{ty}.r16"
-                write(os.path.join(out_dir, rel), a16)
+                if write_per_tile:
+                    write(os.path.join(out_dir, rel), a16)
+                if atlas_fh is not None:
+                    # Same bytes as the per-tile file (LE u16, C-order), so the
+                    # atlas is byte-for-byte reconstructable per tile by offset.
+                    a16.tofile(atlas_fh)
                 tiles_written += 1
 
                 bx0 = plan.origin_x + i0 * spacing
@@ -398,6 +490,30 @@ def export_tiles(
                     "bbox_utm": [bx0, by0, bx0 + TC * spacing, by0 + TC * spacing],
                 })
         manifest_levels.append(level_entry)
+    finally:
+        if atlas_fh is not None:
+            atlas_fh.close()
+
+    atlas_block = None
+    if write_atlas:
+        # Fail LOUDLY at export time if the grid wasn't dense: the runtime reads by
+        # pure arithmetic and a short/long file would silently misalign every tile
+        # past the gap. This is the guardrail for the ragged-edge (border) case.
+        expect = atlas_total_bytes(
+            plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
+        actual = os.path.getsize(os.path.join(out_dir, atlas_name))
+        if actual != expect:
+            raise RuntimeError(
+                f"dense atlas size mismatch: {atlas_name} is {actual} bytes, "
+                f"expected {expect} (tileBytes={atlas_tile_bytes(TS)} * "
+                f"{expect // atlas_tile_bytes(TS)} tiles). The tile grid was not "
+                f"dense — the arithmetic offset path would misalign.")
+        atlas_block = {
+            "format": ATLAS_FORMAT,
+            "height_file": atlas_name,
+            "tile_bytes": atlas_tile_bytes(TS),
+            "height_bytes": expect,
+        }
 
     manifest = {
         "format": "kvterrain-quadtree-r16/1",
@@ -419,6 +535,10 @@ def export_tiles(
         "region_bbox_utm": list(plan.bbox_utm),
         "levels": manifest_levels,
     }
+    if atlas_block is not None:
+        # Presence of this block flips the runtime to the arithmetic read path;
+        # absence keeps it on the legacy per-tile L{level}/{x}_{y}.r16 reader.
+        manifest["atlas"] = atlas_block
 
     if writer is None:
         os.makedirs(out_dir, exist_ok=True)
@@ -442,6 +562,8 @@ def run_export(
     progress: Optional[Callable[[int, int, str], None]] = None,
     include_water: bool = False,
     water_opts: Optional[dict] = None,
+    write_atlas: bool = True,
+    write_per_tile: bool = True,
 ) -> PackResult:
     if fetcher is None:
         fetcher = lambda u, e, sx, sy, nx, ny, sp: export_image_fetch(
@@ -505,14 +627,20 @@ def run_export(
     res = export_tiles(plan, levels, out_dir,
                        nodata_fill_m=nodata_fill_m,
                        height_min=height_min, height_max=height_max,
-                       source_kind=source_kind)
+                       source_kind=source_kind,
+                       write_atlas=write_atlas, write_per_tile=write_per_tile)
 
     if surface_levels is not None:
         # .wsurf packs on the SAME [height_min, height_max] as the .r16 tiles, so it
         # can only be written now that export_tiles has finalised that range.
         from . import watersurface
         wsurf = watersurface.export_surface_tiles(
-            plan, surface_levels, out_dir, res.height_min, res.height_max)
+            plan, surface_levels, out_dir, res.height_min, res.height_max,
+            write_atlas=write_atlas, write_per_tile=write_per_tile)
+        # Tell the runtime the surface atlas exists (only if both an atlas was
+        # written AND this export actually has water).
+        if write_atlas and "atlas" in res.manifest and wsurf.get("atlas_file"):
+            res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
         wsurf["lake_count"] = lake_count
         wsurf["lake_bathymetry"] = {
             "enabled": True,

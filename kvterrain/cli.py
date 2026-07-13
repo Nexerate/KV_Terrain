@@ -53,9 +53,20 @@ def cmd_build(a):
                           nodata_fill_m=a.nodata_fill,
                           height_min=a.hmin, height_max=a.hmax,
                           progress=prog,
-                          include_water=a.water, water_opts=water_opts)
+                          include_water=a.water, water_opts=water_opts,
+                          write_atlas=a.atlas, write_per_tile=a.per_tile)
     print(f"\nwrote {res.tiles_written} tiles to {a.out}  "
           f"range [{res.height_min:.1f}, {res.height_max:.1f}] m")
+    atlas = res.manifest.get("atlas")
+    if atlas:
+        line = (f"  + dense atlas: {atlas['height_file']} "
+                f"({atlas['height_bytes'] / 1e6:.1f} MB, "
+                f"{atlas['tile_bytes']}-byte tiles)")
+        if atlas.get("surface_file"):
+            line += f" + {atlas['surface_file']}"
+        print(line)
+        if not a.per_tile:
+            print("  (per-tile L{level}/{x}_{y}.r16 files skipped: atlas-only export)")
     if a.water:
         wm = res.manifest.get("water_surface", {})
         print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
@@ -108,6 +119,81 @@ def cmd_validate(a):
               f"(includes R16 quantisation ~{(hmax - hmin) / 65535:.3f} m)")
 
 
+def cmd_validate_atlas(a):
+    """Verify a dense atlas against the manifest header and (if present) the
+    per-tile files: exact file size, and byte-for-byte equality of a sample of
+    tiles extracted by computed offset. Implements the §8 export-side checks."""
+    with open(os.path.join(a.out, "manifest.json")) as f:
+        man = json.load(f)
+
+    atlas = man.get("atlas")
+    if not atlas:
+        print("no 'atlas' block in manifest — this export has no dense atlas.")
+        sys.exit(1)
+
+    lx, ly = man["leaf_tiles"]
+    nlev = man["num_levels"]
+    ts = man["tile_samples"]
+    tile_bytes = core.atlas_tile_bytes(ts)
+
+    targets = [("height", atlas.get("height_file"), "r16")]
+    if atlas.get("surface_file"):
+        targets.append(("surface", atlas["surface_file"], "wsurf"))
+
+    rng = np.random.default_rng(0)
+    ok = True
+    for kind, fname, suffix in targets:
+        path = os.path.join(a.out, fname)
+        if not os.path.exists(path):
+            print(f"[{kind}] MISSING atlas file {fname}")
+            ok = False
+            continue
+
+        expect = core.atlas_total_bytes(lx, ly, nlev, ts)
+        actual = os.path.getsize(path)
+        size_ok = actual == expect
+        ok &= size_ok
+        print(f"[{kind}] {fname}: {actual} bytes, expected {expect} "
+              f"-> {'OK' if size_ok else 'MISMATCH (grid not dense!)'}")
+        if not size_ok:
+            continue
+
+        # Byte-for-byte: pull a sample of tiles by offset and compare to the
+        # per-tile file if it still exists. Skipped cleanly for atlas-only exports.
+        checked = compared = 0
+        with open(path, "rb") as fh:
+            for lvl in range(nlev):
+                tx, ty = core.tiles_at_level(lx, ly, lvl)
+                coords = [(x, y) for y in range(ty) for x in range(tx)]
+                pick = rng.choice(len(coords),
+                                  size=min(a.n, len(coords)), replace=False)
+                for idx in pick:
+                    x, y = coords[int(idx)]
+                    off = core.atlas_tile_offset(lx, ly, nlev, ts, lvl, x, y)
+                    fh.seek(off)
+                    blob = fh.read(tile_bytes)
+                    checked += 1
+                    if len(blob) != tile_bytes:
+                        print(f"    L{lvl} {x},{y}: short read at offset {off}")
+                        ok = False
+                        continue
+                    per_tile = os.path.join(a.out, f"L{lvl}/{x}_{y}.{suffix}")
+                    if os.path.exists(per_tile):
+                        with open(per_tile, "rb") as pf:
+                            if pf.read() != blob:
+                                print(f"    L{lvl} {x},{y}: BYTES DIFFER from "
+                                      f"{per_tile}")
+                                ok = False
+                            else:
+                                compared += 1
+        note = (f", {compared} matched per-tile files"
+                if compared else " (no per-tile files to compare — atlas-only)")
+        print(f"    sampled {checked} tiles by offset{note}")
+
+    print("RESULT:", "PASS" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="kvterrain")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -125,6 +211,14 @@ def main(argv=None):
     b.add_argument("--hmin", type=float, default=None)
     b.add_argument("--hmax", type=float, default=None)
     b.add_argument("--demo", action="store_true")
+    b.add_argument("--no-atlas", action="store_false", dest="atlas", default=True,
+                   help="skip the dense heights.atlas / surface.atlas blobs "
+                        "(default: write them)")
+    b.add_argument("--no-per-tile", action="store_false", dest="per_tile",
+                   default=True,
+                   help="skip the per-tile L{level}/{x}_{y}.r16/.wsurf files and "
+                        "write only the dense atlas (hard cutover; re-bake before "
+                        "using with a runtime that lacks the atlas path)")
     b.add_argument("--water", action="store_true")
     b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
     b.add_argument("--river-width-scale", type=float, default=1.0, dest="river_width_scale")
@@ -141,6 +235,13 @@ def main(argv=None):
     v.add_argument("--out", required=True)
     v.add_argument("--n", type=int, default=12)
     v.set_defaults(func=cmd_validate)
+
+    va = sub.add_parser("validate-atlas",
+                        help="check dense atlas size + byte-for-byte vs per-tile files")
+    va.add_argument("--out", required=True)
+    va.add_argument("--n", type=int, default=8,
+                    help="tiles sampled per level for the byte-for-byte check")
+    va.set_defaults(func=cmd_validate_atlas)
 
     a = p.parse_args(argv)
     a.func(a)

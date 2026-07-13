@@ -315,12 +315,15 @@ def unpack_surface_u16(packed: np.ndarray, hmin: float, hmax: float) -> np.ndarr
 
 
 def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str,
-                         hmin: float, hmax: float, *, writer=None) -> dict:
+                         hmin: float, hmax: float, *, writer=None,
+                         write_atlas: bool = True, write_per_tile: bool = True,
+                         atlas_name: str = core.ATLAS_SURFACE_FILE) -> dict:
     """
     Slice every surface pyramid level into (tile_cells+1)² tiles and write each as a
-    raw little-endian u16 `.wsurf` array beside the matching `.r16` tile.
-    Returns a manifest fragment describing the encoding. Uses the same
-    core.north_up_tile_slice tiling as the height export so files line up 1:1.
+    raw little-endian u16 `.wsurf` array beside the matching `.r16` tile, and/or
+    concatenate them into one dense `surface.atlas` blob (same §4 layout as the
+    height atlas). Returns a manifest fragment describing the encoding. Uses the
+    same core.north_up_tile_slice tiling as the height export so files line up 1:1.
     """
     TC = plan.tile_cells
     TS = TC + 1
@@ -330,10 +333,16 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
         arr.tofile(path)
     write = writer or _default_writer
 
+    atlas_fh = None
+    if write_atlas:
+        os.makedirs(out_dir, exist_ok=True)
+        atlas_fh = open(os.path.join(out_dir, atlas_name), "wb")
+
     tiles_written = 0
-    for lvl, surf in enumerate(surface_levels):
-        tiles_x = max(1, plan.leaf_tiles_x // (2 ** lvl))
-        tiles_y = max(1, plan.leaf_tiles_y // (2 ** lvl))
+    try:
+      for lvl, surf in enumerate(surface_levels):
+        tiles_x, tiles_y = core.tiles_at_level(
+            plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
         SY = surf.shape[0]
         for ty in range(tiles_y):
             for tx in range(tiles_x):
@@ -341,8 +350,25 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
                 tile = surf[r0:r0 + TS, c0:c0 + TS]
                 packed = pack_surface_u16(tile, hmin, hmax)
                 rel = f"L{lvl}/{tx}_{ty}.wsurf"
-                write(os.path.join(out_dir, rel), packed)
+                if write_per_tile:
+                    write(os.path.join(out_dir, rel), packed)
+                if atlas_fh is not None:
+                    packed.tofile(atlas_fh)
                 tiles_written += 1
+    finally:
+        if atlas_fh is not None:
+            atlas_fh.close()
+
+    atlas_file = None
+    if write_atlas:
+        expect = core.atlas_total_bytes(
+            plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
+        actual = os.path.getsize(os.path.join(out_dir, atlas_name))
+        if actual != expect:
+            raise RuntimeError(
+                f"dense surface atlas size mismatch: {atlas_name} is {actual} "
+                f"bytes, expected {expect}. The surface tile grid was not dense.")
+        atlas_file = atlas_name
 
     manifest = {
         "tile_suffix": ".wsurf",
@@ -361,6 +387,11 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
         "river_raise_by_order_m": {str(k): v for k, v in DEFAULT_DEPTH_BY_ORDER.items()},
         "tiles_written": tiles_written,
     }
+    if atlas_file is not None:
+        # Consumed by run_export/app to fill manifest["atlas"]["surface_file"];
+        # also handy standalone for anyone reading only the water_surface block.
+        manifest["atlas_file"] = atlas_file
+        manifest["atlas_format"] = core.ATLAS_FORMAT
     # Provenance for the NVE-derived water (no .water tile carries it any more).
     manifest.update(kvwater.water_source_manifest())
     return manifest

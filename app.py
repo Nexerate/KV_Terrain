@@ -250,6 +250,8 @@ if go and plan is not None:
             from kvterrain import watersurface as kvws
             wsurf = kvws.export_surface_tiles(
                 plan, surface_levels, out_dir, res.height_min, res.height_max)
+            if "atlas" in res.manifest and wsurf.get("atlas_file"):
+                res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
             wsurf["lake_count"] = lake_count
             wsurf["lake_bathymetry"] = {
                 "enabled": True,
