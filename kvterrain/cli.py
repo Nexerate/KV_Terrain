@@ -53,24 +53,19 @@ def cmd_build(a):
                           nodata_fill_m=a.nodata_fill,
                           height_min=a.hmin, height_max=a.hmax,
                           progress=prog,
-                          include_water=a.water, water_opts=water_opts,
-                          write_atlas=a.atlas, write_per_tile=a.per_tile)
-    print(f"\nwrote {res.tiles_written} tiles to {a.out}  "
+                          include_water=a.water, water_opts=water_opts)
+    print(f"\npacked {res.tiles_written} tiles to {a.out}  "
           f"range [{res.height_min:.1f}, {res.height_max:.1f}] m")
-    atlas = res.manifest.get("atlas")
-    if atlas:
-        line = (f"  + dense atlas: {atlas['height_file']} "
-                f"({atlas['height_bytes'] / 1e6:.1f} MB, "
-                f"{atlas['tile_bytes']}-byte tiles)")
-        if atlas.get("surface_file"):
-            line += f" + {atlas['surface_file']}"
-        print(line)
-        if not a.per_tile:
-            print("  (per-tile L{level}/{x}_{y}.r16 files skipped: atlas-only export)")
+    atlas = res.manifest["atlas"]
+    line = (f"  + {atlas['height_file']} "
+            f"({atlas['height_bytes'] / 1e6:.1f} MB, {atlas['tile_bytes']}-byte tiles)")
+    if atlas.get("surface_file"):
+        line += f" + {atlas['surface_file']}"
+    print(line)
     if a.water:
         wm = res.manifest.get("water_surface", {})
         print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
-              f".wsurf tiles alongside every .r16 (© NVE)")
+              f"packed in {atlas['surface_file']} (© NVE)")
         print(f"  + lake beds carved flat {a.lake_max_depth:.1f} m below the known "
               f"NVE surface (bevel radius {a.lake_ramp_radius:.1f} m)")
         print(f"  + river surface raised above the DTM channel by stream order "
@@ -85,35 +80,50 @@ def cmd_validate(a):
     epsg = int(man["crs"].split(":")[1])
     hmin, hmax = man["height_min_m"], man["height_max_m"]
     tc = man["tile_cells"]
+    ts = man["tile_samples"]
     spacing = man["leaf_spacing_m"]
+    ox, oy = man["origin_utm"]
+    lx, ly = man["leaf_tiles"]
+    nlev = man["num_levels"]
 
-    leaf = next(l for l in man["levels"] if l["level"] == 0)
+    # Everything about a leaf tile is implied by the header — its atlas byte offset and its
+    # world-space SW corner — so we sample leaf tiles directly from the grid, no per-tile
+    # metadata needed. Read the packed u16 grid out of the height atlas by computed offset.
+    tile_bytes = core.atlas_tile_bytes(ts)
+    atlas_path = os.path.join(a.out, man["atlas"]["height_file"])
     rng = np.random.default_rng(0)
-    sample_tiles = rng.choice(len(leaf["tiles"]), min(a.n, len(leaf["tiles"])), replace=False)
+    coords = [(x, y) for y in range(ly) for x in range(lx)]      # level-0 grid
+    pick = rng.choice(len(coords), min(a.n, len(coords)), replace=False)
+
     sess = requests.Session()
     errs = []
-    for ti in sample_tiles:
-        t = leaf["tiles"][int(ti)]
-        a16 = np.fromfile(os.path.join(a.out, t["file"]), dtype="<u2").reshape(tc + 1, tc + 1)
-        i = int(rng.integers(0, tc + 1)); j = int(rng.integers(0, tc + 1))
-        packed = a16[tc - j, i]
-        h_packed = hmin + (packed / 65535.0) * (hmax - hmin)
-        X = t["bbox_utm"][0] + i * spacing
-        Y = t["bbox_utm"][1] + j * spacing
-        try:
-            r = sess.get(core.POINT_API,
-                         params={"ost": X, "nord": Y, "koordsys": epsg},
-                         timeout=30)
-            data = r.json()
-            h_api = data.get("punkter", [{}])[0].get("z")
-        except Exception as ex:
-            print(f"  point API call failed ({ex}); check param names live.")
-            return
-        if h_api is None:
-            continue
-        errs.append(abs(h_api - h_packed))
-        print(f"  ({X:.0f},{Y:.0f})  packed {h_packed:7.2f}  api {h_api:7.2f}  "
-              f"d={abs(h_api - h_packed):.2f} m")
+    with open(atlas_path, "rb") as atlas_fh:
+        for idx in pick:
+            x, y = coords[int(idx)]
+            off = core.atlas_tile_offset(lx, ly, nlev, ts, 0, x, y)
+            atlas_fh.seek(off)
+            a16 = np.frombuffer(atlas_fh.read(tile_bytes), dtype="<u2").reshape(ts, ts)
+
+            i = int(rng.integers(0, tc + 1)); j = int(rng.integers(0, tc + 1))
+            packed = a16[tc - j, i]
+            h_packed = hmin + (packed / 65535.0) * (hmax - hmin)
+            # Tile SW corner in world CRS, then the sampled cell within it.
+            X = ox + (x * tc + i) * spacing
+            Y = oy + (y * tc + j) * spacing
+            try:
+                r = sess.get(core.POINT_API,
+                             params={"ost": X, "nord": Y, "koordsys": epsg},
+                             timeout=30)
+                data = r.json()
+                h_api = data.get("punkter", [{}])[0].get("z")
+            except Exception as ex:
+                print(f"  point API call failed ({ex}); check param names live.")
+                return
+            if h_api is None:
+                continue
+            errs.append(abs(h_api - h_packed))
+            print(f"  ({X:.0f},{Y:.0f})  packed {h_packed:7.2f}  api {h_api:7.2f}  "
+                  f"d={abs(h_api - h_packed):.2f} m")
     if errs:
         print(f"\nmedian |error| = {np.median(errs):.2f} m  "
               f"(includes R16 quantisation ~{(hmax - hmin) / 65535:.3f} m)")
@@ -128,28 +138,28 @@ def cmd_validate_atlas(a):
 
     atlas = man.get("atlas")
     if not atlas:
-        print("no 'atlas' block in manifest — this export has no dense atlas.")
+        print("no 'atlas' block in manifest — not a kvterrain atlas export.")
         sys.exit(1)
 
     lx, ly = man["leaf_tiles"]
     nlev = man["num_levels"]
     ts = man["tile_samples"]
     tile_bytes = core.atlas_tile_bytes(ts)
+    expect = core.atlas_total_bytes(lx, ly, nlev, ts)
 
-    targets = [("height", atlas.get("height_file"), "r16")]
+    targets = [("height", atlas.get("height_file"))]
     if atlas.get("surface_file"):
-        targets.append(("surface", atlas["surface_file"], "wsurf"))
+        targets.append(("surface", atlas["surface_file"]))
 
     rng = np.random.default_rng(0)
     ok = True
-    for kind, fname, suffix in targets:
+    for kind, fname in targets:
         path = os.path.join(a.out, fname)
         if not os.path.exists(path):
             print(f"[{kind}] MISSING atlas file {fname}")
             ok = False
             continue
 
-        expect = core.atlas_total_bytes(lx, ly, nlev, ts)
         actual = os.path.getsize(path)
         size_ok = actual == expect
         ok &= size_ok
@@ -158,37 +168,23 @@ def cmd_validate_atlas(a):
         if not size_ok:
             continue
 
-        # Byte-for-byte: pull a sample of tiles by offset and compare to the
-        # per-tile file if it still exists. Skipped cleanly for atlas-only exports.
-        checked = compared = 0
+        # Sample tiles across levels and confirm each computed offset yields a full
+        # tileBytes block inside the file (offsets land where the header implies).
+        checked = 0
         with open(path, "rb") as fh:
             for lvl in range(nlev):
                 tx, ty = core.tiles_at_level(lx, ly, lvl)
                 coords = [(x, y) for y in range(ty) for x in range(tx)]
-                pick = rng.choice(len(coords),
-                                  size=min(a.n, len(coords)), replace=False)
-                for idx in pick:
+                for idx in rng.choice(len(coords), size=min(a.n, len(coords)),
+                                      replace=False):
                     x, y = coords[int(idx)]
                     off = core.atlas_tile_offset(lx, ly, nlev, ts, lvl, x, y)
                     fh.seek(off)
-                    blob = fh.read(tile_bytes)
-                    checked += 1
-                    if len(blob) != tile_bytes:
+                    if len(fh.read(tile_bytes)) != tile_bytes:
                         print(f"    L{lvl} {x},{y}: short read at offset {off}")
                         ok = False
-                        continue
-                    per_tile = os.path.join(a.out, f"L{lvl}/{x}_{y}.{suffix}")
-                    if os.path.exists(per_tile):
-                        with open(per_tile, "rb") as pf:
-                            if pf.read() != blob:
-                                print(f"    L{lvl} {x},{y}: BYTES DIFFER from "
-                                      f"{per_tile}")
-                                ok = False
-                            else:
-                                compared += 1
-        note = (f", {compared} matched per-tile files"
-                if compared else " (no per-tile files to compare — atlas-only)")
-        print(f"    sampled {checked} tiles by offset{note}")
+                    checked += 1
+        print(f"    sampled {checked} tile offsets, all full-length")
 
     print("RESULT:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
@@ -211,14 +207,6 @@ def main(argv=None):
     b.add_argument("--hmin", type=float, default=None)
     b.add_argument("--hmax", type=float, default=None)
     b.add_argument("--demo", action="store_true")
-    b.add_argument("--no-atlas", action="store_false", dest="atlas", default=True,
-                   help="skip the dense heights.atlas / surface.atlas blobs "
-                        "(default: write them)")
-    b.add_argument("--no-per-tile", action="store_false", dest="per_tile",
-                   default=True,
-                   help="skip the per-tile L{level}/{x}_{y}.r16/.wsurf files and "
-                        "write only the dense atlas (hard cutover; re-bake before "
-                        "using with a runtime that lacks the atlas path)")
     b.add_argument("--water", action="store_true")
     b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
     b.add_argument("--river-width-scale", type=float, default=1.0, dest="river_width_scale")

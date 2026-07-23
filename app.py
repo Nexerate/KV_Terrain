@@ -59,8 +59,8 @@ with st.sidebar:
     st.divider()
     st.subheader("Water (NVE)")
     want_water = st.toggle("Fetch rivers & lakes", value=True,
-                           help="Also fetch NVE Elvenett + Innsjødatabase and write a "
-                                ".wsurf water-surface tile beside every height tile.")
+                           help="Also fetch NVE Elvenett + Innsjødatabase and pack a "
+                                "per-pixel water surface into surface.atlas.")
     main_rivers = st.toggle("Include main rivers (hovedelv) for size", value=True,
                             disabled=not want_water,
                             help="Second pass that upgrades main-river size class.")
@@ -154,7 +154,7 @@ with col_info:
         st.caption(f"SW origin (UTM): {ox:,.1f}, {oy:,.1f}")
         if want_water:
             wsurf_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 2 / 1e6
-            st.caption(f"+ water surface: {plan.total_tiles()} .wsurf tiles "
+            st.caption(f"+ water surface: surface.atlas "
                        f"(≈ {wsurf_mb:,.1f} MB, u16) from NVE")
             st.caption(f"+ lake beds carved flat {lake_max_depth:.0f} m below the "
                        f"known NVE surface ({lake_ramp_radius:.0f} m shore bevel)")
@@ -298,8 +298,8 @@ if go and plan is not None:
             rgb[..., 2][rmask] = 1.0 * inten[rmask]
             prev_cols[1].image(np.clip(rgb, 0, 1), caption="Water (blue=lake, cyan=river)",
                                clamp=True, width=260)
-            st.caption(f"Water surface: {lake_count} lake(s); per-pixel .wsurf tiles "
-                       f"(u16 m.o.h.) beside every .r16. Lakes use NVE hoyde; rivers "
+            st.caption(f"Water surface: {lake_count} lake(s); per-pixel surface packed "
+                       f"in surface.atlas (u16 m.o.h.). Lakes use NVE hoyde; rivers "
                        f"sit on the DTM channel raised by stream order "
                        f"(× {river_depth_scale:g}). {kvwater.WATER_ATTRIBUTION}.")
             st.caption(f"Lake beds carved flat {lake_max_depth:.0f} m below the known "
