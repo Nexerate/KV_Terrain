@@ -15,12 +15,19 @@ The result is an in-memory `WaterGrid` (per-pixel `type`, river `weight`, and
                                   `.wsurf` water-surface field that is actually
                                   written to disk.
 
-There is NO on-disk `.water` tile any more. The runtime consumes water purely as
-the `.wsurf` surface-elevation field (depth = max(0, surface - terrain)); the old
-categorical `.water` record (type/weight/flow/lake_id) and its quad-tree pyramid
-have been removed. `weight` (stream order) is still carried in memory because the
-river surface raise is sized by it; the old `flow` bearing byte is gone with the
-tile it served.
+On-disk products derived from this grid (0.5.0):
+
+  * `surface.atlas`   — per-pixel water-surface elevation (see `watersurface`).
+  * `water_id.atlas`  — per-pixel class + authored lake identity (see `waterid`).
+
+The old categorical `.water` record (type/weight/flow/lake_id, four channels) and
+its quad-tree pyramid are still gone. `water_id` is its narrower replacement: a
+single u16 channel carrying Dry/River/Ocean plus the authored lake id, which is
+what the runtime actually needs to pin an authored lake level to a solver basin.
+`weight` (stream order) stays in memory only — the river surface raise is sized by
+it and `rivernet` samples it — and the old `flow` bearing byte remains gone with
+the tile it served, since flow direction now lives on the polylines where it
+belongs.
 
 Sources (open data, ArcGIS REST MapServers — same service family as the height
 ImageServer, so we query them the same way and let the server reproject to the
@@ -47,8 +54,6 @@ Data © NVE (Elvenett / Innsjødatabase).
 
 from __future__ import annotations
 
-import json
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -81,6 +86,26 @@ LAKE_LAYER = 5             # 'Innsjodatabase' — lake polygons
 
 # Optional attribute names, tried in order. None are required.
 RIVER_ORDER_FIELDS = ("STRAHLER", "strahler", "elveOrden", "elveorden", "orden", "ORDEN")
+
+# ── ELVIS stable identity ────────────────────────────────────────────────────
+# NVE documents these as persistent across service updates; they are what makes a
+# river segment addressable from one export to the next.
+#
+#   strekn_lnr    segment-level national serial number — THE primary key. NVE
+#                 describes it as the national reference for all watercourse
+#                 elements.
+#   elvid         identifies the river/tributary as a whole (string, len 15).
+#   vassdragsnr   REGINE drainage-basin number (string, len 15).
+#   vatnlnr       lake serial number, present when the segment touches a lake —
+#                 also the natural cross-check for a detected junction.
+#
+# `objectid` is deliberately NOT read: it is an Esri-internal OID, ephemeral
+# across service updates, and persisting it would silently rot.
+RIVER_STREKN_FIELDS = ("strekn_lnr", "streknLnr", "STREKN_LNR", "streknlnr")
+RIVER_ELVID_FIELDS = ("elvid", "elvId", "ELVID", "elv_id")
+RIVER_VASSDRAG_FIELDS = ("vassdragsnr", "vassdragNr", "VASSDRAGSNR", "vassdragsnummer")
+RIVER_VATNLNR_FIELDS = ("vatnlnr", "vatnLnr", "VATNLNR", "vatn_lnr")
+RIVER_CATCHMENT_FIELDS = ("vnrnfelt", "vnrNfelt", "VNRNFELT")
 LAKE_ID_FIELDS = ("vatnLnr", "vatnlnr", "lopenr", "LOPENR", "vassdragLnr", "objektNr")
 LAKE_NAME_FIELDS = ("navn", "NAVN", "sjonavn", "objektNavn", "vatnNavn")
 LAKE_AREA_FIELDS = ("areal_km2", "arealKm2", "areal", "AREAL")   # km² if *_km2, else m²
@@ -116,6 +141,12 @@ DEFAULT_WIDTH_BY_ORDER = {
 DEFAULT_ORDER_MAIN = 5      # assumed order for a 'hovedelv' segment lacking an order attr
 DEFAULT_ORDER_MINOR = 2     # assumed order for an 'elvenett' segment lacking an order attr
 
+# Local lake ids are re-encoded into the u16 water-id raster as
+# `waterid.LAKE_ID_BASE + local_id`, so the usable range is shortened by the
+# reserved low codes. Kept here (not in waterid) because this is where ids are
+# handed out; waterid asserts the two agree.
+MAX_LOCAL_LAKE_ID = 65535 - 16
+
 
 def order_to_width_m(order: int, width_by_order: dict, scale: float) -> float:
     """Full channel width for a stream order, scaled; clamps to the table ends."""
@@ -132,9 +163,27 @@ def order_to_width_m(order: int, width_by_order: dict, scale: float) -> float:
 
 @dataclass
 class RiverSeg:
-    """One polyline in the plan's CRS (metres), vertices ordered downstream."""
+    """
+    One polyline in the plan's CRS (metres), vertices ordered downstream.
+
+    Vertex order is taken on trust from ELVIS, which is DESIGNED to encode flow
+    direction — but that is design intent, not a per-feature guarantee, and
+    nothing upstream of us verifies it. `rivernet.validate_flow_direction`
+    therefore derives a direction independently from the sampled Z and reports
+    the disagreement rate as a diagnostic. It never flips a segment: Z-derived
+    direction is noisy on flat reaches, weirs, lakes and DTM artefacts, so it is
+    a worse authority than the source order, not a better one.
+    """
     xy: np.ndarray             # (N,2) float64
     order: int                 # stream size class (>=1)
+    # ── ELVIS stable identity (all optional; None when the service omits them) ──
+    strekn_lnr: Optional[int] = None    # primary segment key
+    elvid: Optional[str] = None         # river/tributary key
+    vassdragsnr: Optional[str] = None   # REGINE catchment key
+    vatnlnr: Optional[int] = None       # lake serial, when the segment touches one
+    vnrnfelt: Optional[str] = None      # parent catchment's vassdragsnr
+    part_index: int = 0                 # part number within a MultiLineString
+    feature_index: int = -1             # index of the parent GeoJSON feature
 
 
 @dataclass
@@ -149,8 +198,26 @@ class LakePoly:
 
 @dataclass
 class WaterFeatures:
-    rivers: list = field(default_factory=list)   # list[RiverSeg]
-    lakes: list = field(default_factory=list)    # list[LakePoly]
+    """
+    `rivers` is the AUTHORITATIVE network: the `elvenett` layer, one RiverSeg per
+    linestring part, carrying ELVIS identity. This is what `rivernet` serialises.
+
+    `main_rivers` is the `hovedelv` layer, kept SEPARATE and used for one purpose
+    only: it is rasterised alongside `rivers` so that the last-write-wins burn
+    upgrades the per-pixel stream order where a main river runs.
+
+    Before 0.5.0 the hovedelv segments were appended straight into `rivers`, so
+    every main river existed twice as overlapping geometry with two different
+    orders. Harmless while the only product was a raster; fatal for a connectivity
+    graph, which would have emitted each trunk river twice and linked neither copy
+    correctly. Keeping them apart means the polyline set is exactly the elvenett
+    network, while the raster still gets its upgrade — and `rivernet` recovers each
+    segment's upgraded order by sampling the rasterised weight grid along its own
+    pixel path, so the polyline order and the raster order cannot disagree.
+    """
+    rivers: list = field(default_factory=list)        # list[RiverSeg] — elvenett
+    main_rivers: list = field(default_factory=list)   # list[RiverSeg] — hovedelv, raster only
+    lakes: list = field(default_factory=list)         # list[LakePoly]
 
 
 @dataclass
@@ -165,6 +232,12 @@ class WaterGrid:
     weight: np.ndarray         # u1
     lake_id: np.ndarray        # u2
     lake_table: dict           # {local_id:int -> {lopenr,navn,area_m2,hoyde_moh}}
+    # Stream order BEFORE the lake mask zeroes river pixels under lakes. The
+    # display path must not see these (a lake pixel is a lake), but `rivernet`
+    # must: Elvenett includes lake-through-lines, and a through-line's order can
+    # only be recovered from the pre-mask grid. Reading `weight` there would
+    # return 0 and silently demote every trunk river crossing a lake.
+    weight_raw: np.ndarray = None      # u1
 
     def lake_surface_moh(self) -> np.ndarray:
         """
@@ -328,11 +401,29 @@ def features_from_geojson(
     default_order_minor: int = DEFAULT_ORDER_MINOR,
     default_order_main: int = DEFAULT_ORDER_MAIN,
 ) -> WaterFeatures:
-    """Turn raw GeoJSON feature lists into typed, CRS-metre WaterFeatures."""
-    rivers: list = []
+    """
+    Turn raw GeoJSON feature lists into typed, CRS-metre WaterFeatures.
 
-    def _add_rivers(feats, default_order):
-        for f in feats or []:
+    `river_all` (elvenett) becomes the authoritative network with full ELVIS
+    identity. `river_main` (hovedelv) becomes `main_rivers`, geometry retained for
+    the raster order upgrade only — see WaterFeatures for why the two are no
+    longer merged.
+    """
+    def _to_int(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _to_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    def _parse_rivers(feats, default_order, keep_identity: bool) -> list:
+        out: list = []
+        for fi, f in enumerate(feats or []):
             props = f.get("properties", {}) or {}
             ov = _first_attr(props, order_fields)
             try:
@@ -340,12 +431,33 @@ def features_from_geojson(
             except (TypeError, ValueError):
                 order = int(default_order)
             order = max(1, min(255, order))
-            for line in _iter_line_coords(f.get("geometry") or {}):
-                if line and len(line) >= 2:
-                    rivers.append(RiverSeg(np.asarray(line, dtype=np.float64)[:, :2], order))
 
-    _add_rivers(river_all, default_order_minor)
-    _add_rivers(river_main, default_order_main)   # main rivers overwrite by higher weight
+            if keep_identity:
+                strekn = _to_int(_first_attr(props, RIVER_STREKN_FIELDS))
+                elvid = _to_str(_first_attr(props, RIVER_ELVID_FIELDS))
+                vdrag = _to_str(_first_attr(props, RIVER_VASSDRAG_FIELDS))
+                vatn = _to_int(_first_attr(props, RIVER_VATNLNR_FIELDS))
+                nfelt = _to_str(_first_attr(props, RIVER_CATCHMENT_FIELDS))
+            else:
+                strekn = elvid = vdrag = vatn = nfelt = None
+
+            # A MultiLineString is several parts of ONE feature. Each part becomes
+            # its own RiverSeg (they are geometrically disjoint) but all of them
+            # keep the parent's identity plus a part_index, so the link back to the
+            # source feature survives instead of being dissolved as it used to be.
+            for pi, line in enumerate(_iter_line_coords(f.get("geometry") or {})):
+                if line and len(line) >= 2:
+                    out.append(RiverSeg(
+                        xy=np.asarray(line, dtype=np.float64)[:, :2],
+                        order=order,
+                        strekn_lnr=strekn, elvid=elvid, vassdragsnr=vdrag,
+                        vatnlnr=vatn, vnrnfelt=nfelt,
+                        part_index=pi, feature_index=fi,
+                    ))
+        return out
+
+    rivers = _parse_rivers(river_all, default_order_minor, keep_identity=True)
+    main_rivers = _parse_rivers(river_main, default_order_main, keep_identity=False)
 
     lake_polys: list = []
     for f in lakes or []:
@@ -380,7 +492,7 @@ def features_from_geojson(
             if arr_rings:
                 lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh))
 
-    return WaterFeatures(rivers=rivers, lakes=lake_polys)
+    return WaterFeatures(rivers=rivers, main_rivers=main_rivers, lakes=lake_polys)
 
 
 def fetch_water_features(
@@ -431,8 +543,12 @@ def rasterize_water(
     # vertices) buffered to the channel width, so a meandering river is covered
     # piece-by-piece. Only `weight` (stream order) is burned now — the surface
     # raise downstream is sized by it; flow bearing is no longer produced.
+    # BOTH layers are rasterised: the elvenett network plus the hovedelv overlay.
+    # They deliberately overlap; the sort below burns higher orders last, so a main
+    # river upgrades the order of the pixels it shares with its elvenett twin.
+    # Only `feats.rivers` is serialised as polylines — see WaterFeatures.
     weight_shapes = []   # (polygon, order)
-    for seg in feats.rivers:
+    for seg in list(feats.rivers) + list(feats.main_rivers):
         xy = seg.xy
         if xy.shape[0] < 2:
             continue
@@ -474,7 +590,7 @@ def rasterize_water(
         else:
             local = next_id
             next_id += 1
-            if local > 65535:
+            if local > MAX_LOCAL_LAKE_ID:
                 # Extremely unlikely for any drawn region; stop assigning ids.
                 break
             lopenr_to_local[key] = local
@@ -492,13 +608,21 @@ def rasterize_water(
         rasterize(lake_shapes, out=lake_id_arr, transform=transform,
                   all_touched=False, merge_alg=_replace())
 
+    # Keep the order grid as it stood BEFORE lakes claimed their pixels. Elvenett
+    # runs lake-through-lines across every lake, and those pixels are about to be
+    # zeroed; `rivernet` needs them to recover a through-line's order (and, more
+    # importantly, the through-line is the inflow->outflow connection that makes
+    # the river network continuous across a lake).
+    weight_raw = weight_arr.copy()
+
     # lake > river priority: where a lake covers a sample, it's a lake, and the
     # river weight there is cleared (weight is read only when type==RIVER).
     lake_mask = lake_id_arr > 0
     type_arr[lake_mask] = TYPE_LAKE
     weight_arr[lake_mask] = 0
 
-    return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table)
+    return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table,
+                     weight_raw=weight_raw)
 
 
 def _replace():
@@ -520,9 +644,20 @@ def water_source_manifest(width_scale: float = 1.0) -> dict:
         "attribution": WATER_ATTRIBUTION,
         "license": WATER_LICENSE,
         "sources": {
-            "rivers": f"{RIVER_SERVICE} (layers {RIVER_LAYER_ALL} elvenett, "
-                      f"{RIVER_LAYER_MAIN} hovedelv)",
+            "rivers": f"{RIVER_SERVICE} (layer {RIVER_LAYER_ALL} elvenett — the "
+                      f"authoritative network, serialised as polylines)",
+            "rivers_order_overlay": f"{RIVER_SERVICE} (layer {RIVER_LAYER_MAIN} "
+                                    f"hovedelv — rasterised for the stream-order "
+                                    f"upgrade only, not serialised)",
             "lakes": f"{LAKE_SERVICE} (layer {LAKE_LAYER} Innsjodatabase)",
+        },
+        "identity_fields": {
+            "segment_primary": "strekn_lnr",
+            "river": "elvid",
+            "catchment": "vassdragsnr",
+            "lake": "vatnlnr",
+            "note": "objectid is Esri-internal and NOT persisted — it is not "
+                    "stable across NVE service updates.",
         },
         "width_model": {
             "note": "centerline buffered to this FULL width (m) by stream order, "
@@ -546,17 +681,37 @@ def synthetic_water_features(plan: core.GridPlan) -> WaterFeatures:
     lake sits near the centre.
     """
     x0, y0, x1, y1 = plan.bbox_utm
-    # Diagonal river SW->NE, a few vertices so it meanders across the region.
-    river = RiverSeg(
-        xy=np.array([
-            [x0 + 0.10 * (x1 - x0), y0 + 0.10 * (y1 - y0)],
-            [x0 + 0.40 * (x1 - x0), y0 + 0.35 * (y1 - y0)],
-            [x0 + 0.55 * (x1 - x0), y0 + 0.60 * (y1 - y0)],
-            [x0 + 0.90 * (x1 - x0), y0 + 0.90 * (y1 - y0)],
-        ], dtype=np.float64),
+
+    def P(fx, fy):
+        return [x0 + fx * (x1 - x0), y0 + fy * (y1 - y0)]
+
+    # Diagonal trunk river SW->NE. Split at the confluence, the way Elvenett splits
+    # real segments, so the connectivity builder has an end-meets-start join to
+    # find rather than a T-junction mid-polyline (which it correctly would not
+    # link, and which would make this demo silently under-report connectivity).
+    trunk_up = RiverSeg(
+        xy=np.array([P(0.10, 0.10), P(0.25, 0.22), P(0.40, 0.35)], dtype=np.float64),
         order=5,
+        strekn_lnr=100001, elvid="SYN-ELV-0000001", vassdragsnr="002.A1Z",
+        feature_index=0,
     )
-    # A lake rectangle near the centre.
+    trunk_dn = RiverSeg(
+        xy=np.array([P(0.40, 0.35), P(0.55, 0.60), P(0.90, 0.90)], dtype=np.float64),
+        order=5,
+        strekn_lnr=100002, elvid="SYN-ELV-0000001", vassdragsnr="002.A1Z",
+        feature_index=1,
+    )
+    # A tributary meeting the trunk exactly at that split, so the confluence has
+    # two upstream segments feeding one downstream.
+    trib = RiverSeg(
+        xy=np.array([P(0.20, 0.55), P(0.30, 0.45), P(0.40, 0.35)], dtype=np.float64),
+        order=3,
+        strekn_lnr=100003, elvid="SYN-ELV-0000009", vassdragsnr="002.A1Z",
+        feature_index=2,
+    )
+
+    # A lake rectangle, plus an inflow / through-line / outflow chain across it, so
+    # junction detection and the lake-span logic are exercised offline.
     cx0, cy0 = x0 + 0.60 * (x1 - x0), y0 + 0.25 * (y1 - y0)
     cx1, cy1 = x0 + 0.80 * (x1 - x0), y0 + 0.45 * (y1 - y0)
     lake = LakePoly(
@@ -565,4 +720,30 @@ def synthetic_water_features(plan: core.GridPlan) -> WaterFeatures:
         lopenr=999001, navn="Synthetic Lake", area_m2=(cx1 - cx0) * (cy1 - cy0),
         hoyde_moh=320.0,
     )
-    return WaterFeatures(rivers=[river], lakes=[lake])
+    inflow = RiverSeg(
+        xy=np.array([P(0.95, 0.60), P(0.85, 0.45), P(0.72, 0.40)], dtype=np.float64),
+        order=4, strekn_lnr=100004, elvid="SYN-ELV-0000003",
+        vassdragsnr="002.A2Z", vatnlnr=999001, feature_index=3,
+    )
+    through = RiverSeg(
+        xy=np.array([P(0.72, 0.40), P(0.68, 0.32)], dtype=np.float64),
+        order=4, strekn_lnr=100005, elvid="SYN-ELV-0000003",
+        vassdragsnr="002.A2Z", vatnlnr=999001, feature_index=4,
+    )
+    outflow = RiverSeg(
+        xy=np.array([P(0.68, 0.32), P(0.55, 0.22), P(0.40, 0.12)], dtype=np.float64),
+        order=4, strekn_lnr=100006, elvid="SYN-ELV-0000003",
+        vassdragsnr="002.A2Z", vatnlnr=999001, feature_index=5,
+    )
+
+    # hovedelv overlay: the trunk geometry again at a higher order, and NOT added
+    # to `rivers`. Exercises the "upgrade by raster, not by duplicate polyline"
+    # path — rivernet must recover order 6 for the trunk by sampling the weight
+    # grid, without a sixth polyline ever existing.
+    main = RiverSeg(xy=np.vstack([trunk_up.xy, trunk_dn.xy[1:]]), order=6)
+
+    return WaterFeatures(
+        rivers=[trunk_up, trunk_dn, trib, inflow, through, outflow],
+        main_rivers=[main],
+        lakes=[lake],
+    )

@@ -43,7 +43,11 @@ def cmd_build(a):
             "lake_ramp_radius_m": a.lake_ramp_radius,
             "lake_max_depth_m": a.lake_max_depth,
             "river_depth_scale": a.river_depth_scale,
+            "ocean_level_m": a.ocean_level,
+            "emit_geojson": a.emit_geojson,
         }
+        if a.river_vertex_stride is not None:
+            water_opts["river_vertex_stride_m"] = a.river_vertex_stride
         if a.demo:
             water_opts["fetcher"] = _water.synthetic_water_features
 
@@ -66,10 +70,49 @@ def cmd_build(a):
         wm = res.manifest.get("water_surface", {})
         print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
               f"packed in {atlas['surface_file']} (© NVE)")
+        wid = res.manifest.get("water_id", {})
+        if wid:
+            print(f"  + {wid['atlas_file']} (u16 class + lake id; "
+                  f"lake code = {wid['encoding']['lake_id_base']} + lake_id)")
+        wv = res.manifest.get("water_vector", {})
+        if wv:
+            r, lk, jn = wv["rivers"], wv["lakes"], wv["junctions"]
+            print(f"  + {r['file']}: {r['segments']} segments, {r['vertices']} "
+                  f"vertices ({r['bytes'] / 1e6:.1f} MB), upstream→downstream")
+            print(f"  + {lk['file']}: {lk['count']} lakes "
+                  f"({lk['with_authored_level']} with an authored level)")
+            print(f"  + {jn['file']}: {jn['count']} junctions "
+                  f"({jn['inflow']} inflow, {jn['outflow']} outflow)")
+            if wv.get("rivers_geojson"):
+                print(f"  + {wv['rivers_geojson']['file']} (debug sidecar)")
+            _print_water_report(wv["validation"])
         print(f"  + lake beds carved flat {a.lake_max_depth:.1f} m below the known "
               f"NVE surface (bevel radius {a.lake_ramp_radius:.1f} m)")
         print(f"  + river surface raised above the DTM channel by stream order "
               f"(× {a.river_depth_scale:g})")
+
+
+def _print_water_report(rep: dict) -> None:
+    """Validation is advisory: the tool reports and never corrects."""
+    print("\n  water network validation (advisory — nothing was corrected):")
+    print(f"    descent      : {rep['descent_rising_vertices']} of "
+          f"{rep['descent_vertices_checked']} vertices rise downstream "
+          f"({rep['descent_rising_pct']:.2f}%), worst "
+          f"{rep['descent_worst_rise_m']:.2f} m, across "
+          f"{rep['descent_segments_with_rise']} segments")
+    print(f"    flow dir     : {rep['flowdir_disagreements']} of "
+          f"{rep['flowdir_segments_checked']} segments disagree with Z "
+          f"({rep['flowdir_disagreement_pct']:.2f}%) — "
+          f"{rep['flowdir_disagreement_pct_lake_touching']:.2f}% of lake-touching, "
+          f"{rep['flowdir_disagreement_pct_non_lake']:.2f}% of the rest")
+    print(f"    connectivity : {rep['connectivity_orphan_segments']} orphans, "
+          f"{rep['connectivity_source_segments']} sources, "
+          f"{rep['connectivity_sink_segments']} sinks")
+    if rep["flowdir_segments_checked"] and (
+            rep["flowdir_disagreement_pct_lake_touching"] >
+            2.0 * max(rep["flowdir_disagreement_pct_non_lake"], 1e-6)):
+        print("    NOTE: disagreement is concentrated in lake-touching segments, "
+              "which suggests a real ordering issue rather than DTM noise.")
 
 
 def cmd_validate(a):
@@ -190,6 +233,120 @@ def cmd_validate_atlas(a):
     sys.exit(0 if ok else 1)
 
 
+def cmd_validate_water(a):
+    """
+    Re-read the exported water products and check them against the manifest:
+    rivers.bin parses cleanly and its counts match, every segment link resolves,
+    every junction names a lake that exists, and the water_id atlas is dense with
+    the right size. Advisory checks (descent, flow direction) are replayed from
+    the stored report rather than recomputed — the tool never corrects them, so
+    the numbers only need surfacing.
+    """
+    import struct
+
+    from . import rivernet
+
+    with open(os.path.join(a.out, "manifest.json")) as f:
+        man = json.load(f)
+
+    wv = man.get("water_vector")
+    if not wv:
+        print("no 'water_vector' block in manifest — build with --water.")
+        sys.exit(1)
+
+    ok = True
+
+    # ---- rivers.bin ------------------------------------------------------
+    path = os.path.join(a.out, wv["rivers"]["file"])
+    with open(path, "rb") as fh:
+        hdr = fh.read(48)
+        (magic, version, epsg, ox, oy, stride, nseg, nvert, _res) = struct.unpack(
+            "<8sIIddfIII", hdr)
+        if magic != rivernet.BIN_MAGIC:
+            print(f"[rivers] BAD MAGIC {magic!r}")
+            sys.exit(1)
+        print(f"[rivers] {wv['rivers']['file']}: v{version} EPSG:{epsg} "
+              f"stride {stride:g} m, {nseg} segments, {nvert} vertices")
+
+        seen_ids = set()
+        downstream_refs = []
+        total_v = 0
+        for _ in range(nseg):
+            (sid, strekn, vatn, order, down) = struct.unpack("<IqqHi", fh.read(26))
+            (nup,) = struct.unpack("<H", fh.read(2))
+            fh.read(4 * nup)
+            (ln,) = struct.unpack("<B", fh.read(1)); fh.read(ln)
+            (ln,) = struct.unpack("<B", fh.read(1)); fh.read(ln)
+            (nspan,) = struct.unpack("<H", fh.read(2))
+            fh.read(10 * nspan)
+            fh.read(16)
+            (nv,) = struct.unpack("<I", fh.read(4))
+            fh.read(16 * nv)
+            seen_ids.add(sid)
+            total_v += nv
+            if down >= 0:
+                downstream_refs.append((sid, down))
+        trailing = fh.read()
+
+    if trailing:
+        print(f"    {len(trailing)} trailing bytes after the last segment")
+        ok = False
+    if total_v != nvert:
+        print(f"    vertex count mismatch: header {nvert}, actual {total_v}")
+        ok = False
+    dangling = [(s, d) for s, d in downstream_refs if d not in seen_ids]
+    if dangling:
+        print(f"    {len(dangling)} downstream links point at missing segments")
+        ok = False
+    else:
+        print(f"    parsed cleanly; {len(downstream_refs)} downstream links all resolve")
+
+    # ---- lakes + junctions ----------------------------------------------
+    with open(os.path.join(a.out, wv["lakes"]["file"])) as f:
+        lakes = json.load(f)
+    lake_ids = {l["lake_id"] for l in lakes["lakes"]}
+    no_level = [l["lake_id"] for l in lakes["lakes"] if l.get("hoyde_moh") is None]
+    print(f"[lakes] {len(lake_ids)} lakes, {len(no_level)} without an authored level")
+    if no_level:
+        print("    NOTE: lakes without an authored level cannot be pinned "
+              "AuthoredWins; the solver will compute a level for them, and any "
+              "carved bowl beneath them becomes a real basin.")
+
+    with open(os.path.join(a.out, wv["junctions"]["file"])) as f:
+        junc = json.load(f)
+    bad = [j for j in junc["junctions"] if j["lake_id"] not in lake_ids]
+    orphan_seg = [j for j in junc["junctions"] if j["segment_id"] not in seen_ids]
+    print(f"[junctions] {len(junc['junctions'])} total")
+    if bad:
+        print(f"    {len(bad)} reference a lake_id with no lake record")
+        ok = False
+    if orphan_seg:
+        print(f"    {len(orphan_seg)} reference a segment_id not in rivers.bin")
+        ok = False
+    if not bad and not orphan_seg:
+        print("    all lake and segment references resolve")
+
+    # ---- water_id atlas --------------------------------------------------
+    wid = man.get("water_id")
+    if wid:
+        lx, ly = man["leaf_tiles"]
+        ts = man["tile_samples"]
+        expect = core.atlas_total_bytes(lx, ly, man["num_levels"], ts)
+        wpath = os.path.join(a.out, wid["atlas_file"])
+        actual = os.path.getsize(wpath) if os.path.exists(wpath) else -1
+        good = actual == expect
+        ok &= good
+        print(f"[water_id] {wid['atlas_file']}: {actual} bytes, expected {expect} "
+              f"-> {'OK' if good else 'MISMATCH'}")
+        hpath = os.path.join(a.out, man["atlas"]["height_file"])
+        if good and os.path.getsize(hpath) == actual:
+            print("    same size as the height atlas — tile offsets are shared")
+
+    _print_water_report(wv["validation"])
+    print("\nRESULT:", "PASS" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="kvterrain")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -217,6 +374,19 @@ def main(argv=None):
                    help="shore-to-max-depth distance in metres for synthetic lake beds")
     b.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
                    help="maximum synthetic lake depth in metres")
+    b.add_argument("--ocean-level", type=float, default=0.0, dest="ocean_level",
+                   help="sea level in metres above sea level for the Ocean class. "
+                        "Kartverket heights are m.o.h., so 0 is real sea level; the "
+                        "consuming world's ocean plane height is a runtime concern. "
+                        "Ocean is flood-filled from the map edges, not thresholded.")
+    b.add_argument("--river-vertex-stride-m", type=float, default=None,
+                   dest="river_vertex_stride",
+                   help="spacing to densify river polylines to before sampling Z "
+                        "(default: leaf spacing). Denser follows the channel more "
+                        "closely; coarser shrinks rivers.bin.")
+    b.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
+                   help="also write rivers.geojson (debug sidecar for QGIS; "
+                        "rivers.bin is the runtime format)")
     b.set_defaults(func=cmd_build)
 
     v = sub.add_parser("validate", help="spot-check packed leaf heights vs point API")
@@ -230,6 +400,12 @@ def main(argv=None):
     va.add_argument("--n", type=int, default=8,
                     help="tiles sampled per level for the byte-for-byte check")
     va.set_defaults(func=cmd_validate_atlas)
+
+    vw = sub.add_parser("validate-water",
+                        help="check rivers.bin / lakes.json / junctions.json / "
+                             "water_id.atlas against the manifest")
+    vw.add_argument("--out", required=True)
+    vw.set_defaults(func=cmd_validate_water)
 
     a = p.parse_args(argv)
     a.func(a)

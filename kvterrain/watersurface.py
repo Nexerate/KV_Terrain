@@ -12,19 +12,25 @@ Terrain edits stay valid automatically: the surface is a property of the water,
 the depth is re-derived from whatever terrain is current.
 
 Lakes get their authoritative NVE `hoyde` (see water.WaterGrid.lake_surface_moh).
-Rivers have NO elevation in Elvenett (2D polylines), so their surface is estimated
-here from the leaf DTM along each channel:
+Rivers have NO elevation in Elvenett (2D polylines), so their surface is derived
+here from the leaf DTM directly beneath each channel pixel:
 
-  1. Rasterise each centerline in DOWNSTREAM order (Elvenett vertices are ordered
-     downstream) and sample the leaf bed height along it.
-  2. Fit a MONOTONE-NON-INCREASING profile to that bed (isotonic regression / PAVA).
-     Real river surfaces never flow uphill; DTM noise (bridges, vegetation, a coarse
-     cell catching a bank) does. PAVA is the least-squares monotone fit, so it carves
-     spurious bumps and fills spurious dips minimally, without a hand-tuned smoother.
-  3. Add a small nominal depth by Strahler order -> channel surface.
-  4. Tie to lakes: a river pixel adjacent to a lake is pinned to that lake's surface,
-     so the river and lake agree at the outlet/inlet by construction.
-  5. Widen: every pixel of the buffered channel takes its nearest centerline surface.
+    surface(x) = height_leaf(x) + raise_for_order(order(x))
+
+i.e. every river pixel's surface tracks its OWN bed, plus a nominal raise chosen by
+that pixel's Strahler order. A river pixel adjacent to a lake is then pinned to that
+lake's surface, so the two agree exactly at the inlet/outlet.
+
+This is deliberately per-pixel and deliberately NOT a fitted profile. A previous
+revision rasterised each centreline, fitted a monotone-descending profile to the
+sampled bed (isotonic regression / PAVA) and widened it to the buffer; that method
+spiked wherever the chord between sparse vertices crossed a bank. `river_surface_moh`
+documents the failure in full. Do not reintroduce it here.
+
+The polyline products in `rivernet` apply this SAME rule at densified vertices, so
+the raster and the polylines agree by construction rather than by coincidence. The
+raster remains authoritative for display; the polylines exist for the runtime burn,
+which needs the connectivity and ordering that rasterisation destroys.
 
 Coarse levels use a WATER-ONLY downsample (a parent cell is water if ANY child is;
 its surface is the min over water children -- the conservative spill level), so the
@@ -53,15 +59,21 @@ TYPE_LAKE = kvwater.TYPE_LAKE     # 2
 # Sizing rationale (mirrors the lake carve, which uses ~20 m real so it survives a
 # 1:5 vertical compression -> ~4 units and reads opaque): a 1-3 m raise was far
 # below that threshold, so rivers rendered essentially transparent — the symptom
-# that motivated this table. The raise now ramps with stream order so big rivers,
+# that motivated this table. The raise ramps with stream order so big rivers,
 # which sit in deep incised channels, fill those channels and read solidly opaque,
 # while small streams (shallow/no channel) get just a few metres and don't balloon
 # a wide sheet of water over flat ground. depth_for_order clamps any order beyond
 # the table ends, so orders past 8 also get the order-8 value. The whole table is
 # multiplied by `depth_scale` (UI "River surface raise ×" / CLI --river-depth-scale)
 # for per-renderer tuning without editing code.
+#
+# HALVED in 0.5.0. The previous table topped out at 22 m for an order-8 trunk,
+# which overshot: a 22 m column is wider than most real Norwegian channels are
+# deep, so big rivers read as bulging sheets rather than as water sitting in a
+# ravine. Every entry is exactly half its former value. If you need the old look
+# back, --river-depth-scale 2.0 reproduces it precisely.
 DEFAULT_DEPTH_BY_ORDER = {
-    1: 3.0, 2: 4.5, 3: 6.0, 4: 8.0, 5: 11.0, 6: 14.0, 7: 18.0, 8: 22.0,
+    1: 1.5, 2: 2.25, 3: 3.0, 4: 4.0, 5: 5.5, 6: 7.0, 7: 9.0, 8: 11.0,
 }
 
 
@@ -77,33 +89,20 @@ def depth_for_order(order: int, table: dict, scale: float = 1.0) -> float:
     return float(table[o]) * float(scale)
 
 
-def _pava_nondecreasing(y: np.ndarray) -> np.ndarray:
-    """Pool-Adjacent-Violators: least-squares monotone NON-DECREASING fit."""
-    y = np.asarray(y, dtype=np.float64)
-    n = y.size
-    if n <= 1:
-        return y.copy()
-    vals: list[float] = []
-    wts: list[float] = []
-    cnts: list[int] = []
-    for yi in y:
-        vals.append(float(yi)); wts.append(1.0); cnts.append(1)
-        while len(vals) > 1 and vals[-2] > vals[-1]:
-            v2 = vals.pop(); w2 = wts.pop(); c2 = cnts.pop()
-            v1 = vals.pop(); w1 = wts.pop(); c1 = cnts.pop()
-            vals.append((v1 * w1 + v2 * w2) / (w1 + w2))
-            wts.append(w1 + w2); cnts.append(c1 + c2)
-    out = np.empty(n, dtype=np.float64)
-    i = 0
-    for v, c in zip(vals, cnts):
-        out[i:i + c] = v
-        i += c
-    return out
-
-
-def isotonic_decreasing(y: np.ndarray) -> np.ndarray:
-    """Least-squares monotone NON-INCREASING fit (upstream -> downstream)."""
-    return -_pava_nondecreasing(-np.asarray(y, dtype=np.float64))
+# NOTE (0.5.0): `_pava_nondecreasing` / `isotonic_decreasing` lived here and are
+# now DELETED. They were the last remnants of the removed centreline approach
+# (rasterise a polyline, fit a monotone-descending profile, widen to the buffer)
+# whose widen step caused the river-spike failure described in
+# `river_surface_moh` below. Nothing called them.
+#
+# We do NOT reintroduce a profile fit. The tool must not smooth or correct river
+# Z — it reports non-monotonic descent as a warning and leaves the numbers alone;
+# the runtime's running-minimum during the burn is what enforces descent. See
+# `rivernet.validate_descent`.
+#
+# The remaining helpers below (`_fill_nan_1d`, `_line_rc`, `_bresenham_path`) are
+# NOT dead: `rivernet` uses them to walk a centreline's pixel path and to repair
+# nodata bed samples along it.
 
 
 def _fill_nan_1d(y: np.ndarray) -> np.ndarray:
@@ -251,11 +250,19 @@ def combine_water_surface(lake_surface: np.ndarray,
 
 def downsample_surface_water_only(surf: np.ndarray) -> np.ndarray:
     """
-    One pyramid step for the surface field, matching water.decimate_water_corner's
-    corner-anchored 3x3 scheme: a parent sample is water if ANY of its up-to-9 child
-    samples is water, and its surface is the MIN over the water children (the
-    conservative spill level -- never floods a cell higher than its lowest water
-    child would). NaN stays NaN (no water).
+    One pyramid step for the surface field: a parent sample is water if ANY of its
+    up-to-9 corner-anchored child samples is water, and its surface is the MIN over
+    the water children (the conservative spill level -- never floods a cell higher
+    than its lowest water child would). NaN stays NaN (no water).
+
+    The corner-anchored 3x3 gather matches `core.decimate_corner`'s sample lattice
+    (parent sample i sits on child sample 2i), so a surface sample and its height
+    twin stay on the same world point at every level. `waterid.downsample_water_id`
+    uses the identical gather with a categorical rule.
+
+    (This docstring used to cite `water.decimate_water_corner` as the scheme being
+    matched. That function was deleted along with the categorical `.water` tile;
+    the scheme it described is now defined here and in `waterid`.)
     """
     SY, SX = surf.shape
     oy, ox = (SY - 1) // 2 + 1, (SX - 1) // 2 + 1

@@ -9,7 +9,6 @@ Run:
     streamlit run app.py
 """
 import io
-import json
 import os
 import zipfile
 import tempfile
@@ -86,6 +85,30 @@ with st.sidebar:
                                     "NVE surface. Must exceed the renderer's opaque "
                                     "threshold AFTER any height compression (e.g. 20 m "
                                     "real → 4 units at 1:5).")
+    ocean_level = st.number_input("Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0,
+                                  disabled=not want_water,
+                                  help="Kartverket heights are metres above sea level, "
+                                       "so 0 is real sea level. Ocean is flood-filled "
+                                       "inward from the map edges, not thresholded, so "
+                                       "inland below-sea-level ground is never "
+                                       "mislabelled as sea.")
+
+    st.divider()
+    st.subheader("River polylines")
+    st.caption("The burn needs flow direction, connectivity and the ramp profile — "
+               "none of which survive rasterisation. These are emitted as vectors "
+               "beside the rasters and loaded once at runtime, not streamed.")
+    river_vertex_stride = st.slider("Vertex stride (m, 0 = leaf spacing)",
+                                    0.0, 32.0, 0.0, 1.0, disabled=not want_water,
+                                    help="Polylines are densified to this spacing "
+                                         "before the DTM is sampled beneath them. "
+                                         "Denser follows the real channel more "
+                                         "closely; coarser shrinks rivers.bin.")
+    emit_geojson = st.toggle("Also write rivers.geojson", value=False,
+                             disabled=not want_water,
+                             help="Debug sidecar for QGIS. rivers.bin is the runtime "
+                                  "format — this is for when you need to LOOK at a "
+                                  "validation warning.")
 
     st.divider()
     demo = st.toggle("Demo mode (synthetic, no network)", value=False,
@@ -156,6 +179,11 @@ with col_info:
             wsurf_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 2 / 1e6
             st.caption(f"+ water surface: surface.atlas "
                        f"(≈ {wsurf_mb:,.1f} MB, u16) from NVE")
+            st.caption(f"+ water classes + lake ids: water_id.atlas "
+                       f"(≈ {wsurf_mb:,.1f} MB, u16) — same tile offsets as the "
+                       f"height atlas")
+            st.caption("+ river polylines: rivers.bin + lakes.json + junctions.json "
+                       "(vectors, loaded once at runtime — not streamed)")
             st.caption(f"+ lake beds carved flat {lake_max_depth:.0f} m below the "
                        f"known NVE surface ({lake_ramp_radius:.0f} m shore bevel)")
             st.caption(f"+ river surfaces raised above the DTM channel by stream "
@@ -194,74 +222,46 @@ if go and plan is not None:
     try:
         out_dir = tempfile.mkdtemp(prefix="kvterrain_")
 
-        leaf = core.assemble_region(
-            plan,
-            fetcher or (lambda u, e, sx, sy, nx, ny, sp:
-                        core.export_image_fetch(u, e, sx, sy, nx, ny, sp,
-                                                source_kind=source_kind)),
-            server_url or core.IMAGESERVER[source_kind],
-            max_fetch_px=max_fetch_px, progress=on_progress)
-
-        # ---- water pass runs BEFORE the height pyramid is built -----------
-        # Lakes/rivers must exist so the bed can be carved and the water-surface
-        # field computed against `leaf` before build_pyramid() locks it in.
-        water_leaf = None
-        surface_levels = None
-        lake_count = 0
+        # ONE call. This module used to re-implement the whole build sequence —
+        # assemble, void-repair, carve, river surface, combine, pyramid, export —
+        # as a second copy of core.run_export. The two copies had already drifted
+        # apart, and every change to the pipeline had to be written twice and kept
+        # in sync by hand. All of the Streamlit code stays here; only the pipeline
+        # duplication is gone. run_export hands the water products back on its
+        # result so the previews below still work.
+        water_opts = None
         if want_water:
-            prog.progress(0.99, text="fetching + rasterising rivers & lakes…")
-            from kvterrain import water as kvwater
-            from kvterrain import bathymetry
-            from kvterrain import watersurface as kvws
-
-            feats = (kvwater.synthetic_water_features(plan) if demo
-                     else kvwater.fetch_water_features(
-                         plan, include_main_rivers=main_rivers))
-            water_leaf = kvwater.rasterize_water(
-                plan, feats, width_scale=river_width_scale)
-            lake_count = len(water_leaf.lake_table)
-
-            lake_surf = water_leaf.lake_surface_moh()          # NVE hoyde
-            leaf = bathymetry.carve_lake_beds(
-                leaf,
-                water_leaf.type,
-                plan.spacing_m,
-                surface_moh=lake_surf,
-                carve_depth_m=lake_max_depth,
-                ramp_radius_m=lake_ramp_radius,
-            )
-            # Unified per-pixel water surface: lakes = authoritative NVE hoyde,
-            # rivers = leaf-DTM bed raised by stream order (× river_depth_scale) so
-            # they sit visibly above the incised channel instead of at terrain height.
-            river_surf = kvws.river_surface_moh(
-                plan, feats, water_leaf, leaf,
-                depth_scale=river_depth_scale, lake_surface=lake_surf)
-            water_surface = kvws.combine_water_surface(lake_surf, river_surf)
-            surface_levels = kvws.build_surface_pyramid(water_surface, plan.num_levels)
-
-        prog.progress(1.0, text="building pyramid + slicing tiles…")
-        levels = core.build_pyramid(leaf, plan.num_levels)
-        res = core.export_tiles(plan, levels, out_dir,
-                                nodata_fill_m=nodata_fill,
-                                height_min=hmin, height_max=hmax,
-                                source_kind=source_kind)
-
-        if surface_levels is not None:
-            from kvterrain import watersurface as kvws
-            wsurf = kvws.export_surface_tiles(
-                plan, surface_levels, out_dir, res.height_min, res.height_max)
-            if "atlas" in res.manifest and wsurf.get("atlas_file"):
-                res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
-            wsurf["lake_count"] = lake_count
-            wsurf["lake_bathymetry"] = {
-                "enabled": True,
-                "carve_depth_m": float(lake_max_depth),
-                "shore_bevel_m": float(lake_ramp_radius),
-                "method": "flat_below_known_surface_with_shore_bevel",
+            water_opts = {
+                "include_main_rivers": main_rivers,
+                "width_scale": river_width_scale,
+                "river_depth_scale": river_depth_scale,
+                "lake_ramp_radius_m": lake_ramp_radius,
+                "lake_max_depth_m": lake_max_depth,
+                "ocean_level_m": ocean_level,
+                "emit_geojson": emit_geojson,
             }
-            res.manifest["water_surface"] = wsurf
-            with open(os.path.join(out_dir, "manifest.json"), "w") as _f:
-                json.dump(res.manifest, _f, indent=2)
+            if river_vertex_stride > 0:
+                water_opts["river_vertex_stride_m"] = river_vertex_stride
+            if demo:
+                from kvterrain import water as kvwater
+                water_opts["fetcher"] = kvwater.synthetic_water_features
+
+        res = core.run_export(
+            plan, out_dir,
+            source_kind=source_kind,
+            fetcher=fetcher,
+            server_url=server_url,
+            max_fetch_px=max_fetch_px,
+            nodata_fill_m=nodata_fill,
+            height_min=hmin, height_max=hmax,
+            progress=on_progress,
+            include_water=want_water,
+            water_opts=water_opts,
+        )
+        prog.progress(1.0, text="packing…")
+
+        water_leaf = res.water_grid
+        lake_count = len((water_leaf.lake_table if water_leaf else {}) or {})
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -274,7 +274,7 @@ if go and plan is not None:
         st.success(f"Built {res.tiles_written} tiles across {plan.num_levels} levels. "
                    f"Vertical range [{res.height_min:.1f}, {res.height_max:.1f}] m.")
 
-        coarse = levels[-1]
+        coarse = res.coarse_level
         norm = np.clip((coarse - res.height_min) /
                        max(res.height_max - res.height_min, 1e-6), 0, 1)
         have_water = want_water and water_leaf is not None
@@ -304,6 +304,41 @@ if go and plan is not None:
                        f"(× {river_depth_scale:g}). {kvwater.WATER_ATTRIBUTION}.")
             st.caption(f"Lake beds carved flat {lake_max_depth:.0f} m below the known "
                        f"NVE surface ({lake_ramp_radius:.0f} m shore bevel).")
+
+            wv = res.manifest.get("water_vector")
+            if wv:
+                r, lk, jn = wv["rivers"], wv["lakes"], wv["junctions"]
+                st.caption(
+                    f"Vectors: {r['segments']} river segments / {r['vertices']} "
+                    f"vertices ({r['bytes'] / 1e6:.1f} MB, upstream→downstream, "
+                    f"bed Z + surface level per vertex) · {lk['count']} lake "
+                    f"records ({lk['with_authored_level']} with an authored level) "
+                    f"· {jn['count']} junctions ({jn['inflow']} in / "
+                    f"{jn['outflow']} out) · classes in water_id.atlas.")
+
+                rep = wv["validation"]
+                with st.expander("Water network validation (advisory)"):
+                    st.markdown(
+                        f"""
+- **Descent:** {rep['descent_rising_vertices']:,} of
+  {rep['descent_vertices_checked']:,} vertices rise going downstream
+  ({rep['descent_rising_pct']:.2f} %), worst
+  {rep['descent_worst_rise_m']:.2f} m, across
+  {rep['descent_segments_with_rise']:,} segments.
+- **Flow direction:** {rep['flowdir_disagreements']:,} of
+  {rep['flowdir_segments_checked']:,} segments
+  ({rep['flowdir_disagreement_pct']:.2f} %) run uphill by sampled Z —
+  {rep['flowdir_disagreement_pct_lake_touching']:.2f} % of lake-touching
+  segments vs {rep['flowdir_disagreement_pct_non_lake']:.2f} % of the rest.
+- **Connectivity:** {rep['connectivity_orphan_segments']:,} orphans,
+  {rep['connectivity_source_segments']:,} sources,
+  {rep['connectivity_sink_segments']:,} sinks.
+""")
+                    st.caption("Nothing here is corrected. Source vertex order stays "
+                               "authoritative and river Z is left alone; the runtime "
+                               "burn's running-minimum enforces descent. Disagreement "
+                               "concentrated in lake-touching segments would suggest a "
+                               "real ordering problem rather than DTM noise.")
 
         st.download_button("Download tiles + manifest (zip)", buf,
                            file_name="kvterrain_tiles.zip", mime="application/zip")

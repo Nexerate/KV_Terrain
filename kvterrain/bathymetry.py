@@ -23,8 +23,33 @@ lake polygon comes back one of two ways:
 Because (b) is FINITE, an `isfinite` test cannot find it. `fill_lake_surface`
 therefore detects voids PHYSICALLY: a lake sample is a void if it is non-finite
 OR sits more than `void_below_shore_m` below its own shoreline. It then fills
-each lake's voids with that lake's (flat) shoreline elevation before the bowl is
-carved. `carve_lake_beds` calls it automatically (fill_voids=True).
+each lake's voids with that lake's (flat) shoreline elevation.
+
+CALL ORDER (this is the contract; `carve_lake_beds` does NOT do it for you):
+
+    leaf = fill_lake_surface(leaf, wg.type)          # repair voids
+    leaf = carve_lake_beds(leaf, wg.type, spacing,   # then carve the bowl
+                           surface_moh=lake_surf, ...)
+
+Earlier revisions of this docstring claimed `carve_lake_beds` invoked
+`fill_lake_surface` automatically via `fill_voids=True`. IT NEVER DID — the
+`fill_voids` kwarg is a legacy alias for `estimate_missing`, which gates
+`estimate_lake_surface` (a different function that only picks a water LEVEL).
+The carve then happened to hide interior voids as a side effect, because it
+overwrites every lake pixel with `surface - carve_depth` regardless of what the
+DTM returned there.
+
+That side effect is not a substitute for the repair, for two reasons:
+
+  * it misses lakes that have neither an NVE `hoyde` nor a usable shoreline, and
+  * it cannot touch the thin ring of void land just OUTSIDE the polygon, where
+    the source raster and the NVE geometry fail to align to the pixel. Those
+    shore-ring voids stay in `bed` as a fake pit right at the waterline, which
+    the runtime clip pass (`depth = max(0, L - bed)`) renders as a spike and the
+    solver reads as a spurious basin.
+
+`core.run_export` therefore calls `fill_lake_surface` explicitly, before the
+carve. Any other caller must do the same.
 """
 
 from __future__ import annotations
@@ -278,6 +303,29 @@ def carve_lake_beds(
 
     The only purpose of the carve is to sink the bed far enough below the water
     surface that the consumer renders opaque water; it is not real bathymetry.
+
+    WHY THIS IS SAFE FOR THE SOLVER (it looks like it should not be).
+    The carve deliberately writes a depression into the visual terrain, which
+    reads as a violation of "do not change the visual terrain". It is not, and
+    the reason is worth recording because it is easy to talk yourself out of:
+
+      * The source leaves us no choice. LiDAR gets no return from water, so the
+        DTM carries a lake's SURFACE as its terrain height. Without a carve the
+        water plane and the terrain are coincident and the surfaces z-fight.
+        There is no true bed in the input to preserve.
+      * It is the depression-hierarchy's Case 1: a hole beneath an existing lake
+        that does not break the rim. The bevel guarantees the bed descends
+        monotonically inward from the shoreline, so no rim cell is ever lowered
+        and the drainage topology is untouched.
+      * The basin it creates is never discovered as a free basin, because the
+        lake carries an authored level (NVE `hoyde`) and is pinned
+        `AuthoredWins`. The solver reads the pinned level; the carve only makes
+        `max(0, L - bed)` deeper, which is the intended visual result.
+
+    The pin is load-bearing. If a lake ever loses its authored level and falls
+    through to the computed path, the solver will find this fabricated bowl and
+    fill it to a spill elevation that means nothing. Keep lake records emitted
+    and keep the pin flag wired.
     """
     if height_m.shape != water_type.shape:
         raise ValueError(

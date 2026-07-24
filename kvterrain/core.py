@@ -296,6 +296,13 @@ class PackResult:
     height_max: float
     manifest: dict
     tiles_written: int
+    # Water products, returned so a UI can preview them without re-running the
+    # pipeline. `app.py` used to keep its own copy of the whole build sequence in
+    # order to hold on to these; it now calls run_export and reads them here.
+    water_grid: object = None       # water.WaterGrid | None
+    river_net: object = None        # rivernet.RiverNetwork | None
+    water_id_leaf: object = None    # np.ndarray | None
+    coarse_level: object = None     # np.ndarray | None — root of the height pyramid
 
 
 def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int, int, int]:
@@ -505,11 +512,17 @@ def run_export(
                            max_fetch_px=max_fetch_px, progress=progress)
 
     surface_levels = None
+    water_id_levels = None
+    water_leaf = None
+    river_net = None
+    water_params: dict = {}
     lake_count = 0
     carve_depth_m = 0.0
     bevel_px = 0
+    emit_geojson = False
+
     if include_water:
-        from . import water, bathymetry, watersurface
+        from . import water, bathymetry, watersurface, waterid, rivernet
         opts = dict(water_opts or {})
         features = opts.pop("features", None)
         fetcher_water = opts.pop("fetcher", None)
@@ -519,6 +532,9 @@ def run_export(
         if "lake_ramp_radius_m" in opts:   # legacy alias -> bevel width in texels
             bevel_px = max(1, int(round(float(opts.pop("lake_ramp_radius_m")) / plan.spacing_m)))
         depth_scale = float(opts.pop("river_depth_scale", 1.0))
+        ocean_level_m = float(opts.pop("ocean_level_m", waterid.DEFAULT_OCEAN_LEVEL_M))
+        vertex_stride_m = float(opts.pop("river_vertex_stride_m", plan.spacing_m))
+        emit_geojson = bool(opts.pop("emit_geojson", False))
 
         # Pop the rasterise-only keys so they never leak into fetch_water_features
         # (which doesn't accept them). What remains in `opts` is fetch kwargs only.
@@ -536,6 +552,19 @@ def run_export(
         water_leaf = water.rasterize_water(plan, features, **raster_opts)
         lake_count = len(water_leaf.lake_table)
         lake_surf = water_leaf.lake_surface_moh()          # authoritative NVE hoyde
+
+        # 1. VOID REPAIR, before anything reads the bed. Kartverket returns a void
+        #    lake interior as a finite 0/sentinel rather than NaN, so an isfinite
+        #    test misses it entirely. Left in place it becomes the export's
+        #    height_min and the shore ring keeps a fake pit right at the waterline.
+        #    The carve below hides interior voids as a side effect but cannot reach
+        #    the ring outside the polygon, and does nothing for lakes with neither
+        #    an NVE hoyde nor a usable shoreline. See bathymetry's module docstring.
+        leaf = bathymetry.fill_lake_surface(leaf, water_leaf.type)
+
+        # 2. Carve the bowl so the water plane does not z-fight the LiDAR-flattened
+        #    lake surface. Safe for the solver only because the lake level is
+        #    authored and pinned — see carve_lake_beds.
         leaf = bathymetry.carve_lake_beds(
             leaf,
             water_leaf.type,
@@ -544,25 +573,58 @@ def run_export(
             carve_depth_m=carve_depth_m,
             bevel_px=bevel_px,
         )
-        # Unified water surface (lakes = NVE hoyde, rivers = leaf-DTM bed + a raise
-        # by stream order), then its water-only pyramid. Rivers sample the *leaf*
-        # bed, so this must run on `leaf` before the height pyramid is built.
+
+        # 3. Unified water surface (lakes = NVE hoyde, rivers = leaf-DTM bed + a
+        #    raise by stream order), then its water-only pyramid. Rivers sample the
+        #    *leaf* bed, so this must run on `leaf` before the pyramid is built.
         river_surf = watersurface.river_surface_moh(
             plan, features, water_leaf, leaf,
             depth_scale=depth_scale, lake_surface=lake_surf)
         water_surface = watersurface.combine_water_surface(lake_surf, river_surf)
         surface_levels = watersurface.build_surface_pyramid(water_surface, plan.num_levels)
 
+        # 4. Class + authored lake identity. Ocean is flood-filled inward from the
+        #    map edges, not thresholded, so inland sub-sea-level ground (including
+        #    the bowls just carved) is never mislabelled sea.
+        ocean = waterid.ocean_mask_from_edges(
+            leaf, ocean_level_m,
+            exclude=(water_leaf.type != water.TYPE_LAND))
+        water_id_leaf = waterid.build_water_id(water_leaf, ocean)
+        water_id_levels = waterid.build_water_id_pyramid(water_id_leaf, plan.num_levels)
+
+        # 5. The polylines. Sampled against the SAME leaf the surface raster used,
+        #    so polyline `level` equals the raster surface pixel-for-pixel.
+        river_net = rivernet.build_river_network(
+            plan, features, water_leaf, leaf,
+            water_surface=water_surface,
+            vertex_stride_m=vertex_stride_m, depth_scale=depth_scale)
+
+        water_params = {
+            "river_width_scale": raster_opts.get("width_scale", 1.0),
+            "river_depth_scale": depth_scale,
+            "river_vertex_stride_m": vertex_stride_m,
+            "lake_carve_depth_m": carve_depth_m,
+            "lake_bevel_px": bevel_px,
+            "ocean_level_m": ocean_level_m,
+            "include_main_rivers": opts.get("include_main_rivers", True),
+        }
+
     levels = build_pyramid(leaf, plan.num_levels)
     res = export_tiles(plan, levels, out_dir,
                        nodata_fill_m=nodata_fill_m,
                        height_min=height_min, height_max=height_max,
                        source_kind=source_kind)
+    res.water_grid = water_leaf
+    res.river_net = river_net
+    res.water_id_leaf = water_id_levels[0] if water_id_levels else None
+    res.coarse_level = levels[-1]
 
     if surface_levels is not None:
+        import os
+        from . import watersurface, waterid, rivernet
+
         # The surface atlas packs on the SAME [height_min, height_max] as the height atlas,
         # so it can only be written now that export_tiles has finalised that range.
-        from . import watersurface
         wsurf = watersurface.export_surface_tiles(
             plan, surface_levels, out_dir, res.height_min, res.height_max)
         # Name the surface atlas in the header so the runtime opens the second handle.
@@ -573,9 +635,42 @@ def run_export(
             "carve_depth_m": float(carve_depth_m),
             "bevel_px": int(bevel_px),
             "method": "flat_below_known_surface_with_shore_bevel",
+            "rationale": "LiDAR returns the lake SURFACE as terrain height, so "
+                         "without a carve the water plane and the terrain are "
+                         "coincident. Safe for the solver: bevelled, never breaks "
+                         "the rim, and the lake level is authored and pinned.",
         }
         res.manifest["water_surface"] = wsurf
+
+        wid = waterid.export_water_id_tiles(plan, water_id_levels, out_dir)
+        res.manifest["atlas"]["water_id_file"] = wid["atlas_file"]
+        res.manifest["water_id"] = wid
+
+        res.manifest["water_vector"] = rivernet.export_river_network(
+            river_net, plan, out_dir, emit_geojson=emit_geojson)
+
+        res.manifest["generator"] = rivernet.generator_metadata(plan, {
+            "source_kind": source_kind,
+            "nodata_fill_m": nodata_fill_m,
+            "height_min_m": res.height_min,
+            "height_max_m": res.height_max,
+            "tile_cells": plan.tile_cells,
+            "water": water_params,
+        })
+
+        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+            json.dump(res.manifest, f, indent=2)
+    else:
         import os
+        from . import rivernet
+        res.manifest["generator"] = rivernet.generator_metadata(plan, {
+            "source_kind": source_kind,
+            "nodata_fill_m": nodata_fill_m,
+            "height_min_m": res.height_min,
+            "height_max_m": res.height_max,
+            "tile_cells": plan.tile_cells,
+            "water": None,
+        })
         with open(os.path.join(out_dir, "manifest.json"), "w") as f:
             json.dump(res.manifest, f, indent=2)
 

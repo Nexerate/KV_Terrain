@@ -1,0 +1,24 @@
+{
+  "format": "kvterrain-junctions/1",
+  "crs": "EPSG:25832",
+  "types": ["Inflow", "Outflow"],
+  "note": "Inflow: the river segment enters the lake at this point (it becomes a source on the lake's basin node). Outflow: the segment leaves the lake here (it starts at the lake's spill point).",
+  "junctions": [
+    {
+      "segment_id": 3,
+      "strekn_lnr": 100004,
+      "lake_id": 1,
+      "vatn_lnr": 999001,
+      "type": "Inflow",
+      "position": [473384.0, 6794032.15, 373.86]
+    },
+    {
+      "segment_id": 5,
+      "strekn_lnr": 100006,
+      "lake_id": 1,
+      "vatn_lnr": 999001,
+      "type": "Outflow",
+      "position": [469286.17, 6790501.89, 370.7]
+    }
+  ]
+}

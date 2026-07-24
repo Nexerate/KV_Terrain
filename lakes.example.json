@@ -1,0 +1,25 @@
+{
+  "format": "kvterrain-lakes/1",
+  "crs": "EPSG:25832",
+  "lake_id_base": 16,
+  "mask_reference": {
+    "file": "water_id.atlas",
+    "rule": "a pixel belongs to lake_id n where water_id == 16 + n"
+  },
+  "authored_level_field": "hoyde_moh",
+  "policy": "AuthoredWins",
+  "note": "no polygon geometry is emitted; the per-pixel mask in water_id.atlas is the geometry reference.",
+  "lakes": [
+    {
+      "lake_id": 1,
+      "water_id_code": 17,
+      "vatn_lnr": 999001,
+      "navn": "Synthetic Lake",
+      "area_m2": 16777216.0,
+      "hoyde_moh": 320.0,
+      "authored_level_m": 320.0,
+      "pixel_count": 168100,
+      "bbox_utm": [469290.0, 6790330.0, 473380.0, 6794420.0]
+    }
+  ]
+}
