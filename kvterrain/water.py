@@ -84,8 +84,17 @@ RIVER_LAYER_MAIN = 1       # 'hovedelv'  — main rivers only (polyline)
 LAKE_SERVICE = "https://kart.nve.no/enterprise/rest/services/Innsjodatabase2/MapServer"
 LAKE_LAYER = 5             # 'Innsjodatabase' — lake polygons
 
-# Optional attribute names, tried in order. None are required.
-RIVER_ORDER_FIELDS = ("STRAHLER", "strahler", "elveOrden", "elveorden", "orden", "ORDEN")
+# Attribute names, tried in order; the FIRST entry of each tuple is the name the
+# live service actually uses, verified against the layer's own `?f=json` metadata
+# (see `describe_layer` / `kvterrain describe-services`). The rest are historical
+# or defensive spellings kept only so an older/mirrored service still resolves.
+#
+# Read the metadata before editing these. Two of these tuples were wrong for the
+# whole of 0.5.0 because they were written from guesswork and from field ALIASES
+# rather than field NAMES — ArcGIS returns names in GeoJSON `properties`, and the
+# alias ("Strahler") is not the name ("elveordenstrahler").
+RIVER_ORDER_FIELDS = ("elveordenstrahler", "STRAHLER", "strahler",
+                      "elveOrden", "elveorden", "orden", "ORDEN")
 
 # ── ELVIS stable identity ────────────────────────────────────────────────────
 # NVE documents these as persistent across service updates; they are what makes a
@@ -101,7 +110,8 @@ RIVER_ORDER_FIELDS = ("STRAHLER", "strahler", "elveOrden", "elveorden", "orden",
 #
 # `objectid` is deliberately NOT read: it is an Esri-internal OID, ephemeral
 # across service updates, and persisting it would silently rot.
-RIVER_STREKN_FIELDS = ("strekn_lnr", "streknLnr", "STREKN_LNR", "streknlnr")
+RIVER_STREKN_FIELDS = ("strekninglnr", "strekn_lnr", "streknLnr", "STREKN_LNR",
+                       "streknlnr")
 RIVER_ELVID_FIELDS = ("elvid", "elvId", "ELVID", "elv_id")
 RIVER_VASSDRAG_FIELDS = ("vassdragsnr", "vassdragNr", "VASSDRAGSNR", "vassdragsnummer")
 RIVER_VATNLNR_FIELDS = ("vatnlnr", "vatnLnr", "VATNLNR", "vatn_lnr")
@@ -239,24 +249,37 @@ class WaterGrid:
     # return 0 and silently demote every trunk river crossing a lake.
     weight_raw: np.ndarray = None      # u1
 
+    def lake_level(self, info: dict):
+        """
+        The level this lake should actually be rendered and carved at.
+
+        `level_m` when `apply_estimated_levels` has filled one in, else the NVE
+        `hoyde_moh`. Kept as one accessor so the carve, the surface raster, the
+        river tie-in and lakes.json cannot disagree about a lake's level — they
+        did disagree before, and the result was a 20 m dry pit wherever NVE had
+        no `hoyde` (see `apply_estimated_levels`).
+        """
+        lvl = info.get("level_m")
+        return info.get("hoyde_moh") if lvl is None else lvl
+
     def lake_surface_moh(self) -> np.ndarray:
         """
         Per-pixel lake water-surface elevation (m.o.h.), float32, NaN everywhere
-        except lake pixels whose lake has a known `hoyde_moh`. This is the array the
-        carve reads to place the bed and the runtime reads for depth = surface -
-        terrain. Lakes missing `hoyde_moh` stay NaN so callers can fall back to the
-        shore-estimate path for just those.
+        except lake pixels whose lake has a resolved level (see `lake_level`).
+        This is the array the carve reads to place the bed and the runtime reads
+        for depth = surface - terrain. Lakes with no level from either source stay
+        NaN — and MUST then be left uncarved, or they become a dry hole.
         """
         surf = np.full(self.type.shape, np.nan, dtype=np.float32)
         if not self.lake_table:
             return surf
-        # Build an id->hoyde lookup array indexed by local lake id (0..maxid).
+        # Build an id->level lookup array indexed by local lake id (0..maxid).
         maxid = int(self.lake_id.max()) if self.lake_id.size else 0
         if maxid == 0:
             return surf
         lut = np.full(maxid + 1, np.nan, dtype=np.float32)
         for lid, info in self.lake_table.items():
-            h = info.get("hoyde_moh")
+            h = self.lake_level(info)
             if lid <= maxid and h is not None:
                 lut[lid] = np.float32(h)
         is_lake = self.type == TYPE_LAKE
@@ -362,11 +385,127 @@ def _arcgis_query_geojson(
     return feats
 
 
-def _first_attr(props: dict, names) -> Optional[object]:
-    for n in names:
-        if n in props and props[n] is not None:
-            return props[n]
-    return None
+def _norm_key(s) -> str:
+    """Fold a property name to letters+digits only, lowercased."""
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
+# NOTE: `_first_attr` lived here and is now DELETED. It resolved one property per
+# call, per feature, by rescanning the whole property dict — so a schema mismatch
+# was invisible unless a caller happened to check the result and complain.
+# `resolve_fields` replaces it: the schema is resolved ONCE per layer against the
+# union of property names, and `report_field_map` prints the outcome whether or
+# not it succeeded. That inversion is the actual fix here; the two corrected
+# spellings above are just the symptom it was hiding.
+
+
+# Logical field -> candidate spellings, for the two feature layers we parse.
+# `resolve_fields` turns these into "logical name -> the name this service really
+# uses", once per layer per run, and `report_field_map` prints the result.
+RIVER_FIELD_CANDIDATES = {
+    "order": RIVER_ORDER_FIELDS,
+    "strekn_lnr": RIVER_STREKN_FIELDS,
+    "elvid": RIVER_ELVID_FIELDS,
+    "vassdragsnr": RIVER_VASSDRAG_FIELDS,
+    "vatnlnr": RIVER_VATNLNR_FIELDS,
+    "vnrnfelt": RIVER_CATCHMENT_FIELDS,
+}
+LAKE_FIELD_CANDIDATES = {
+    "lopenr": LAKE_ID_FIELDS,
+    "navn": LAKE_NAME_FIELDS,
+    "area": LAKE_AREA_FIELDS,
+    "hoyde": LAKE_HOYDE_FIELDS,
+}
+
+# Logical fields whose absence changes the OUTPUT rather than just dropping a
+# label, and which must therefore be shouted about rather than mentioned. `order`
+# is here because losing it is invisible downstream: every segment silently takes
+# DEFAULT_ORDER_MINOR, every river gets the same width and the same surface
+# raise, and nothing in the export says so. That is exactly what happened for the
+# whole of 0.5.0.
+#
+# Criticality is PER LAYER, not global: hovedelv carries no order field at all
+# and is not supposed to, so flagging it there would train the reader to ignore
+# the warning — which is how the real one went unnoticed in the first place.
+CRITICAL_FIELDS = frozenset({"order", "hoyde"})
+NO_CRITICAL_FIELDS: frozenset = frozenset()
+
+
+def resolve_fields(available, candidates: dict) -> dict:
+    """
+    Map each logical field to the name THIS service actually uses (or None).
+
+    Three passes, narrowing in confidence: exact name, then case/punctuation-
+    folded name, then a folded SUBSTRING match that is only accepted when exactly
+    one field matches. The substring pass is what would have caught
+    `elveordenstrahler` from the candidate `strahler` without anyone noticing the
+    rename; the uniqueness requirement is what stops it pairing `navn` with
+    `elvenavnhierarki`.
+    """
+    available = list(available)
+    exact = set(available)
+    folded: dict = {}
+    for k in available:                      # first spelling wins ties
+        folded.setdefault(_norm_key(k), k)
+
+    out: dict = {}
+    for logical, names in candidates.items():
+        hit = None
+        for n in names:
+            if n in exact:
+                hit = n
+                break
+        if hit is None:
+            for n in names:
+                hit = folded.get(_norm_key(n))
+                if hit:
+                    break
+        if hit is None:
+            for n in names:
+                want = _norm_key(n)
+                near = [k for fk, k in folded.items() if want in fk]
+                if len(near) == 1:
+                    hit = near[0]
+                    break
+        out[logical] = hit
+    return out
+
+
+_FIELD_MAP_REPORTED: set = set()
+
+
+def report_field_map(layer_label: str, fmap: dict, available,
+                     critical=CRITICAL_FIELDS, note: Optional[str] = None) -> None:
+    """
+    Print, once per layer per run, how every logical field resolved.
+
+    Deliberately prints on success too. The predecessor only spoke up when the
+    river primary key was missing, so a missing `order` — which matters more —
+    went unreported for an entire release. Silence should mean "not run", never
+    "nothing to say".
+    """
+    if layer_label in _FIELD_MAP_REPORTED:
+        return
+    _FIELD_MAP_REPORTED.add(layer_label)
+
+    got = {k: v for k, v in fmap.items() if v}
+    lost = [k for k, v in fmap.items() if not v]
+    pairs = ", ".join(f"{k}->{v}" for k, v in sorted(got.items()))
+    print(f"[kvterrain.water] {layer_label}: matched {len(got)}/{len(fmap)} fields ({pairs})")
+    if not lost:
+        return
+    hot = sorted(set(lost) & set(critical))
+    if not hot:
+        # Expected absence (see WATER_LAYERS notes): say so and stay quiet.
+        print(f"[kvterrain.water] {layer_label}: no {', '.join(sorted(lost))} field"
+              f"{' — ' + note if note else ''}")
+        return
+    print(f"[kvterrain.water] {layer_label}: UNMATCHED {', '.join(sorted(lost))}\n"
+          f"  *** {', '.join(hot)} affects the exported geometry — "
+          f"fix before trusting this export ***\n"
+          f"  service fields: {sorted(available)}\n"
+          f"  add the right spelling to the *_FIELDS tuples in water.py, or run "
+          f"`kvterrain describe-services` to see the live schema.")
 
 
 def _iter_line_coords(geom: dict):
@@ -421,11 +560,27 @@ def features_from_geojson(
         s = str(v).strip()
         return s or None
 
-    def _parse_rivers(feats, default_order, keep_identity: bool) -> list:
+    def _parse_rivers(feats, default_order, keep_identity: bool, label: str) -> list:
         out: list = []
+        # Resolve the schema ONCE per layer instead of re-scanning every property
+        # of every feature for every field, then read straight through the map.
+        cands = dict(RIVER_FIELD_CANDIDATES, order=tuple(order_fields))
+        if not keep_identity:
+            cands = {"order": cands["order"]}     # hovedelv carries no identity
+        keys: set = set()
+        for f in feats or []:
+            keys |= set((f.get("properties") or {}).keys())
+        fmap = resolve_fields(keys, cands)
+        if keys:
+            report_field_map(
+                label, fmap, keys,
+                critical=CRITICAL_FIELDS if keep_identity else NO_CRITICAL_FIELDS,
+                note=None if keep_identity else HOVEDELV_NO_ORDER)
+        f_order = fmap.get("order")
+
         for fi, f in enumerate(feats or []):
             props = f.get("properties", {}) or {}
-            ov = _first_attr(props, order_fields)
+            ov = props.get(f_order) if f_order else None
             try:
                 order = int(round(float(ov))) if ov is not None else int(default_order)
             except (TypeError, ValueError):
@@ -433,11 +588,11 @@ def features_from_geojson(
             order = max(1, min(255, order))
 
             if keep_identity:
-                strekn = _to_int(_first_attr(props, RIVER_STREKN_FIELDS))
-                elvid = _to_str(_first_attr(props, RIVER_ELVID_FIELDS))
-                vdrag = _to_str(_first_attr(props, RIVER_VASSDRAG_FIELDS))
-                vatn = _to_int(_first_attr(props, RIVER_VATNLNR_FIELDS))
-                nfelt = _to_str(_first_attr(props, RIVER_CATCHMENT_FIELDS))
+                strekn = _to_int(props.get(fmap["strekn_lnr"]) if fmap["strekn_lnr"] else None)
+                elvid = _to_str(props.get(fmap["elvid"]) if fmap["elvid"] else None)
+                vdrag = _to_str(props.get(fmap["vassdragsnr"]) if fmap["vassdragsnr"] else None)
+                vatn = _to_int(props.get(fmap["vatnlnr"]) if fmap["vatnlnr"] else None)
+                nfelt = _to_str(props.get(fmap["vnrnfelt"]) if fmap["vnrnfelt"] else None)
             else:
                 strekn = elvid = vdrag = vatn = nfelt = None
 
@@ -456,31 +611,38 @@ def features_from_geojson(
                     ))
         return out
 
-    rivers = _parse_rivers(river_all, default_order_minor, keep_identity=True)
-    main_rivers = _parse_rivers(river_main, default_order_main, keep_identity=False)
+    rivers = _parse_rivers(river_all, default_order_minor, keep_identity=True,
+                           label="elvenett")
+    main_rivers = _parse_rivers(river_main, default_order_main, keep_identity=False,
+                                label="hovedelv")
+
+    lake_keys: set = set()
+    for f in lakes or []:
+        lake_keys |= set((f.get("properties") or {}).keys())
+    lmap = resolve_fields(lake_keys, LAKE_FIELD_CANDIDATES)
+    if lake_keys:
+        report_field_map("innsjodatabase", lmap, lake_keys)
+    # The km² -> m² conversion keys off the resolved field's own NAME, so it stays
+    # correct whichever spelling the service turned out to use.
+    area_is_km2 = bool(lmap["area"]) and lmap["area"].lower().endswith("km2")
 
     lake_polys: list = []
     for f in lakes or []:
         props = f.get("properties", {}) or {}
-        lopenr = _first_attr(props, LAKE_ID_FIELDS)
+        lopenr = props.get(lmap["lopenr"]) if lmap["lopenr"] else None
         try:
             lopenr = int(lopenr) if lopenr is not None else None
         except (TypeError, ValueError):
             lopenr = None
-        navn = _first_attr(props, LAKE_NAME_FIELDS)
-        area = _first_attr(props, LAKE_AREA_FIELDS)
+        navn = props.get(lmap["navn"]) if lmap["navn"] else None
+        area = props.get(lmap["area"]) if lmap["area"] else None
         area_m2 = None
         if area is not None:
             try:
-                area_m2 = float(area)
-                # Heuristic: fields ending _km2 are km²; convert.
-                for nm in LAKE_AREA_FIELDS:
-                    if nm in props and props[nm] is area and nm.lower().endswith("km2"):
-                        area_m2 *= 1e6
-                        break
+                area_m2 = float(area) * (1e6 if area_is_km2 else 1.0)
             except (TypeError, ValueError):
                 area_m2 = None
-        hv = _first_attr(props, LAKE_HOYDE_FIELDS)
+        hv = props.get(lmap["hoyde"]) if lmap["hoyde"] else None
         hoyde_moh = None
         if hv is not None:
             try:
@@ -493,6 +655,138 @@ def features_from_geojson(
                 lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh))
 
     return WaterFeatures(rivers=rivers, main_rivers=main_rivers, lakes=lake_polys)
+
+
+LEVEL_SOURCE_NVE = "nve_hoyde"
+LEVEL_SOURCE_ESTIMATED = "dtm_interior_median"
+
+
+def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
+                           enabled: bool = True, margin_m: Optional[float] = None) -> dict:
+    """
+    Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
+    estimating a level from the DTM for the lakes NVE gives no `hoyde` for.
+
+    WHY THIS EXISTS. `hoyde` is null for a lot of small lakes — 25% of the records
+    in a Lierne export, 37% of the lakes in the source data there, against 11% in
+    a Krøderen one. Those lakes still rasterise, still classify as Lake, and still
+    got carved (the carve had its own private shore-estimate fallback), but the
+    surface raster only ever read `hoyde`, so it left them empty. A 20 m bowl dug
+    into the terrain with no water in it — strictly worse than not carving at all.
+
+    Resolving the level ONCE, here, and having every consumer read it through
+    `WaterGrid.lake_level`, is what stops that divergence recurring. An estimated
+    level is treated as authoritative from this point on: it goes into the surface
+    raster and into `authored_level_m`, so the runtime pins it exactly as it pins
+    an NVE one and needs to know nothing about where it came from. `level_source`
+    records the provenance for anyone who does care.
+
+    With `enabled=False` no estimate is made, those lakes keep a null level, and
+    the caller MUST also stop carving them (`estimate_missing=False`) — otherwise
+    it recreates the dry-pit bug this function was written to remove.
+
+    `height_repaired` must be the void-repaired, UNCARVED bed. Returns a small
+    summary dict for the manifest.
+    """
+    from . import bathymetry
+
+    table = wg.lake_table or {}
+    for info in table.values():
+        h = info.get("hoyde_moh")
+        info["level_m"] = h
+        info["level_source"] = LEVEL_SOURCE_NVE if h is not None else None
+
+    missing = [lid for lid, info in table.items() if info.get("level_m") is None]
+    estimated = 0
+    if enabled and missing:
+        kw = {} if margin_m is None else {"margin_m": float(margin_m)}
+        est = bathymetry.estimate_levels_from_interior(
+            height_repaired, wg.lake_id, **kw)
+        for lid in missing:
+            v = est.get(lid)
+            if v is not None and np.isfinite(v):
+                table[lid]["level_m"] = float(v)
+                table[lid]["level_source"] = LEVEL_SOURCE_ESTIMATED
+                estimated += 1
+
+    unresolved = sum(1 for i in table.values() if i.get("level_m") is None)
+    return {
+        "lakes_total": len(table),
+        "levels_from_nve": sum(1 for i in table.values()
+                               if i.get("level_source") == LEVEL_SOURCE_NVE),
+        "levels_estimated": estimated,
+        "levels_unresolved": unresolved,
+        "estimation_enabled": bool(enabled),
+        "margin_m": (bathymetry.DEFAULT_LEVEL_MARGIN_M
+                     if margin_m is None else float(margin_m)),
+        "method": ("median of the void-repaired DTM inside each lake polygon "
+                   "(LiDAR returns the water surface), minus margin_m"),
+    }
+
+
+def describe_layer(server: str, layer: int, *, session=None, timeout: int = 60) -> dict:
+    """
+    The layer's own schema, from ArcGIS's `?f=json` endpoint: name, geometry type,
+    paging cap, and every field with its type and alias.
+
+    This is the authoritative answer to "what is this service actually called
+    now", and it is why the *_FIELDS tuples no longer need to be guesswork. Note
+    that GeoJSON `properties` carry field NAMES, not aliases — reading the alias
+    column and writing it into a candidate tuple is the mistake that cost 0.5.0
+    its Strahler orders.
+    """
+    import requests
+
+    sess = session or requests.Session()
+    url = f"{server.rstrip('/')}/{layer}"
+    r = sess.get(url, params={"f": "json"}, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("error"):
+        raise RuntimeError(f"ArcGIS error describing {url}: {js['error']}")
+    return {
+        "url": url,
+        "name": js.get("name"),
+        "geometry_type": js.get("geometryType"),
+        "max_record_count": js.get("maxRecordCount"),
+        "fields": [{"name": f.get("name"),
+                    "type": str(f.get("type", "")).replace("esriFieldType", ""),
+                    "alias": f.get("alias")}
+                   for f in js.get("fields", []) or []],
+    }
+
+
+HOVEDELV_NO_ORDER = ("this layer has no Strahler field by design; every segment "
+                     "takes DEFAULT_ORDER_MAIN and only upgrades the raster")
+
+WATER_LAYERS = (
+    {"label": "elvenett", "server": RIVER_SERVICE, "layer": RIVER_LAYER_ALL,
+     "candidates": RIVER_FIELD_CANDIDATES, "critical": CRITICAL_FIELDS, "note": None},
+    {"label": "hovedelv", "server": RIVER_SERVICE, "layer": RIVER_LAYER_MAIN,
+     "candidates": {"order": RIVER_ORDER_FIELDS}, "critical": NO_CRITICAL_FIELDS,
+     "note": HOVEDELV_NO_ORDER},
+    {"label": "innsjodatabase", "server": LAKE_SERVICE, "layer": LAKE_LAYER,
+     "candidates": LAKE_FIELD_CANDIDATES, "critical": CRITICAL_FIELDS, "note": None},
+)
+
+
+def describe_water_services(*, session=None) -> list:
+    """Schema + logical-field resolution for every layer this module reads."""
+    out = []
+    for spec in WATER_LAYERS:
+        base = {"label": spec["label"], "critical": spec["critical"],
+                "note": spec["note"]}
+        try:
+            info = describe_layer(spec["server"], spec["layer"], session=session)
+        except Exception as e:  # noqa: BLE001 — reported, not raised
+            out.append(dict(base, url=f"{spec['server']}/{spec['layer']}",
+                            error=str(e)))
+            continue
+        names = [f["name"] for f in info["fields"]]
+        info.update(base)
+        info["resolved"] = resolve_fields(names, spec["candidates"])
+        out.append(info)
+    return out
 
 
 def fetch_water_features(

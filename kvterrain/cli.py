@@ -45,6 +45,7 @@ def cmd_build(a):
             "river_depth_scale": a.river_depth_scale,
             "ocean_level_m": a.ocean_level,
             "emit_geojson": a.emit_geojson,
+            "estimate_lake_levels": a.estimate_lake_levels,
         }
         if a.river_vertex_stride is not None:
             water_opts["river_vertex_stride_m"] = a.river_vertex_stride
@@ -70,6 +71,11 @@ def cmd_build(a):
         wm = res.manifest.get("water_surface", {})
         print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
               f"packed in {atlas['surface_file']} (© NVE)")
+        ll = wm.get("lake_levels")
+        if ll:
+            print(f"    levels: {ll['levels_from_nve']} from NVE hoyde, "
+                  f"{ll['levels_estimated']} estimated from the LiDAR water surface, "
+                  f"{ll['levels_unresolved']} unresolved (left uncarved)")
         wid = res.manifest.get("water_id", {})
         if wid:
             print(f"  + {wid['atlas_file']} (u16 class + lake id; "
@@ -305,12 +311,18 @@ def cmd_validate_water(a):
     with open(os.path.join(a.out, wv["lakes"]["file"])) as f:
         lakes = json.load(f)
     lake_ids = {l["lake_id"] for l in lakes["lakes"]}
-    no_level = [l["lake_id"] for l in lakes["lakes"] if l.get("hoyde_moh") is None]
-    print(f"[lakes] {len(lake_ids)} lakes, {len(no_level)} without an authored level")
+    # The pin reads `authored_level_m`, which carries an estimated level too — so
+    # this must not test `hoyde_moh`, or every estimated lake reads as unpinnable.
+    no_level = [l["lake_id"] for l in lakes["lakes"]
+                if l.get("authored_level_m") is None]
+    est = [l for l in lakes["lakes"] if l.get("level_source") == "dtm_interior_median"]
+    print(f"[lakes] {len(lake_ids)} lakes, {len(est)} with an estimated level, "
+          f"{len(no_level)} without any level")
     if no_level:
-        print("    NOTE: lakes without an authored level cannot be pinned "
-              "AuthoredWins; the solver will compute a level for them, and any "
-              "carved bowl beneath them becomes a real basin.")
+        print("    NOTE: lakes without a level cannot be pinned AuthoredWins. They "
+              "are also left uncarved, so they stay flat ground rather than "
+              "becoming an empty bowl — rerun without --no-estimate-lake-levels "
+              "to fill them in.")
 
     with open(os.path.join(a.out, wv["junctions"]["file"])) as f:
         junc = json.load(f)
@@ -345,6 +357,45 @@ def cmd_validate_water(a):
     _print_water_report(wv["validation"])
     print("\nRESULT:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
+
+
+def cmd_describe_services(a):
+    """
+    Print the live schema of every NVE layer the water pipeline reads, and show
+    how each logical field resolves against it.
+
+    This is the tool to reach for when a field stops matching: it distinguishes
+    "NVE renamed it" from "our candidate spelling was always wrong" in one call,
+    without running an export.
+    """
+    from . import water as kvwater
+
+    bad = False
+    for info in kvwater.describe_water_services():
+        print(f"\n=== {info['label']}  {info['url']} ===")
+        if info.get("error"):
+            print(f"  UNREACHABLE: {info['error']}")
+            bad = True
+            continue
+        print(f"  name={info['name']!r}  geometry={info['geometry_type']}  "
+              f"maxRecordCount={info['max_record_count']}")
+        if a.fields:
+            print("  fields (NAME is what GeoJSON properties use; alias is not):")
+            for f in info["fields"]:
+                print(f"    {f['name']:<28} {f['type']:<16} alias={f['alias']}")
+        print("  logical field resolution:")
+        for logical, actual in sorted(info["resolved"].items()):
+            if actual:
+                print(f"    {logical:<14} -> {actual}")
+            elif logical in info["critical"]:
+                print(f"    {logical:<14} -> UNMATCHED  *** affects exported geometry ***")
+                bad = True
+            else:
+                note = f"  ({info['note']})" if info.get("note") else ""
+                print(f"    {logical:<14} -> absent, expected{note}")
+
+    print("\nRESULT:", "FAIL — see UNMATCHED above" if bad else "PASS")
+    sys.exit(1 if bad else 0)
 
 
 def main(argv=None):
@@ -384,6 +435,12 @@ def main(argv=None):
                    help="spacing to densify river polylines to before sampling Z "
                         "(default: leaf spacing). Denser follows the channel more "
                         "closely; coarser shrinks rivers.bin.")
+    b.add_argument("--estimate-lake-levels", action=argparse.BooleanOptionalAction,
+                   default=True, dest="estimate_lake_levels",
+                   help="fill in a water level for lakes NVE gives no 'hoyde' for, "
+                        "by reading the LiDAR water surface inside the polygon "
+                        "(default: on). With --no-estimate-lake-levels those lakes "
+                        "are left uncarved and dry rather than guessed at.")
     b.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
                    help="also write rivers.geojson (debug sidecar for QGIS; "
                         "rivers.bin is the runtime format)")
@@ -400,6 +457,13 @@ def main(argv=None):
     va.add_argument("--n", type=int, default=8,
                     help="tiles sampled per level for the byte-for-byte check")
     va.set_defaults(func=cmd_validate_atlas)
+
+    ds = sub.add_parser("describe-services",
+                        help="print the live NVE layer schemas and show how each "
+                             "logical field resolves against them")
+    ds.add_argument("--fields", action="store_true",
+                    help="also list every field with its type and alias")
+    ds.set_defaults(func=cmd_describe_services)
 
     vw = sub.add_parser("validate-water",
                         help="check rivers.bin / lakes.json / junctions.json / "

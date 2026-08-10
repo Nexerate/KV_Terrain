@@ -84,6 +84,24 @@ ENDPOINT_TOL_CELLS = 1.0
 # Descent tolerance: a rise smaller than this is DTM noise, not a real reversal.
 DESCENT_TOL_M = 0.05
 
+# The ELVIS query uses esriSpatialRelIntersects, so any feature TOUCHING the crop
+# comes back in full — including the part outside it. There is no terrain there:
+# world_to_grid/_bilinear/_nearest_idx all clamp, so an outside vertex silently
+# receives the z, the level and the lake id of the nearest EDGE pixel. Those are
+# fabricated values, and the runtime burns them. Vertices outside the region are
+# therefore dropped, and a segment that leaves and re-enters is split, because
+# within this export those two pieces genuinely are not connected.
+MIN_RUN_VERTICES = 2
+
+# Lake spans are detected by snapping each densified vertex to the nearest lake
+# mask pixel, so a channel running ALONG a shoreline flickers in and out of the
+# mask and shatters into short spurious spans. Each one costs three things: the
+# runtime skips the burn inside a span (a gap in a burned channel is a dam), the
+# level is pinned to a pool the vertex is not in, and _detect_junctions emits a
+# spurious Inflow/Outflow pair. Close small gaps, then drop short runs.
+LAKE_SPAN_CLOSE_GAP = 2      # vertices; bridge mask dropouts up to this long
+LAKE_SPAN_MIN_VERTICES = 3   # runs shorter than this are snapping noise
+
 
 # --------------------------------------------------------------------------- #
 # Grid <-> world                                                               #
@@ -122,11 +140,46 @@ def _bilinear(grid: np.ndarray, row, col) -> np.ndarray:
 
 
 def _nearest_idx(plan: core.GridPlan, xy: np.ndarray):
-    """Clamped integer (row, col) of the sample nearest each vertex."""
+    """Clamped integer (row, col) of the sample nearest each vertex.
+
+    The clamp is only safe for vertices already known to be inside the region —
+    see in_region() and MIN_RUN_VERTICES. Outside vertices clamp to an edge pixel
+    and silently pick up its height and lake id.
+    """
     row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
     r = np.clip(np.rint(row), 0, plan.samples_y - 1).astype(np.intp)
     c = np.clip(np.rint(col), 0, plan.samples_x - 1).astype(np.intp)
     return r, c
+
+
+def in_region(plan: core.GridPlan, xy: np.ndarray) -> np.ndarray:
+    """Boolean mask: which vertices lie inside the export's sample lattice.
+
+    The bound is the SAMPLE extent (origin .. origin + cells*spacing), matching
+    what world_to_grid maps onto [0, samples-1]; a vertex on the boundary is in.
+    """
+    x0, y0, x1, y1 = plan.bbox_utm
+    x = np.asarray(xy[:, 0], dtype=np.float64)
+    y = np.asarray(xy[:, 1], dtype=np.float64)
+    return (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+
+
+def _contiguous_runs(mask: np.ndarray, min_len: int) -> list:
+    """[(start, end)] inclusive index ranges of consecutive True, length >= min_len."""
+    out = []
+    n = int(np.size(mask))
+    i = 0
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and mask[j + 1]:
+            j += 1
+        if (j - i + 1) >= min_len:
+            out.append((i, j))
+        i = j + 1
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -298,10 +351,17 @@ def build_river_network(
     if height_leaf.shape != (SY, SX):
         raise ValueError(f"height_leaf {height_leaf.shape} != grid {(SY, SX)}")
 
-    lake_hoyde = {lid: info.get("hoyde_moh")
+    # Resolved level, not the raw NVE field: a polyline crossing a lake whose level
+    # was estimated must be pinned to that same level, or the polyline and the
+    # surface raster disagree at exactly the inlet/outlet the burn hands off at.
+    lake_hoyde = {lid: wg.lake_level(info)
                   for lid, info in (wg.lake_table or {}).items()}
 
     segments: list = []
+    clip = {"features": 0, "clipped": 0, "split": 0,
+            "vertices_in": 0, "vertices_dropped": 0, "features_dropped": 0}
+    span_stats = {"raw": 0, "merged": 0, "dropped": 0, "kept": 0}
+
     for seg in feats.rivers:
         if seg.xy.shape[0] < 2:
             continue
@@ -309,53 +369,82 @@ def build_river_network(
         path = _segment_pixel_path(plan, seg.xy)
         order = _order_along_path(weight_raw, path, seg.order)
 
-        xy = densify_polyline(seg.xy, stride)
-        row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
-        z = _bilinear(height_leaf, row, col)
-        # Nodata bed samples along the channel are interpolated from their finite
-        # neighbours rather than dropped — a hole in the middle of a polyline would
-        # otherwise break the burn's running minimum.
-        z = _fill_nan_1d(z)
-        if not np.isfinite(z).any():
+        xy_full = densify_polyline(seg.xy, stride)
+
+        # CLIP TO THE REGION before anything samples the grid. Everything below
+        # (_bilinear, _nearest_idx, water_surface lookup) clamps out-of-range
+        # coordinates to an edge pixel, which would hand an outside vertex a
+        # fabricated bed, level and lake id — values the runtime then burns.
+        # A feature that leaves and re-enters becomes two segments: inside this
+        # export they are not connected, and pretending otherwise would splice a
+        # channel across terrain that was never fetched.
+        clip["features"] += 1
+        clip["vertices_in"] += int(xy_full.shape[0])
+        inside = in_region(plan, xy_full)
+        runs = _contiguous_runs(inside, MIN_RUN_VERTICES)
+        clip["vertices_dropped"] += int(xy_full.shape[0]) - int(inside.sum())
+        if not runs:
+            clip["features_dropped"] += 1
             continue
+        if not bool(inside.all()):
+            clip["clipped"] += 1
+        if len(runs) > 1:
+            clip["split"] += len(runs) - 1
 
-        raise_m = depth_for_order(order, depth_by_order, depth_scale)
-        level = z + raise_m
+        for (v0, v1) in runs:
+            xy = xy_full[v0:v1 + 1]
 
-        ri, ci = _nearest_idx(plan, xy)
-        lake_at = wg.lake_id[ri, ci].astype(np.int64)
-        spans = _runs_of_lake(lake_at)
+            row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
+            z = _bilinear(height_leaf, row, col)
+            # Nodata bed samples along the channel are interpolated from their finite
+            # neighbours rather than dropped — a hole in the middle of a polyline would
+            # otherwise break the burn's running minimum.
+            z = _fill_nan_1d(z)
+            if not np.isfinite(z).any():
+                continue
 
-        # Inside a lake, the authored lake surface wins over bed+raise: the lake's
-        # NVE `hoyde` is real data and the raise is a synthetic constant, so a
-        # through-line must not disagree with the pool it crosses.
-        for a, b, lid in spans:
-            h = lake_hoyde.get(int(lid))
-            if h is not None and np.isfinite(h):
-                level[a:b + 1] = float(h)
+            raise_m = depth_for_order(order, depth_by_order, depth_scale)
+            level = z + raise_m
 
-        # Then, wherever the raster actually carries water at this vertex's pixel,
-        # take ITS value verbatim. The raster is the display authority; this makes
-        # the two products identical instead of independently derived, and it picks
-        # up the adjacent-to-lake pinning that bed+raise cannot know about.
-        if water_surface is not None:
-            ras = np.asarray(water_surface, dtype=np.float64)[ri, ci]
-            take = np.isfinite(ras)
-            level[take] = ras[take]
+            ri, ci = _nearest_idx(plan, xy)
+            lake_at = wg.lake_id[ri, ci].astype(np.int64)
+            spans, st = _runs_of_lake(lake_at)
+            for k in span_stats:
+                span_stats[k] += st[k]
 
-        segments.append(RiverSegment(
-            seg_id=len(segments),
-            geom_hash=geometry_hash(seg.xy),
-            order=int(order),
-            xy=xy,
-            z=z.astype(np.float32),
-            level=level.astype(np.float32),
-            strekn_lnr=seg.strekn_lnr,
-            elvid=seg.elvid,
-            vassdragsnr=seg.vassdragsnr,
-            vatnlnr=seg.vatnlnr,
-            lake_spans=spans,
-        ))
+            # Inside a lake, the authored lake surface wins over bed+raise: the lake's
+            # NVE `hoyde` is real data and the raise is a synthetic constant, so a
+            # through-line must not disagree with the pool it crosses.
+            for a, b, lid in spans:
+                h = lake_hoyde.get(int(lid))
+                if h is not None and np.isfinite(h):
+                    level[a:b + 1] = float(h)
+
+            # Then, wherever the raster actually carries water at this vertex's pixel,
+            # take ITS value verbatim. The raster is the display authority; this makes
+            # the two products identical instead of independently derived, and it picks
+            # up the adjacent-to-lake pinning that bed+raise cannot know about.
+            if water_surface is not None:
+                ras = np.asarray(water_surface, dtype=np.float64)[ri, ci]
+                take = np.isfinite(ras)
+                level[take] = ras[take]
+
+            segments.append(RiverSegment(
+                seg_id=len(segments),
+                # Hash the CLIPPED run, not the source feature: after a split the
+                # source geometry no longer identifies one emitted segment, and two
+                # pieces sharing one hash would collide as keys.
+                geom_hash=geometry_hash(xy),
+                order=int(order),
+                xy=xy,
+                z=z.astype(np.float32),
+                level=level.astype(np.float32),
+                strekn_lnr=seg.strekn_lnr,
+                elvid=seg.elvid,
+                vassdragsnr=seg.vassdragsnr,
+                vatnlnr=seg.vatnlnr,
+                lake_spans=spans,
+            ))
 
     _link_segments(segments, tol_m=ENDPOINT_TOL_CELLS * plan.spacing_m)
     junctions = _detect_junctions(segments, wg)
@@ -367,6 +456,29 @@ def build_river_network(
         "vertex_stride_m": stride,
         "junctions": len(junctions),
         "lakes": len(lakes),
+        # Region clipping. A large dropped fraction is expected and healthy — the
+        # ELVIS query returns whole features that merely intersect the crop — but
+        # it is reported because it is also the signal that the crop bisects the
+        # network, and because these vertices used to be kept with edge-clamped
+        # values.
+        "clip_source_features": clip["features"],
+        "clip_features_clipped": clip["clipped"],
+        "clip_features_dropped": clip["features_dropped"],
+        "clip_segments_split": clip["split"],
+        "clip_vertices_dropped": clip["vertices_dropped"],
+        "clip_vertices_dropped_pct": (
+            100.0 * clip["vertices_dropped"] / clip["vertices_in"]
+        ) if clip["vertices_in"] else 0.0,
+        "clip_note": "vertices outside the export region are dropped and a feature "
+                     "that re-enters is split; sampling them would clamp to an edge "
+                     "pixel and fabricate bed, level and lake id.",
+        # Lake-span cleaning.
+        "lake_spans_raw": span_stats["raw"],
+        "lake_spans_merged": span_stats["merged"],
+        "lake_spans_dropped_short": span_stats["dropped"],
+        "lake_spans_kept": span_stats["kept"],
+        "lake_span_min_vertices": int(LAKE_SPAN_MIN_VERTICES),
+        "lake_span_close_gap": int(LAKE_SPAN_CLOSE_GAP),
     }
     report.update(validate_descent(segments))
     report.update(validate_flow_direction(segments))
@@ -376,9 +488,31 @@ def build_river_network(
                         report=report, vertex_stride_m=stride)
 
 
-def _runs_of_lake(lake_at: np.ndarray) -> list:
-    """Contiguous vertex runs sharing one non-zero lake id -> (start, end, id)."""
-    out = []
+def _runs_of_lake(
+    lake_at: np.ndarray,
+    *,
+    close_gap: int = LAKE_SPAN_CLOSE_GAP,
+    min_vertices: int = LAKE_SPAN_MIN_VERTICES,
+) -> tuple:
+    """
+    Contiguous vertex runs sharing one non-zero lake id -> ([(start, end, id)], stats).
+
+    Raw runs come straight off the nearest-pixel lake id, which is noisy where a
+    channel runs along a shoreline: the mask flickers, so one real crossing can
+    arrive as several short runs and a channel that merely grazes a lake can
+    produce a 1-vertex run that is pure snapping artefact.
+
+    Two cleanups, in order:
+      1. CLOSE — two runs of the SAME id separated by at most `close_gap`
+         vertices are one crossing that the mask dropped out of; merge them.
+      2. DROP  — a surviving run shorter than `min_vertices` is noise, not a
+         crossing. Dropping it restores the burn over those vertices, leaves the
+         level as bed+raise instead of the pool's surface, and removes the
+         spurious Inflow/Outflow pair _detect_junctions would have emitted.
+
+    Both are reported (never silently applied) via the returned stats dict.
+    """
+    raw = []
     n = int(lake_at.size)
     i = 0
     while i < n:
@@ -389,9 +523,25 @@ def _runs_of_lake(lake_at: np.ndarray) -> list:
         j = i
         while j + 1 < n and int(lake_at[j + 1]) == v:
             j += 1
-        out.append((i, j, v))
+        raw.append([i, j, v])
         i = j + 1
-    return out
+
+    closed = []
+    for run in raw:
+        if closed and closed[-1][2] == run[2] and (run[0] - closed[-1][1] - 1) <= close_gap:
+            closed[-1][1] = run[1]
+        else:
+            closed.append(list(run))
+
+    kept = [(a, b, v) for (a, b, v) in closed if (b - a + 1) >= min_vertices]
+
+    stats = {
+        "raw": len(raw),
+        "merged": len(raw) - len(closed),
+        "dropped": len(closed) - len(kept),
+        "kept": len(kept),
+    }
+    return kept, stats
 
 
 def _link_segments(segments: list, tol_m: float) -> None:
@@ -509,8 +659,15 @@ def build_lake_records(plan: core.GridPlan, wg: kvwater.WaterGrid) -> list:
             "vatn_lnr": info.get("lopenr"),
             "navn": info.get("navn"),
             "area_m2": info.get("area_m2"),
+            # `hoyde_moh` stays the RAW NVE field — null when NVE has none — so the
+            # source data is still legible. `authored_level_m` is the level the
+            # export actually used, estimated or not, because that is what the
+            # runtime pins on and it must match the surface raster exactly.
+            # `level_source` is the only thing distinguishing the two, and nothing
+            # downstream is required to read it.
             "hoyde_moh": info.get("hoyde_moh"),
-            "authored_level_m": info.get("hoyde_moh"),
+            "authored_level_m": wg.lake_level(info),
+            "level_source": info.get("level_source"),
             "pixel_count": px,
             "bbox_utm": [x_min, y_min, x_max, y_max],
         })
@@ -531,6 +688,7 @@ def validate_descent(segments: list, tol_m: float = DESCENT_TOL_M) -> dict:
     total = 0
     worst = 0.0
     bad_segments = 0
+    in_tot = in_ris = 0
     for s in segments:
         z = np.asarray(s.z, dtype=np.float64)
         if z.size < 2:
@@ -543,12 +701,29 @@ def validate_descent(segments: list, tol_m: float = DESCENT_TOL_M) -> dict:
         if k:
             bad_segments += 1
             worst = max(worst, float(d[up].max()))
+        # Split by lake-span membership. A rise inside a span is the polyline
+        # crossing a pool, where bed shape carries no downstream signal and the
+        # runtime does not burn anyway; a rise on open channel is the number that
+        # actually bears on the burn. Reporting them together hides both.
+        if s.lake_spans:
+            m = np.zeros(z.size, dtype=bool)
+            for (a, b, _lid) in s.lake_spans:
+                m[a:b + 1] = True
+            step_in = m[:-1] | m[1:]
+            in_tot += int(step_in.sum())
+            in_ris += int((up & step_in).sum())
+    out_tot = total - in_tot
+    out_ris = rising - in_ris
     return {
         "descent_vertices_checked": total,
         "descent_rising_vertices": rising,
         "descent_rising_pct": (100.0 * rising / total) if total else 0.0,
         "descent_segments_with_rise": bad_segments,
         "descent_worst_rise_m": worst,
+        "descent_rising_pct_in_lake_span": (
+            100.0 * in_ris / in_tot) if in_tot else 0.0,
+        "descent_rising_pct_open_channel": (
+            100.0 * out_ris / out_tot) if out_tot else 0.0,
         "descent_note": "reported only; not corrected. The runtime burn's "
                         "running-minimum enforces descent.",
     }
@@ -565,15 +740,23 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
     real (a genuinely mis-ordered layer, or lake-through-lines whose flat Z carries
     no directional signal at all).
     """
-    dis = touch = dis_touch = n = 0
+    dis = touch = dis_touch = n = vatn = 0
     for s in segments:
         z = np.asarray(s.z, dtype=np.float64)
         if z.size < 2 or not np.isfinite(z).any():
             continue
         n += 1
-        is_touch = bool(s.lake_spans) or (s.vatnlnr is not None)
+        # "Touches a lake" means the GEOMETRY enters one, i.e. it has a lake span.
+        # `vatnlnr` must NOT be part of this test: ELVIS populates it on ~94% of
+        # segments (it references the watercourse's lake, not a crossing), so
+        # including it put almost the whole network in one bucket and left the
+        # non-lake rate resting on a few hundred segments — which is exactly the
+        # comparison this check exists to make. Reported separately below.
+        is_touch = bool(s.lake_spans)
         if is_touch:
             touch += 1
+        if s.vatnlnr is not None:
+            vatn += 1
         if float(z[-1]) > float(z[0]) + tol_m:      # ends higher than it starts
             dis += 1
             if is_touch:
@@ -585,6 +768,7 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
         "flowdir_disagreements": dis,
         "flowdir_disagreement_pct": (100.0 * dis / n) if n else 0.0,
         "flowdir_lake_touching_segments": touch,
+        "flowdir_vatnlnr_segments": vatn,
         "flowdir_disagreement_pct_lake_touching": (
             100.0 * dis_touch / touch) if touch else 0.0,
         "flowdir_disagreement_pct_non_lake": (
@@ -759,17 +943,30 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
             "rule": f"a pixel belongs to lake_id n where water_id == "
                     f"{kvid.LAKE_ID_BASE} + n",
         },
-        "authored_level_field": "hoyde_moh",
+        "authored_level_field": "authored_level_m",
         "policy": "AuthoredWins",
+        "level_source_field": "level_source",
+        "level_sources": {
+            "nve_hoyde": "the lake's authored NVE `hoyde`",
+            "dtm_interior_median": "read off the LiDAR water surface inside the "
+                                   "polygon, because NVE publishes no hoyde for "
+                                   "this lake. Pin it exactly like an NVE one — "
+                                   "it is the level the surface raster carries.",
+        },
         "note": "no polygon geometry is emitted; the per-pixel mask in "
-                "water_id.atlas is the geometry reference.",
+                "water_id.atlas is the geometry reference. `hoyde_moh` is the raw "
+                "NVE field and may be null; `authored_level_m` is always the level "
+                "this export actually used.",
         "lakes": net.lakes,
     }
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)
     return {"file": os.path.basename(path), "count": len(net.lakes),
             "with_authored_level": sum(
-                1 for l in net.lakes if l.get("hoyde_moh") is not None)}
+                1 for l in net.lakes if l.get("authored_level_m") is not None),
+            "with_estimated_level": sum(
+                1 for l in net.lakes
+                if l.get("level_source") == "dtm_interior_median")}
 
 
 def write_junctions_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:

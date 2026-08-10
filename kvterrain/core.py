@@ -535,6 +535,7 @@ def run_export(
         ocean_level_m = float(opts.pop("ocean_level_m", waterid.DEFAULT_OCEAN_LEVEL_M))
         vertex_stride_m = float(opts.pop("river_vertex_stride_m", plan.spacing_m))
         emit_geojson = bool(opts.pop("emit_geojson", False))
+        estimate_lake_levels = bool(opts.pop("estimate_lake_levels", True))
 
         # Pop the rasterise-only keys so they never leak into fetch_water_features
         # (which doesn't accept them). What remains in `opts` is fetch kwargs only.
@@ -551,7 +552,6 @@ def run_export(
 
         water_leaf = water.rasterize_water(plan, features, **raster_opts)
         lake_count = len(water_leaf.lake_table)
-        lake_surf = water_leaf.lake_surface_moh()          # authoritative NVE hoyde
 
         # 1. VOID REPAIR, before anything reads the bed. Kartverket returns a void
         #    lake interior as a finite 0/sentinel rather than NaN, so an isfinite
@@ -562,9 +562,38 @@ def run_export(
         #    an NVE hoyde nor a usable shoreline. See bathymetry's module docstring.
         leaf = bathymetry.fill_lake_surface(leaf, water_leaf.type)
 
+        # 1b. SNAPSHOT the repaired-but-UNCARVED bed, for the polylines only.
+        #     The carve below writes a fabricated bowl (carve_depth_m under the
+        #     authored surface) inside every lake polygon. That bowl is a display
+        #     device — it exists so the water plane does not z-fight the
+        #     LiDAR-flattened lake surface — and it is NOT terrain. The runtime
+        #     burns polyline `z` straight into bedConditioned, so a `z` sampled
+        #     from the carved array cuts the solver's routing grid to a fabricated
+        #     depth at exactly the points where a channel hands off to a lake
+        #     basin. Sampling the uncarved bed does not weaken the polyline/raster
+        #     agreement, because `level` is read verbatim out of `water_surface`
+        #     (see build_river_network) rather than recomputed from `z`.
+        leaf_bed_uncarved = leaf.copy()
+
+        # 1c. RESOLVE EVERY LAKE'S LEVEL, once, before anything reads one. NVE
+        #     `hoyde` where it exists; otherwise the median of the (now repaired,
+        #     still uncarved) DTM inside the polygon, which is a direct reading of
+        #     the LiDAR water surface. Everything downstream — the carve, the
+        #     surface raster, the river tie-in, lakes.json — goes through
+        #     WaterGrid.lake_level, so they cannot drift apart.
+        level_report = water.apply_estimated_levels(
+            water_leaf, leaf, enabled=estimate_lake_levels)
+        lake_surf = water_leaf.lake_surface_moh()
+
         # 2. Carve the bowl so the water plane does not z-fight the LiDAR-flattened
         #    lake surface. Safe for the solver only because the lake level is
         #    authored and pinned — see carve_lake_beds.
+        #
+        #    `estimate_missing` is tied to the SAME switch that governs the surface
+        #    raster. It must never be true while the raster is empty: the carve's
+        #    private shore-estimate fallback is exactly how lakes without an NVE
+        #    hoyde ended up as 20 m dry pits. Either both know a level, or neither
+        #    touches the lake.
         leaf = bathymetry.carve_lake_beds(
             leaf,
             water_leaf.type,
@@ -572,6 +601,7 @@ def run_export(
             surface_moh=lake_surf,
             carve_depth_m=carve_depth_m,
             bevel_px=bevel_px,
+            estimate_missing=False,
         )
 
         # 3. Unified water surface (lakes = NVE hoyde, rivers = leaf-DTM bed + a
@@ -592,10 +622,11 @@ def run_export(
         water_id_leaf = waterid.build_water_id(water_leaf, ocean)
         water_id_levels = waterid.build_water_id_pyramid(water_id_leaf, plan.num_levels)
 
-        # 5. The polylines. Sampled against the SAME leaf the surface raster used,
-        #    so polyline `level` equals the raster surface pixel-for-pixel.
+        # 5. The polylines. `z` is sampled from the UNCARVED bed (step 1b) because
+        #    the runtime burns it; `level` is read verbatim from `water_surface`,
+        #    so polyline level still equals the raster surface pixel-for-pixel.
         river_net = rivernet.build_river_network(
-            plan, features, water_leaf, leaf,
+            plan, features, water_leaf, leaf_bed_uncarved,
             water_surface=water_surface,
             vertex_stride_m=vertex_stride_m, depth_scale=depth_scale)
 
@@ -607,6 +638,7 @@ def run_export(
             "lake_bevel_px": bevel_px,
             "ocean_level_m": ocean_level_m,
             "include_main_rivers": opts.get("include_main_rivers", True),
+            "estimate_lake_levels": estimate_lake_levels,
         }
 
     levels = build_pyramid(leaf, plan.num_levels)
@@ -630,11 +662,15 @@ def run_export(
         # Name the surface atlas in the header so the runtime opens the second handle.
         res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
         wsurf["lake_count"] = lake_count
+        wsurf["lake_levels"] = level_report
         wsurf["lake_bathymetry"] = {
             "enabled": True,
             "carve_depth_m": float(carve_depth_m),
             "bevel_px": int(bevel_px),
             "method": "flat_below_known_surface_with_shore_bevel",
+            "bevel_anchor": "waterline",
+            "bevel_profile_m": "depth from shore inward = 0, then smoothstep to "
+                               "carve_depth_m over bevel_px texels",
             "rationale": "LiDAR returns the lake SURFACE as terrain height, so "
                          "without a carve the water plane and the terrain are "
                          "coincident. Safe for the solver: bevelled, never breaks "

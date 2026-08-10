@@ -6,9 +6,14 @@
     "file": "water_id.atlas",
     "rule": "a pixel belongs to lake_id n where water_id == 16 + n"
   },
-  "authored_level_field": "hoyde_moh",
+  "authored_level_field": "authored_level_m",
   "policy": "AuthoredWins",
-  "note": "no polygon geometry is emitted; the per-pixel mask in water_id.atlas is the geometry reference.",
+  "level_source_field": "level_source",
+  "level_sources": {
+    "nve_hoyde": "the lake's authored NVE `hoyde`",
+    "dtm_interior_median": "read off the LiDAR water surface inside the polygon, because NVE publishes no hoyde for this lake. Pin it exactly like an NVE one \u2014 it is the level the surface raster carries."
+  },
+  "note": "no polygon geometry is emitted; the per-pixel mask in water_id.atlas is the geometry reference. `hoyde_moh` is the raw NVE field and may be null; `authored_level_m` is always the level this export actually used.",
   "lakes": [
     {
       "lake_id": 1,
@@ -18,8 +23,14 @@
       "area_m2": 16777216.0,
       "hoyde_moh": 320.0,
       "authored_level_m": 320.0,
-      "pixel_count": 168100,
-      "bbox_utm": [469290.0, 6790330.0, 473380.0, 6794420.0]
+      "level_source": "nve_hoyde",
+      "pixel_count": 670761,
+      "bbox_utm": [
+        540050.0,
+        6656640.0,
+        544140.0,
+        6660730.0
+      ]
     }
   ]
 }

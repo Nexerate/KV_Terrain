@@ -85,6 +85,14 @@ with st.sidebar:
                                     "NVE surface. Must exceed the renderer's opaque "
                                     "threshold AFTER any height compression (e.g. 20 m "
                                     "real → 4 units at 1:5).")
+    estimate_lake_levels = st.toggle("Estimate missing lake levels", value=True,
+                                     disabled=not want_water,
+                                     help="NVE leaves 'hoyde' blank on a lot of small "
+                                          "lakes — a quarter of them in Lierne. LiDAR "
+                                          "reports the water surface as terrain, so the "
+                                          "level is read from the DTM inside the polygon "
+                                          "and used as if it were authored. Off: those "
+                                          "lakes stay flat, dry ground.")
     ocean_level = st.number_input("Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0,
                                   disabled=not want_water,
                                   help="Kartverket heights are metres above sea level, "
@@ -239,6 +247,7 @@ if go and plan is not None:
                 "lake_max_depth_m": lake_max_depth,
                 "ocean_level_m": ocean_level,
                 "emit_geojson": emit_geojson,
+                "estimate_lake_levels": estimate_lake_levels,
             }
             if river_vertex_stride > 0:
                 water_opts["river_vertex_stride_m"] = river_vertex_stride

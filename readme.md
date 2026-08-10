@@ -176,9 +176,14 @@ surface_moh = hmin + (code / 65534.0) * (hmax - hmin)     # where is_water
 
 Where the surface comes from:
 
-- **Lakes:** the NVE `hoyde` for that lake, stamped on every one of its pixels
-  (flat). Also stored per lake in `manifest.water.lake_table[id].hoyde_moh`. If a
-  lake lacks `hoyde` (rare), the surface falls back to a DTM shoreline estimate.
+- **Lakes:** the lake's resolved level, stamped on every one of its pixels (flat),
+  and stored per lake in `manifest.water.lake_table[id].level_m`.
+  NVE `hoyde` where it exists — but it very often does not (25% of lake records in
+  a Lierne export, 11% in a Krøderen one), so by default those lakes get a level
+  read off the **LiDAR water surface inside the polygon** (`--no-estimate-lake-levels`
+  turns this off, and then they are left uncarved rather than guessed at).
+  `lakes.json` carries the level used as `authored_level_m` and its provenance as
+  `level_source`; the raw NVE field stays visible, and null, as `hoyde_moh`.
 - **Rivers:** Elvenett has no elevation, so the surface is estimated from the
   **leaf DTM along each channel**: sample the bed at the finest resolution, fit a
   **monotone-descending** profile (isotonic regression — real river surfaces never
@@ -221,7 +226,7 @@ units at 1:5.)
   assembled array, so adjacent edges are bit-identical and mutually aligned.
 
 `manifest.water` records the mask encoding, width model, attribution, and the
-`lake_table` (`local_id → {lopenr, navn, area_m2, hoyde_moh}`).
+`lake_table` (`local_id → {lopenr, navn, area_m2, hoyde_moh, level_m, level_source}`).
 `manifest.water_surface` records the `.wsurf` encoding, the `65535` sentinel, and
 the runtime depth formula.
 

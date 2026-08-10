@@ -55,7 +55,8 @@ carve. Any other caller must do the same.
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, label, binary_dilation
+from scipy.ndimage import (distance_transform_edt, label, binary_dilation,
+                           maximum as _labeled_maximum)
 
 TYPE_LAKE_VALUE = 2
 DEFAULT_RAMP_RADIUS_M = 4.0   # legacy (pre-known-surface) ramp radius
@@ -79,11 +80,90 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
 
 
 def distance_to_shore_m(water_type: np.ndarray, spacing_m: float) -> np.ndarray:
+    """
+    Distance from each lake sample to the nearest NON-lake sample, in metres.
+
+    Note what this means at the edge: the outermost wet sample is one full cell
+    from dry land, so its distance is `spacing_m` — NOT zero. `carve_lake_beds`
+    subtracts that offset before ramping; see SHORE_ANCHOR_M.
+    """
     is_lake = water_type == TYPE_LAKE_VALUE
     if not is_lake.any():
         return np.zeros(water_type.shape, dtype=np.float32)
     dist = distance_transform_edt(is_lake, sampling=(spacing_m, spacing_m))
     return dist.astype(np.float32)
+
+
+# Where the bevel's zero point sits, in units of `spacing_m`, measured from the
+# outermost wet sample outward. 1.0 puts it on the first DRY sample, so the last
+# WET sample lands at exactly zero carve — the water's edge sits on the terrain.
+#
+# The true waterline is really about half a cell out (rasterisation is
+# centre-in-polygon), which would leave the last wet sample ~3 m deep at the
+# default bevel. 1.0 is the deliberate choice over 0.5: a mesh renderer that
+# feathers between a wet vertex and a dry one wants that wet vertex ON the
+# terrain, and zero is the only value that guarantees no step. Drop this to 0.5
+# if a consumer culls samples at depth <= 0 and the outermost ring disappears.
+#
+# It was effectively 0.0 before, and that was the bug behind the "trench around
+# every lake": distance_to_shore_m hands the outermost wet sample a distance of
+# one whole cell, so with the default 2-texel bevel the ramp opened at
+# smoothstep(5/10) = 0.5 and that sample was carved to HALF the full depth
+# immediately. Measured over a 41x41 km export: 219744 shoreline samples, median
+# depth at the outermost ring 10.01 m, and not one lake sample anywhere in the
+# export shallower than 9 m. Every lake was a flat-bottomed pit with a 10 m
+# vertical rim, and the water plane consequently sat metres below the ground it
+# should have met. There was no shallow margin to render a shoreline with.
+SHORE_ANCHOR_M = 1.0
+
+
+def _shore_ramp(is_lake: np.ndarray, dist: np.ndarray,
+                bevel_px: int, spacing_m: float) -> np.ndarray:
+    """
+    The bevel profile: 0 at the waterline rising to 1 at full carve depth.
+
+    Two things happen here beyond a plain `smoothstep(dist / bevel)`.
+
+    1. The ramp is anchored on the WATERLINE (`SHORE_ANCHOR_M`), because `dist`
+       bottoms out at one whole cell inside a lake rather than at zero.
+
+    2. The bevel is shrunk PER LAKE BODY so the ramp always reaches 1 somewhere
+       in that body. Anchoring costs one cell of reach, and a body narrower than
+       the nominal bevel would otherwise never bottom out — it would hold a few
+       metres of water at its deepest point and render near-transparent. In the
+       reference export that is 197 of 1484 bodies: tiny, 586 samples between
+       them (0.02% of lake area), but "the pond vanished" is a worse failure than
+       "the pond is a little too deep", and the guard is one labelled maximum.
+
+    A body with NO room at all — one sample across, every sample sitting on the
+    waterline — takes the full carve as a step. There is nowhere to ramp, so a
+    vertical pit is the only available answer, and it is what this code did
+    everywhere before the anchor was fixed.
+    """
+    nominal = max(float(bevel_px) * spacing_m, 1e-6)
+    anchor = SHORE_ANCHOR_M * spacing_m
+    lbl, n = label(is_lake)
+    if n == 0:
+        return np.zeros(is_lake.shape, dtype=np.float32)
+
+    # Deepest reach of each body == how much ramp room it actually has.
+    reach = np.atleast_1d(
+        np.asarray(_labeled_maximum(dist, lbl, np.arange(1, n + 1)),
+                   dtype=np.float32))
+    room = reach - anchor
+
+    width = np.empty(n + 1, dtype=np.float32)
+    width[0] = nominal
+    width[1:] = np.clip(room, 1e-6, nominal)
+    # Bodies with no room take the full carve outright. Flagged explicitly rather
+    # than left to `room/width`, which is 0/0 there and would silently yield a
+    # ramp of zero — i.e. no carve at all, the pond rendered dry.
+    stepped = np.zeros(n + 1, dtype=bool)
+    stepped[1:] = room <= 1e-6
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frac = _smoothstep((dist - anchor) / width[lbl])
+    return np.where(stepped[lbl], np.float32(1.0), frac).astype(np.float32)
 
 
 def _shore_surface(shore_vals: np.ndarray, shore_percentile: float,
@@ -165,6 +245,76 @@ def estimate_lake_surface(
             surf = np.where(need, nearest_real_h, surf)
 
     return surf.astype(np.float32)
+
+
+# Estimated levels are pulled DOWN by this much before use. The estimator itself
+# is unbiased at the median, so this is a deliberate one-sided hedge: water
+# standing proud of its own banks reads as broken, whereas water sitting a
+# fraction low is the mild version of an artifact the shore bevel already
+# feathers. Calibrated on 89 Lierne lakes that DO carry an NVE hoyde — 0.25 m
+# cuts the "more than 2 m too high" tail from 3.4% to 1.1% and offsets about half
+# the +0.5 m bias seen on small lakes, at the cost of a 0.25 m median undershoot,
+# which is a quarter of `hoyde`'s own 1 m quantisation.
+DEFAULT_LEVEL_MARGIN_M = 0.25
+# Fewer interior samples than this and the median is not worth trusting.
+MIN_INTERIOR_SAMPLES = 5
+
+
+def estimate_levels_from_interior(
+    height_m: np.ndarray,
+    lake_id: np.ndarray,
+    *,
+    margin_m: float = DEFAULT_LEVEL_MARGIN_M,
+    min_samples: int = MIN_INTERIOR_SAMPLES,
+) -> dict:
+    """
+    Per-lake water level read straight off the DTM INSIDE each lake polygon.
+
+    LiDAR does get a return from water — it reports the water SURFACE — so the
+    samples inside a lake polygon are a direct measurement of the thing we want,
+    not an inference from the surrounding bank. That makes this strictly better
+    than `estimate_lake_surface`, which reads a percentile of the shoreline band
+    outside the polygon. Measured against the 89 lakes in a Lierne block that do
+    carry an NVE `hoyde`:
+
+        interior median   bias +0.00 m, |err| p50 0.63 m, 28% high by >0.5 m
+        shore band (old)  bias +0.35 m, |err| p50 0.75 m, 39% high by >0.5 m
+
+    and the truth itself is quantised to 1 m, so 0.63 m is at the noise floor.
+
+    Takes the plain MEDIAN. Eroding the boundary ring first, or using a low
+    percentile instead, were both measured and both changed the result by under
+    0.02 m — lake interiors are flat, so there is nothing for a robust statistic
+    to be robust against. Simplicity wins.
+
+    `height_m` must be the VOID-REPAIRED, UNCARVED bed (i.e. run this after
+    `fill_lake_surface` and before `carve_lake_beds`); sampling a carved array
+    would just return `surface - carve_depth`.
+
+    Returns {local lake id -> level in metres}, omitting lakes with too few
+    usable samples.
+    """
+    ids = np.asarray(lake_id).ravel()
+    h = np.asarray(height_m).ravel()
+    sel = (ids > 0) & np.isfinite(h)
+    if not sel.any():
+        return {}
+
+    gid = ids[sel]
+    gh = h[sel].astype(np.float64)
+    order = np.argsort(gid, kind="stable")
+    gid = gid[order]
+    gh = gh[order]
+
+    uniq, starts = np.unique(gid, return_index=True)
+    ends = np.append(starts[1:], gid.size)
+
+    out: dict = {}
+    for u, a, b in zip(uniq, starts, ends):
+        if b - a < min_samples:
+            continue
+        out[int(u)] = float(np.median(gh[a:b])) - float(margin_m)
+    return out
 
 
 def fill_lake_surface(
@@ -296,6 +446,13 @@ def carve_lake_beds(
     the lake (flat surface, void 0, sentinel) — it is `surface - carve_depth_m` — so
     the LiDAR water-flattening and the whole void saga are irrelevant here.
 
+    The resulting bed profile, going inward from the shore at the default 2-texel
+    bevel and 5 m spacing, is `surface - [0, 10, 20, 20, ...]`. The leading ZERO is
+    the point: the outermost wet sample sits exactly at the water level, so the
+    water has somewhere to be shallow and a mesh renderer has a vertex to feather
+    against. See SHORE_ANCHOR_M for what this looked like when it was wrong, and
+    `_shore_ramp` for the per-body handling of lakes too narrow to ramp.
+
     Surface source, per lake pixel:
       1. `surface_moh` (authoritative NVE `hoyde`) wherever finite, else
       2. a DTM shore estimate (`estimate_lake_surface`) when `estimate_missing`.
@@ -366,9 +523,15 @@ def carve_lake_beds(
 
     # Flat bed at surface - carve_depth, with a smooth bevel over the first
     # `bevel_px` texels from shore so the shoreline isn't a vertical wall.
+    #
+    # The ramp is anchored on the WATERLINE, not on the outermost wet sample:
+    # `dist` never reads below one cell inside a lake, so ramping straight off it
+    # opens the bevel already half-open and leaves a vertical step at the shore.
+    # See SHORE_ANCHOR_M for the measurement that motivated this. The subtraction
+    # can only make the carve SHALLOWER, so it cannot deepen a bowl, widen one, or
+    # lower a rim sample that was previously left alone.
     dist = distance_to_shore_m(water_type, spacing_m)      # metres from shore
-    bevel_m = max(float(bevel_px) * spacing_m, 1e-6)
-    frac = _smoothstep(dist / bevel_m)                     # 0 at shore -> 1 inside
+    frac = _shore_ramp(is_lake, dist, bevel_px, spacing_m)  # 0 at shore -> 1 inside
     bed = surf - carve_depth_m * frac
     out[have] = bed[have]
     return out
