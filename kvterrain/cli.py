@@ -1,4 +1,17 @@
-"""kvterrain command-line interface."""
+"""
+kvterrain command-line interface.
+
+The tool comes apart at the dataset boundary, and so does this CLI:
+
+    kvterrain fetch    --bbox ... --spacing 5          # network -> data/datasets/<name>
+    kvterrain datasets                                 # what have I already fetched?
+    kvterrain process  --dataset <name> --out out/     # dataset -> the Unity export
+
+`build` is still there and still does both in one pass with nothing stored in
+between, for when you genuinely only want the region once. If you expect to
+retune a carve, fetch once and process many times — that is the whole point of
+the split.
+"""
 import argparse
 import json
 import os
@@ -8,19 +21,180 @@ import numpy as np
 
 from . import core
 
+# The synthetic surface used to live here AND in app.py, two copies that could
+# disagree about what an offline dry run even builds. It is now one function.
+from .fetch import synthetic_height_fetcher as _demo_fetcher
 
-def _demo_fetcher(u, e, sx, sy, nx, ny, sp):
-    xs = sx + np.arange(nx) * sp
-    ys = sy + np.arange(ny) * sp
-    XX, YY = np.meshgrid(xs, ys)
-    surf = (300.0
-            + 400.0 * np.exp(-(((XX - XX.mean()) / 4000.0) ** 2
-                               + ((YY - YY.mean()) / 4000.0) ** 2))
-            + 60.0 * np.sin(XX / 900.0) * np.cos(YY / 700.0))
-    return surf.astype(np.float32)[::-1, :]
+
+def _bar(prefix: str):
+    """A (fraction, label) progress printer for the two stage runners."""
+    state = {"last": ""}
+
+    def prog(frac: float, label: str) -> None:
+        line = f"\r  {prefix} {frac * 100:5.1f}%  {label:<52.52s}"
+        state["last"] = line
+        print(line, end="", flush=True)
+    return prog
+
+
+def _resolve_dataset(spec: str, root=None):
+    """Accept a path to a dataset directory, or the slug/name of one under `root`."""
+    from . import dataset as ds_mod
+
+    if os.path.isdir(spec) and os.path.exists(
+            os.path.join(spec, ds_mod.MANIFEST_NAME)):
+        return ds_mod.load(spec)
+    root = root or ds_mod.DEFAULT_ROOT
+    cand = os.path.join(root, spec)
+    if os.path.exists(os.path.join(cand, ds_mod.MANIFEST_NAME)):
+        return ds_mod.load(cand)
+    available = ds_mod.list_datasets(root)
+    for d in available:
+        if spec in (d.slug, d.name):
+            return d
+    names = ", ".join(d.slug for d in available) or "(none)"
+    raise SystemExit(f"no dataset {spec!r} in {root}. Available: {names}")
+
+
+def _water_opts(a) -> dict:
+    """The process-stage water settings, shared by `build` and `process`."""
+    opts = {
+        "include_main_rivers": not getattr(a, "no_main_rivers", False),
+        "width_scale": a.river_width_scale,
+        "lake_ramp_radius_m": a.lake_ramp_radius,
+        "lake_max_depth_m": a.lake_max_depth,
+        "lake_min_depth_m": a.lake_min_depth,
+        "lake_shore_slope": a.lake_shore_slope,
+        "lake_snap_px": a.lake_snap_px,
+        "river_depth_scale": a.river_depth_scale,
+        "river_bank_tolerance_m": a.river_bank_tolerance,
+        "fill_lake_holes": not a.keep_lake_holes,
+        "ocean_level_m": a.ocean_level,
+        "emit_geojson": a.emit_geojson,
+        "estimate_lake_levels": a.estimate_lake_levels,
+        "lake_perimeter_cap": a.lake_perimeter_cap,
+    }
+    if a.river_vertex_stride is not None:
+        opts["river_vertex_stride_m"] = a.river_vertex_stride
+    return opts
+
+
+# --------------------------------------------------------------------------- #
+# fetch — stage one                                                            #
+# --------------------------------------------------------------------------- #
+
+def cmd_fetch(a):
+    from . import fetch as kvfetch
+
+    lon_min, lat_min, lon_max, lat_max = a.bbox
+    plan = core.plan_grid(lon_min, lat_min, lon_max, lat_max,
+                          spacing_m=a.spacing, tile_cells=a.tile_cells, epsg=a.epsg)
+    print(f"CRS EPSG:{plan.epsg}  region {plan.width_m:.0f}x{plan.height_m:.0f} m  "
+          f"{plan.samples_x}x{plan.samples_y} samples at {plan.spacing_m:g} m")
+
+    res = kvfetch.run_fetch(
+        plan,
+        name=a.name,
+        root=a.root,
+        dest=a.dest,
+        source_kind=a.source,
+        max_fetch_px=a.max_px,
+        include_water=a.water,
+        include_main_rivers=not a.no_main_rivers,
+        demo=a.demo,
+        progress=_bar("fetch"),
+        request_bbox_lonlat=(lon_min, lat_min, lon_max, lat_max),
+    )
+    d = res.dataset
+    s = d.summary()
+    print(f"\n\nfetched {s['name']!r} -> {d.root}")
+    print(f"  {s['area_km2']:,.1f} km²  ({s['width_m']:,.0f} x {s['height_m']:,.0f} m)  "
+          f"{s['spacing_m']:g} m spacing  EPSG:{s['epsg']}")
+    print(f"  heights {s['samples'][0]}x{s['samples'][1]} samples, "
+          f"{s['coverage_pct']:.2f}% covered, "
+          f"range [{s['height_min_m']:.1f}, {s['height_max_m']:.1f}] m")
+    if s["has_water"]:
+        print(f"  water: {s['rivers']:,} elvenett + {s['main_rivers']:,} hovedelv "
+              f"segments, {s['lakes']:,} lake polygons")
+    else:
+        print("  water: not fetched")
+    print(f"  {s['bytes_total'] / 1e6:,.1f} MB on disk  "
+          f"({res.seconds_heights:.0f}s heights + {res.seconds_water:.0f}s water)")
+    print(f"  tile_cells at fetch {s['tile_cells']}; this lattice can also be "
+          f"processed as {s['valid_tile_cells']}")
+    print(f"\nnext:  kvterrain process --dataset {s['slug']} --out out/")
+
+
+# --------------------------------------------------------------------------- #
+# datasets — what is already on disk                                           #
+# --------------------------------------------------------------------------- #
+
+def cmd_datasets(a):
+    from . import dataset as ds_mod
+
+    root = a.root or ds_mod.DEFAULT_ROOT
+    found = ds_mod.list_datasets(root)
+    if not found:
+        print(f"no datasets in {root}\n\nfetch one:  kvterrain fetch --bbox "
+              f"LONMIN LATMIN LONMAX LATMAX --spacing 5")
+        return
+    print(f"{len(found)} dataset(s) in {root}\n")
+    for d in found:
+        s = d.summary()
+        water = (f"{s['rivers']:,}r/{s['lakes']:,}l" if s["has_water"] else "no water")
+        print(f"  {s['slug']:<24} {s['name']:<22} {s['area_km2']:>8,.1f} km²  "
+              f"{s['spacing_m']:>5g} m  {s['source']:<4} {water:<14} "
+              f"{s['bytes_total'] / 1e6:>8,.1f} MB  "
+              f"{s['created_utc'].replace('T', ' ')[:16]}"
+              + ("  [demo]" if s["demo"] else ""))
+    if a.verbose:
+        for d in found:
+            print(f"\n=== {d.slug} ===")
+            print(json.dumps(d.summary(), indent=2, default=str))
+
+
+# --------------------------------------------------------------------------- #
+# process — stage two                                                          #
+# --------------------------------------------------------------------------- #
+
+def cmd_process(a):
+    from . import process as kvprocess
+
+    d = _resolve_dataset(a.dataset, a.root)
+    s = d.summary()
+    want_water = d.has_water and not a.no_water
+    tile_cells = a.tile_cells or d.default_tile_cells
+    plan = d.plan(tile_cells)
+    print(f"dataset {s['name']!r} ({d.root})")
+    print(f"  CRS EPSG:{plan.epsg}  region {plan.width_m:.0f}x{plan.height_m:.0f} m  "
+          f"leaf {plan.leaf_tiles_x}x{plan.leaf_tiles_y} tiles  "
+          f"{plan.num_levels} levels  {plan.total_tiles()} tiles total")
+    if not want_water:
+        print("  water: OFF" + ("" if d.has_water else " (this dataset has none)"))
+
+    res = kvprocess.process_dataset(
+        d, a.out,
+        tile_cells=tile_cells,
+        nodata_fill_m=a.nodata_fill,
+        height_min=a.hmin, height_max=a.hmax,
+        include_water=want_water,
+        water_opts=_water_opts(a) if want_water else None,
+        progress=_bar("process"),
+    )
+    print()
+    _report_export(a, res, want_water)
+    if res.stage_seconds:
+        slowest = sorted(res.stage_seconds.items(), key=lambda kv: -kv[1])[:4]
+        print("\n  stage timings (slowest first): "
+              + ", ".join(f"{k} {v:.1f}s" for k, v in slowest))
 
 
 def cmd_build(a):
+    """Fetch and process in one pass, storing nothing in between.
+
+    Kept for one-shot builds. When you expect to process the same region more
+    than once, `fetch` then `process` instead — that is what the split is for.
+    """
     lon_min, lat_min, lon_max, lat_max = a.bbox
     plan = core.plan_grid(lon_min, lat_min, lon_max, lat_max,
                           spacing_m=a.spacing, tile_cells=a.tile_cells, epsg=a.epsg)
@@ -29,7 +203,7 @@ def cmd_build(a):
           f"{plan.num_levels} levels  {plan.total_tiles()} tiles total")
 
     def prog(d, t, m):
-        print(f"\r  fetch {d}/{t}", end="", flush=True)
+        print(f"\r  {m:<60.60s}", end="", flush=True)
 
     fetcher = _demo_fetcher if a.demo else None
     server = "(demo)" if a.demo else None
@@ -37,24 +211,7 @@ def cmd_build(a):
     water_opts = None
     if a.water:
         from . import water as _water
-        water_opts = {
-            "include_main_rivers": not a.no_main_rivers,
-            "width_scale": a.river_width_scale,
-            "lake_ramp_radius_m": a.lake_ramp_radius,
-            "lake_max_depth_m": a.lake_max_depth,
-            "lake_min_depth_m": a.lake_min_depth,
-            "lake_shore_slope": a.lake_shore_slope,
-            "lake_snap_px": a.lake_snap_px,
-            "river_depth_scale": a.river_depth_scale,
-            "river_bank_tolerance_m": a.river_bank_tolerance,
-            "fill_lake_holes": not a.keep_lake_holes,
-            "ocean_level_m": a.ocean_level,
-            "emit_geojson": a.emit_geojson,
-            "estimate_lake_levels": a.estimate_lake_levels,
-            "lake_perimeter_cap": a.lake_perimeter_cap,
-        }
-        if a.river_vertex_stride is not None:
-            water_opts["river_vertex_stride_m"] = a.river_vertex_stride
+        water_opts = _water_opts(a)
         if a.demo:
             water_opts["fetcher"] = _water.synthetic_water_features
 
@@ -65,7 +222,13 @@ def cmd_build(a):
                           height_min=a.hmin, height_max=a.hmax,
                           progress=prog,
                           include_water=a.water, water_opts=water_opts)
-    print(f"\npacked {res.tiles_written} tiles to {a.out}  "
+    print()
+    _report_export(a, res, a.water)
+
+
+def _report_export(a, res, want_water: bool) -> None:
+    """The end-of-build summary, shared by `build` and `process`."""
+    print(f"packed {res.tiles_written} tiles to {a.out}  "
           f"range [{res.height_min:.1f}, {res.height_max:.1f}] m")
     atlas = res.manifest["atlas"]
     line = (f"  + {atlas['height_file']} "
@@ -73,7 +236,7 @@ def cmd_build(a):
     if atlas.get("surface_file"):
         line += f" + {atlas['surface_file']}"
     print(line)
-    if a.water:
+    if want_water:
         wm = res.manifest.get("water_surface", {})
         print(f"  + water surface: {wm.get('lake_count', 0)} lakes, "
               f"packed in {atlas['surface_file']} (© NVE)")
@@ -417,89 +580,160 @@ def cmd_describe_services(a):
     sys.exit(1 if bad else 0)
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="kvterrain")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    b = sub.add_parser("build", help="fetch + build tiles")
-    b.add_argument("--bbox", nargs=4, type=float, required=True,
+def _add_area_args(p):
+    """What defines the lattice — i.e. what forces a new fetch if you change it."""
+    p.add_argument("--bbox", nargs=4, type=float, required=True,
                    metavar=("LONMIN", "LATMIN", "LONMAX", "LATMAX"))
-    b.add_argument("--spacing", type=float, default=5.0)
-    b.add_argument("--tile-cells", type=int, default=128, dest="tile_cells")
-    b.add_argument("--epsg", type=int, default=None)
-    b.add_argument("--source", choices=["DTM", "DOM"], default="DTM")
-    b.add_argument("--out", required=True)
-    b.add_argument("--max-px", type=int, default=core.DEFAULT_MAX_FETCH_PX, dest="max_px")
-    b.add_argument("--nodata-fill", type=float, default=0.0, dest="nodata_fill")
-    b.add_argument("--hmin", type=float, default=None)
-    b.add_argument("--hmax", type=float, default=None)
-    b.add_argument("--demo", action="store_true")
-    b.add_argument("--water", action="store_true")
-    b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
-    b.add_argument("--river-width-scale", type=float, default=1.0, dest="river_width_scale")
-    b.add_argument("--river-depth-scale", type=float, default=1.0, dest="river_depth_scale",
+    p.add_argument("--spacing", type=float, default=5.0,
+                   help="leaf sample spacing in metres — the finest LOD. Don't ask "
+                        "for finer than the native data (DTM1 = 1 m).")
+    p.add_argument("--tile-cells", type=int, default=128, dest="tile_cells",
+                   help="cells per tile edge (samples = cells + 1). Used to pad the "
+                        "region out to whole power-of-two tiles; a fetched dataset "
+                        "can still be re-tiled to any smaller power of two at "
+                        "process time without refetching.")
+    p.add_argument("--epsg", type=int, default=None)
+    p.add_argument("--source", choices=["DTM", "DOM"], default="DTM")
+    p.add_argument("--max-px", type=int, default=core.DEFAULT_MAX_FETCH_PX, dest="max_px",
+                   help="largest exportImage request, in pixels per axis")
+    p.add_argument("--demo", action="store_true",
+                   help="synthetic surface + synthetic rivers/lakes, no network")
+
+
+def _add_process_args(p):
+    """Everything that only reads already-fetched data, and is therefore free to
+    re-run. These are the knobs the split exists to let you turn."""
+    p.add_argument("--nodata-fill", type=float, default=0.0, dest="nodata_fill")
+    p.add_argument("--hmin", type=float, default=None,
+                   help="fix the R16 vertical range low end (default: data min)")
+    p.add_argument("--hmax", type=float, default=None,
+                   help="fix the R16 vertical range high end (default: data max)")
+    p.add_argument("--river-width-scale", type=float, default=1.0,
+                   dest="river_width_scale")
+    p.add_argument("--river-depth-scale", type=float, default=1.0, dest="river_depth_scale",
                    help="scales how deep the channel trench is carved under each "
                         "river (per stream order); >1 = deeper/more opaque rivers. "
                         "The water surface itself always sits on the terrain.")
-    b.add_argument("--river-bank-tolerance", type=float, default=2.0,
+    p.add_argument("--river-bank-tolerance", type=float, default=2.0,
                    dest="river_bank_tolerance",
                    help="how far (metres) a channel sample may stand above its "
                         "river's water level and still hold water. Bounds how far "
                         "water can climb a bank or a cliff face the rasterised "
                         "channel lapped onto; lower it if you still see water on "
                         "rock, raise it if channels look too narrow.")
-    b.add_argument("--keep-lake-holes", action="store_true", dest="keep_lake_holes",
+    p.add_argument("--keep-lake-holes", action="store_true", dest="keep_lake_holes",
                    help="do NOT fill lake polygon holes. By default islands are "
                         "covered by the water surface (their own terrain hides it) "
                         "because the polygon/raster misalignment otherwise leaves a "
                         "one-texel dry moat around every island.")
-    b.add_argument("--lake-shore-slope", type=float, default=1.0, dest="lake_shore_slope",
+    p.add_argument("--lake-shore-slope", type=float, default=1.0, dest="lake_shore_slope",
                    help="metres of lake depth gained per metre of shore, on a "
                         "STRAIGHT ramp. At the default 1.0 a --lake-max-depth of 20 m "
                         "is reached 20 m from shore (four texels at 5 m spacing). "
                         "Lower = gentler sides over a longer ramp.")
-    b.add_argument("--lake-ramp-radius", type=float, default=0.0, dest="lake_ramp_radius",
+    p.add_argument("--lake-ramp-radius", type=float, default=0.0, dest="lake_ramp_radius",
                    help="set the ramp length in metres directly, overriding "
                         "--lake-shore-slope. 0 (default) derives it from the slope.")
-    b.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
+    p.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
                    help="maximum synthetic lake depth in metres, reached only by "
                         "lakes big enough to ramp that far")
-    b.add_argument("--lake-min-depth", type=float, default=2.0, dest="lake_min_depth",
+    p.add_argument("--lake-min-depth", type=float, default=2.0, dest="lake_min_depth",
                    help="depth every lake reaches at its deepest sample, however "
                         "small it is, so ponds don't render as dry ground")
-    b.add_argument("--lake-snap-px", type=int, default=2, dest="lake_snap_px",
+    p.add_argument("--lake-snap-px", type=int, default=2, dest="lake_snap_px",
                    help="how many texels outside its polygon a lake may claim samples "
                         "that are still its own flat water surface in the DTM. The NVE "
                         "outline and the LiDAR block do not align to the pixel, and the "
                         "leftover ring renders as a raised rim tracing the true "
                         "shoreline. 0 disables.")
-    b.add_argument("--ocean-level", type=float, default=0.0, dest="ocean_level",
+    p.add_argument("--ocean-level", type=float, default=0.0, dest="ocean_level",
                    help="sea level in metres above sea level for the Ocean class. "
                         "Kartverket heights are m.o.h., so 0 is real sea level; the "
                         "consuming world's ocean plane height is a runtime concern. "
                         "Ocean is flood-filled from the map edges, not thresholded.")
-    b.add_argument("--river-vertex-stride-m", type=float, default=None,
+    p.add_argument("--river-vertex-stride-m", type=float, default=None,
                    dest="river_vertex_stride",
                    help="spacing to densify river polylines to before sampling Z "
                         "(default: leaf spacing). Denser follows the channel more "
                         "closely; coarser shrinks rivers.bin.")
-    b.add_argument("--estimate-lake-levels", action=argparse.BooleanOptionalAction,
+    p.add_argument("--estimate-lake-levels", action=argparse.BooleanOptionalAction,
                    default=True, dest="estimate_lake_levels",
                    help="fill in a water level for lakes NVE gives no 'hoyde' for, "
                         "by reading the LiDAR water surface inside the polygon "
                         "(default: on). With --no-estimate-lake-levels those lakes "
                         "are left uncarved and dry rather than guessed at.")
-    b.add_argument("--lake-perimeter-cap", action=argparse.BooleanOptionalAction,
+    p.add_argument("--lake-perimeter-cap", action=argparse.BooleanOptionalAction,
                    default=True, dest="lake_perimeter_cap",
                    help="cap an ESTIMATED lake level at the height of the land ring "
                         "just outside the polygon, so a lake NVE gives no 'hoyde' "
                         "for cannot end up standing above the terrain around it "
                         "(default: on). A published hoyde is never capped.")
-    b.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
+    p.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
                    help="also write rivers.geojson (debug sidecar for QGIS; "
                         "rivers.bin is the runtime format)")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="kvterrain",
+        description="Kartverket height (+ NVE water) -> Unity quad-tree terrain. "
+                    "Fetch once (`fetch`), process as often as you like "
+                    "(`process`), or do both in one pass (`build`).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # ---- stage one ------------------------------------------------------- #
+    f = sub.add_parser("fetch", help="fetch a region and store it as a dataset")
+    _add_area_args(f)
+    f.add_argument("--name", default=None,
+                   help="name for the dataset (default: the municipality under the "
+                        "region's centre, from Kartverket's kommuneinfo API)")
+    f.add_argument("--root", default=None,
+                   help=f"where datasets live (default: {'data/datasets'} in the "
+                        f"project)")
+    f.add_argument("--dest", default=None,
+                   help="write to exactly this directory instead of deriving one "
+                        "from --name under --root")
+    f.add_argument("--water", action=argparse.BooleanOptionalAction, default=True,
+                   help="also fetch the NVE rivers/lakes that intersect the region "
+                        "(default: on — the vectors are cheap next to the raster, "
+                        "and `process --no-water` can always ignore them later)")
+    f.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers",
+                   help="skip the hovedelv layer, which is the second NVE query and "
+                        "the only thing that upgrades trunk-river size class")
+    f.set_defaults(func=cmd_fetch)
+
+    dl = sub.add_parser("datasets", help="list the datasets already fetched")
+    dl.add_argument("--root", default=None)
+    dl.add_argument("--verbose", action="store_true", help="dump each summary as JSON")
+    dl.set_defaults(func=cmd_datasets)
+
+    # ---- stage two ------------------------------------------------------- #
+    pr = sub.add_parser("process", help="build the export from a fetched dataset")
+    pr.add_argument("--dataset", required=True,
+                    help="dataset directory, or the slug/name of one under --root")
+    pr.add_argument("--root", default=None)
+    pr.add_argument("--out", required=True)
+    pr.add_argument("--tile-cells", type=int, default=None, dest="tile_cells",
+                    help="re-tile the SAME samples (default: whatever the fetch "
+                         "used). Any power of two the lattice divides by — see "
+                         "`kvterrain datasets --verbose`.")
+    pr.add_argument("--no-water", action="store_true", dest="no_water",
+                    help="ignore the dataset's water vectors and build height only")
+    _add_process_args(pr)
+    pr.set_defaults(func=cmd_process)
+
+    # ---- both at once ---------------------------------------------------- #
+    b = sub.add_parser("build", help="fetch + process in one pass, storing nothing "
+                                     "in between")
+    _add_area_args(b)
+    b.add_argument("--out", required=True)
+    b.add_argument("--water", action="store_true",
+                   help="also fetch and process NVE rivers/lakes")
+    b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
+    _add_process_args(b)
     b.set_defaults(func=cmd_build)
 
+    # ---- checks ---------------------------------------------------------- #
     v = sub.add_parser("validate", help="spot-check packed leaf heights vs point API")
     v.add_argument("--out", required=True)
     v.add_argument("--n", type=int, default=12)

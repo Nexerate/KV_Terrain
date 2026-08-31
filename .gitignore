@@ -89,3 +89,7 @@ config.py
 # Generated exports (atlases are hundreds of MB; lakes/junctions JSON is tens of
 # thousands of lines). Everything here is reproducible from a `kvterrain build`.
 exports/
+
+# Fetched intermediate datasets (the stage-one store). Tens to hundreds of MB
+# each and fully reproducible from a `kvterrain fetch`.
+data/
