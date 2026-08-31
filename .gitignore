@@ -85,3 +85,7 @@ Thumbs.db
 # Local config / secrets
 *.local
 config.py
+
+# Generated exports (atlases are hundreds of MB; lakes/junctions JSON is tens of
+# thousands of lines). Everything here is reproducible from a `kvterrain build`.
+exports/
