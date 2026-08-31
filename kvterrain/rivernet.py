@@ -15,17 +15,20 @@ Elvenett polylines are 2D. There is no Z in the source to "keep" — it has to b
 constructed, and this module constructs it exactly the way the raster already
 does, because that is the behaviour that visibly works:
 
-    z(v)     = leaf DTM sampled beneath vertex v          <- the BED
-    level(v) = z(v) + raise_for_order(order)              <- the water SURFACE
+    z(v)     = carved leaf DTM sampled beneath vertex v   <- the BED
+    level(v) = z(v) + carve_depth_for_order(order)        <- the water SURFACE
 
 Two values per vertex, deliberately, because they have different consumers:
 
-  * `z` is the BED, and it is what the burn runs its running-minimum over. Burning
-    against the surface instead would cut ~1-11 m too shallow and leave the DEM
-    dams in place.
+  * `z` is the BED — the floor of the trench `bathymetry.carve_river_beds` cut —
+    and it is what the burn runs its running-minimum over. Burning against the
+    surface instead would cut ~1-11 m too shallow and leave the DEM dams in place.
   * `level` is the authored water surface, and it is what a river pins to when it
-    is not disturbed. It equals the raster's surface value at that pixel by
-    construction, so the polyline and the raster cannot drift apart.
+    is not disturbed. It is read VERBATIM out of the raster surface field when one
+    is supplied, so the polyline and the raster cannot drift apart; the
+    `z + carve_depth` form above is the fallback, and it reconstructs the same
+    number because the surface a river is given IS the ground the trench was cut
+    from.
 
 This is the same per-pixel rule as `watersurface.river_surface_moh`, applied at
 vertices. It is NOT a fitted profile. An earlier revision rasterised the centreline,
@@ -65,7 +68,8 @@ import numpy as np
 from . import core
 from . import water as kvwater
 from . import waterid as kvid
-from .watersurface import DEFAULT_DEPTH_BY_ORDER, depth_for_order, _fill_nan_1d, _bresenham_path
+from .bathymetry import DEFAULT_RIVER_DEPTH_BY_ORDER, depth_for_order
+from .watersurface import _fill_nan_1d, _bresenham_path
 
 RIVERS_BIN_FILE = "rivers.bin"
 RIVERS_GEOJSON_FILE = "rivers.geojson"
@@ -340,10 +344,11 @@ def build_river_network(
     100 m+ disagreement on the handful of vertices that matter most, since they
     are precisely where the burn hands off to the lake basin.
 
-    Without `water_surface` the function falls back to `bed + raise` plus lake-span
-    pinning, which is correct in the interior and wrong only at those boundaries.
+    Without `water_surface` the function falls back to `bed + carve depth` plus
+    lake-span pinning, which is correct in the interior and wrong only at those
+    boundaries.
     """
-    depth_by_order = depth_by_order or DEFAULT_DEPTH_BY_ORDER
+    depth_by_order = depth_by_order or DEFAULT_RIVER_DEPTH_BY_ORDER
     stride = float(vertex_stride_m) if vertex_stride_m else float(plan.spacing_m)
     weight_raw = wg.weight_raw if wg.weight_raw is not None else wg.weight
 
@@ -403,8 +408,10 @@ def build_river_network(
             if not np.isfinite(z).any():
                 continue
 
-            raise_m = depth_for_order(order, depth_by_order, depth_scale)
-            level = z + raise_m
+            # Fallback surface: the trench floor plus the depth that was carved to
+            # make it, i.e. the ground the channel was cut from. Overwritten below
+            # wherever the raster actually carries a surface at this vertex.
+            level = z + depth_for_order(order, depth_by_order, depth_scale)
 
             ri, ci = _nearest_idx(plan, xy)
             lake_at = wg.lake_id[ri, ci].astype(np.int64)
@@ -884,10 +891,10 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
         "vertices": net.total_vertices(),
         "vertex_fields": ["x_rel_origin_m", "y_rel_origin_m", "z_bed_m", "level_surface_m"],
         "vertex_order": "upstream_to_downstream",
-        "note": ("z is the sampled DTM BED — burn against this. level is the water "
-                 "SURFACE (bed + raise by stream order, or the lake's authored "
-                 "hoyde inside a lake span) — pin to this. Loaded once, resident; "
-                 "not streamed."),
+        "note": ("z is the sampled DTM BED — the floor of the carved channel — burn "
+                 "against this. level is the water SURFACE (the ground above that "
+                 "channel, or the lake's authored level inside a lake span) — pin "
+                 "to this. Loaded once, resident; not streamed."),
     }
 
 
@@ -946,12 +953,16 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
         "authored_level_field": "authored_level_m",
         "policy": "AuthoredWins",
         "level_source_field": "level_source",
+        # Keyed off the constants, not off copies of their values: the strings are
+        # a serialisation contract, and a rename that updated one of the four
+        # places they used to be spelled out would have gone unnoticed.
         "level_sources": {
-            "nve_hoyde": "the lake's authored NVE `hoyde`",
-            "dtm_interior_median": "read off the LiDAR water surface inside the "
-                                   "polygon, because NVE publishes no hoyde for "
-                                   "this lake. Pin it exactly like an NVE one — "
-                                   "it is the level the surface raster carries.",
+            kvwater.LEVEL_SOURCE_NVE: "the lake's authored NVE `hoyde`",
+            kvwater.LEVEL_SOURCE_ESTIMATED:
+                "read off the LiDAR water surface inside the polygon (the low band "
+                "of it), capped at the land ringing the lake, because NVE publishes "
+                "no hoyde for this lake. Pin it exactly like an NVE one — it is the "
+                "level the surface raster carries.",
         },
         "note": "no polygon geometry is emitted; the per-pixel mask in "
                 "water_id.atlas is the geometry reference. `hoyde_moh` is the raw "
@@ -966,7 +977,7 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
                 1 for l in net.lakes if l.get("authored_level_m") is not None),
             "with_estimated_level": sum(
                 1 for l in net.lakes
-                if l.get("level_source") == "dtm_interior_median")}
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED)}
 
 
 def write_junctions_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:

@@ -9,8 +9,9 @@ SAME corner-centered sample lattice the height pipeline uses (`core.GridPlan`).
 The result is an in-memory `WaterGrid` (per-pixel `type`, river `weight`, and
 `lake_id` + `lake_table`) that downstream passes consume:
 
-  * `bathymetry.carve_lake_beds`  reads `type` to carve lake bowls, and
-  * `watersurface`                reads `type` + `weight` (stream order) and
+  * `bathymetry.carve_lake_beds`  reads `type` to carve lake bowls,
+  * `bathymetry.carve_river_beds` reads `type` + `weight` to carve channels, and
+  * `watersurface`                reads `type` and
                                   `lake_surface_moh()` to build the per-pixel
                                   `.wsurf` water-surface field that is actually
                                   written to disk.
@@ -24,7 +25,7 @@ The old categorical `.water` record (type/weight/flow/lake_id, four channels) an
 its quad-tree pyramid are still gone. `water_id` is its narrower replacement: a
 single u16 channel carrying Dry/River/Ocean plus the authored lake id, which is
 what the runtime actually needs to pin an authored lake level to a solver basin.
-`weight` (stream order) stays in memory only — the river surface raise is sized by
+`weight` (stream order) stays in memory only — the river channel carve is sized by
 it and `rivernet` samples it — and the old `flow` bearing byte remains gone with
 the tile it served, since flow direction now lives on the polylines where it
 belongs.
@@ -235,8 +236,10 @@ class WaterGrid:
     """North-up assembled masks, shape (SY, SX) each; lake_table maps id->info.
 
     `weight` is the per-pixel river stream order (clamped 1..255; 0 off-river),
-    which `watersurface` reads to size the river-surface raise. The old `flow`
-    bearing byte was dropped together with the `.water` tile it served.
+    which `bathymetry.carve_river_beds` reads to size the channel trench — and
+    which `watersurface` no longer needs, now that a river's surface is simply the
+    ground above that trench. The old `flow` bearing byte was dropped together with
+    the `.water` tile it served.
     """
     type: np.ndarray           # u1
     weight: np.ndarray         # u1
@@ -248,6 +251,11 @@ class WaterGrid:
     # only be recovered from the pre-mask grid. Reading `weight` there would
     # return 0 and silently demote every trunk river crossing a lake.
     weight_raw: np.ndarray = None      # u1
+    # Lake samples that are really ISLANDS — inside a hole of the lake polygon.
+    # The mask calls them lake (so the water surface runs through them, see
+    # `rasterize_water`) but they are dry land: the carve leaves their DTM height
+    # alone and treats them as shore, and the level estimator ignores them.
+    lake_island: np.ndarray = None     # bool
 
     def lake_level(self, info: dict):
         """
@@ -658,16 +666,123 @@ def features_from_geojson(
 
 
 LEVEL_SOURCE_NVE = "nve_hoyde"
-LEVEL_SOURCE_ESTIMATED = "dtm_interior_median"
+LEVEL_SOURCE_ESTIMATED = "dtm_interior_low"
+
+# How far outside its polygon a lake may claim samples that are still its own flat
+# water surface in the DTM, and how close to that surface they have to be.
+DEFAULT_LAKE_SNAP_PX = 2
+DEFAULT_LAKE_SNAP_TOL_M = 0.35
+
+
+def snap_lakes_to_flat_water(wg: WaterGrid, height_repaired: np.ndarray, *,
+                             max_px: int = DEFAULT_LAKE_SNAP_PX,
+                             tol_m: float = DEFAULT_LAKE_SNAP_TOL_M) -> dict:
+    """
+    Grow each lake into the samples just outside its polygon that are STILL that
+    lake's flat water surface in the DTM. Mutates `wg` and returns a summary.
+
+    An NVE outline and a Kartverket LiDAR block are independent products, so the
+    polygon boundary lands somewhere near — not on — the flat plane the flight
+    recorded for that lake, and it is rasterised centre-in-polygon on top of that.
+    The result is a ring of samples, one or two texels wide, that ARE the lake's
+    own water surface and are classified as dry land. They keep a terrain height at
+    the flown water level while the lake beside them is carved to its authored
+    level, so they render as a raised rim tracing the real shoreline while the
+    water sits inside it. Measured on a Lierne export: of the samples immediately
+    outside Kroktjønna's polygon, 55% were still its own flat water plane; for
+    Klingervatnet, 21%.
+
+    That rim is why a lake can be at exactly its published `hoyde` and still look
+    wrong — it draws the true outline in dry land, just outside the water.
+
+    The test is deliberately narrow: a candidate must be within `max_px` of the
+    lake, must not already be water, and its height must be within `tol_m` of THAT
+    lake's own flown surface (the median of its interior, which is flat to within
+    0.25 m on 90-97% of samples). Real bank rises out of that window immediately,
+    so the growth stops at the shoreline rather than crawling across flat ground.
+
+    Run it AFTER `bathymetry.fill_lake_surface` (so voids are repaired and the
+    interior median is meaningful) and BEFORE the levels are resolved.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    is_lake = wg.type == TYPE_LAKE
+    stats = {"max_px": int(max_px), "tol_m": float(tol_m), "samples_added": 0,
+             "lakes_grown": 0}
+    if not is_lake.any() or max_px <= 0:
+        return stats
+
+    # Each lake's flown water surface: the median of its own interior, islands out.
+    ids = wg.lake_id
+    sel = is_lake & np.isfinite(height_repaired)
+    if wg.lake_island is not None:
+        sel &= ~wg.lake_island
+    if not sel.any():
+        return stats
+    gid = ids[sel]
+    gh = np.asarray(height_repaired)[sel].astype(np.float64)
+    order = np.argsort(gid, kind="stable")
+    gid, gh = gid[order], gh[order]
+    uniq, starts = np.unique(gid, return_index=True)
+    ends = np.append(starts[1:], gid.size)
+    flown = np.full(int(ids.max()) + 1, np.nan, dtype=np.float64)
+    for u, a, b in zip(uniq, starts, ends):
+        flown[int(u)] = np.median(gh[a:b])
+
+    # Nearest lake sample for every dry sample, and that lake's flown surface.
+    dist, ind = distance_transform_edt(
+        ~is_lake, return_distances=True, return_indices=True)
+    near_id = ids[ind[0], ind[1]]
+    with np.errstate(invalid="ignore"):
+        near_flown = flown[near_id]
+        grow = ((wg.type == TYPE_LAND) & (dist <= float(max_px))
+                & (near_id > 0) & np.isfinite(height_repaired)
+                & np.isfinite(near_flown)
+                & (np.abs(height_repaired - near_flown) <= float(tol_m)))
+    if not grow.any():
+        return stats
+
+    wg.type[grow] = TYPE_LAKE
+    wg.lake_id[grow] = near_id[grow].astype(wg.lake_id.dtype)
+    wg.weight[grow] = 0
+    if wg.lake_island is not None:
+        wg.lake_island[grow] = False
+    stats["samples_added"] = int(grow.sum())
+    stats["lakes_grown"] = int(np.unique(near_id[grow]).size)
+    return stats
+
+# NOTE: a third source, `nve_hoyde_lowered_to_dtm`, existed briefly and is DELETED.
+# It lowered a published `hoyde` to the LiDAR reading whenever `hoyde` stood above
+# it, on the theory that a lake should never sit higher than the ground the DTM
+# recorded around it.
+#
+# It was wrong, and the reason is what `hoyde` IS. It is the lake's AUTHORED level
+# — for a regulated lake, its nominal/regulated level — while the DTM is a snapshot
+# of whatever the water happened to be doing on the day that block was flown. On a
+# regulated lake those differ by metres, and it is the authored level that the map,
+# the shoreline and everyone's memory of the place agree with. Clamping took the
+# drawdown as truth: recognisable lakes came out metres low, their shorelines
+# retreated inland to a ring of exposed bed, and the rivers that used to meet them
+# ended above the new surface.
+#
+# The measurement that motivated the clamp was real (over a Lierne block, `hoyde`
+# sat up to 0.81 m above the LiDAR surface, and on the worst decile of those lakes
+# nearly half the shoreline samples fell below the water plane) — but sub-metre
+# overshoot on a shoreline the carve already feathers is a far smaller error than
+# metres of drawdown on a reservoir. NVE publishes the level; we use the level.
+# The interior reading is for lakes that have none, and `perimeter_levels` bounds
+# THOSE.
 
 
 def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
-                           enabled: bool = True, margin_m: Optional[float] = None) -> dict:
+                           enabled: bool = True, margin_m: Optional[float] = None,
+                           island: Optional[np.ndarray] = None,
+                           perimeter_cap: bool = True) -> dict:
     """
     Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
     estimating a level from the DTM for the lakes NVE gives no `hoyde` for.
 
-    WHY THIS EXISTS. `hoyde` is null for a lot of small lakes — 25% of the records
+    WHY THE ESTIMATE EXISTS. `hoyde` is null for a lot of small lakes — 25% of the records
     in a Lierne export, 37% of the lakes in the source data there, against 11% in
     a Krøderen one. Those lakes still rasterise, still classify as Lake, and still
     got carved (the carve had its own private shore-estimate fallback), but the
@@ -685,6 +800,22 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     the caller MUST also stop carving them (`estimate_missing=False`) — otherwise
     it recreates the dry-pit bug this function was written to remove.
 
+    A PUBLISHED `hoyde` IS USED EXACTLY AS PUBLISHED. It is not averaged with the
+    DTM, not lowered to it, not sanity-checked against it. NVE is the authority on
+    what a lake's level is; the DTM is one flight's opinion of where the water was
+    that day, and on a regulated lake that is metres of drawdown below the level
+    the place actually has. See the note above `apply_estimated_levels` for the
+    version of this function that got that backwards.
+
+    THE PERIMETER CAP (`perimeter_cap`, on by default) therefore applies to
+    ESTIMATED levels only. Those come from the polygon's interior, so the one
+    failure they can have is a polygon that overlaps land — and the check for it is
+    the ring of ground just outside the polygon: a lake should not be handed a
+    surface standing above the land that encircles it. `bathymetry.perimeter_levels`
+    reads a low percentile of that ring (not its minimum — an outlet is genuinely
+    below the lake), and the estimate is capped there. It only lowers, and only a
+    lake NVE told us nothing about.
+
     `height_repaired` must be the void-repaired, UNCARVED bed. Returns a small
     summary dict for the manifest.
     """
@@ -698,16 +829,28 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
 
     missing = [lid for lid, info in table.items() if info.get("level_m") is None]
     estimated = 0
+    capped = 0
+    cap_max_m = 0.0
     if enabled and missing:
         kw = {} if margin_m is None else {"margin_m": float(margin_m)}
+        if island is None:
+            island = wg.lake_island
         est = bathymetry.estimate_levels_from_interior(
-            height_repaired, wg.lake_id, **kw)
+            height_repaired, wg.lake_id, exclude=island, **kw)
+        cap = (bathymetry.perimeter_levels(height_repaired, wg.lake_id, wg.type)
+               if perimeter_cap else {})
         for lid in missing:
             v = est.get(lid)
-            if v is not None and np.isfinite(v):
-                table[lid]["level_m"] = float(v)
-                table[lid]["level_source"] = LEVEL_SOURCE_ESTIMATED
-                estimated += 1
+            if v is None or not np.isfinite(v):
+                continue
+            c = cap.get(lid)
+            if c is not None and np.isfinite(c) and float(c) < float(v):
+                cap_max_m = max(cap_max_m, float(v) - float(c))
+                v = float(c)
+                capped += 1
+            table[lid]["level_m"] = float(v)
+            table[lid]["level_source"] = LEVEL_SOURCE_ESTIMATED
+            estimated += 1
 
     unresolved = sum(1 for i in table.values() if i.get("level_m") is None)
     return {
@@ -715,12 +858,24 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
         "levels_from_nve": sum(1 for i in table.values()
                                if i.get("level_source") == LEVEL_SOURCE_NVE),
         "levels_estimated": estimated,
+        "levels_capped_to_perimeter": capped,
+        "levels_cap_max_drop_m": cap_max_m,
+        "perimeter_cap_enabled": bool(perimeter_cap),
         "levels_unresolved": unresolved,
         "estimation_enabled": bool(enabled),
         "margin_m": (bathymetry.DEFAULT_LEVEL_MARGIN_M
                      if margin_m is None else float(margin_m)),
-        "method": ("median of the void-repaired DTM inside each lake polygon "
-                   "(LiDAR returns the water surface), minus margin_m"),
+        "band_pct": [bathymetry.DEFAULT_LEVEL_TRIM_PCT,
+                     bathymetry.DEFAULT_LEVEL_BAND_PCT],
+        "method": (f"a published NVE hoyde is used verbatim. For a lake without "
+                   f"one: the mean of the "
+                   f"{bathymetry.DEFAULT_LEVEL_TRIM_PCT:g}-"
+                   f"{bathymetry.DEFAULT_LEVEL_BAND_PCT:g}th percentile band of the "
+                   f"void-repaired DTM inside the polygon (LiDAR returns the water "
+                   f"surface), ignoring island pixels, minus margin_m, then capped "
+                   f"at the {bathymetry.DEFAULT_PERIMETER_PERCENTILE:g}th percentile "
+                   f"of the land ring just outside the polygon so the estimate "
+                   f"cannot stand above the terrain around it."),
     }
 
 
@@ -811,18 +966,61 @@ def fetch_water_features(
 
 
 # --------------------------------------------------------------------------- #
+# NOTE: river -> lake SNAPPING was implemented here and then deleted.           #
+# --------------------------------------------------------------------------- #
+#
+# The hypothesis was the obvious one: Elvenett and the Innsjødatabase are
+# separate products, so a channel stops short of the lake it feeds and the gap
+# survives rasterisation as a dry texel or two. The code walked each free river
+# endpoint onto the nearest lake boundary and a little past it.
+#
+# It never fired, and the measurements say it never should. Over a 20x20 km
+# Lierne block (51266 elvenett segments, 1251 lakes):
+#
+#   * 29221 segment endpoints already lie INSIDE a lake polygon;
+#   * 5107 more lie 0-20 m outside one (median 4.9 m — the one-texel gap you can
+#     see in a viewer), but not one of them is a free end. Every one is a shared
+#     ELVIS join, and the segment continuing through it carries on into the lake;
+#   * rasterised, 203 endpoints sat in that near-lake band and 203 of 203 were in
+#     a connected wet component that INCLUDED the lake. Zero raster gaps.
+#
+# Extending shared joins anyway would have been actively harmful: they are what
+# `rivernet._link_segments` matches last-vertex-to-first-vertex on, so moving one
+# side of a join breaks the connectivity graph.
+#
+# The gap that IS visible between a river and a lake was never geometric. It was
+# the lake tie-in in `watersurface.river_surface_moh` pinning the last river
+# texels DOWN to the pool's level, which clipped their depth to zero and rendered
+# them dry — 88% of all junction pixels. That function documents the fix.
+
+# --------------------------------------------------------------------------- #
 # Rasterise: burn features onto the leaf sample grid                           #
 # --------------------------------------------------------------------------- #
 
 def rasterize_water(
     plan: core.GridPlan, feats: WaterFeatures, *,
     width_by_order: Optional[dict] = None, width_scale: float = 1.0,
-    all_touched_rivers: bool = True,
+    all_touched_rivers: bool = True, fill_lake_holes: bool = True,
 ) -> WaterGrid:
     """
     Rasterise rivers (buffered by size) and lakes onto the leaf (SY,SX) grid.
     Priority at overlaps is lake > river; among rivers the larger (higher order)
     wins, and its weight (stream order) is the one kept.
+
+    With `fill_lake_holes` (the default) a lake polygon's HOLES are rasterised as
+    lake too, and recorded separately in `WaterGrid.lake_island`. The water surface
+    therefore runs continuously through an island, and the island's own DTM height
+    — which the carve leaves alone — is what covers the surface back up.
+
+    That is a fix for the thin gap that used to appear around every island. A hole
+    boundary almost never lands on the sample lattice, so the ring of pixels
+    between the true shoreline and the first pixel whose CENTRE is inside the hole
+    fell out of the lake mask, carried no water surface, and kept a terrain height
+    that the LiDAR had flattened to the lake's own level. The result was a one-
+    texel moat of bare, water-level ground around every island. Filling the hole
+    covers that ring with water and lets `depth = max(0, level - terrain)` decide
+    where the shoreline really is, at the resolution of the height data rather than
+    the resolution of the polygon rasteriser.
     """
     from shapely.geometry import LineString, Polygon
     from rasterio.features import rasterize
@@ -875,6 +1073,7 @@ def rasterize_water(
     lake_id_arr = np.zeros(shape, dtype=np.uint16)
     lake_table: dict = {}
     lake_shapes = []
+    hole_shapes = []
     next_id = 1
     lopenr_to_local: dict = {}
     for lk in feats.lakes:
@@ -894,13 +1093,27 @@ def rasterize_water(
             }
         shell = lk.rings[0]
         holes = lk.rings[1:] if len(lk.rings) > 1 else None
-        poly = Polygon(shell, holes)
+        poly = Polygon(shell, None if fill_lake_holes else holes)
         if not poly.is_empty:
             lake_shapes.append((poly, int(local)))
+        if fill_lake_holes and holes:
+            for h in holes:
+                hp = Polygon(h)
+                if not hp.is_empty:
+                    hole_shapes.append((hp, 1))
 
     if lake_shapes:
         rasterize(lake_shapes, out=lake_id_arr, transform=transform,
                   all_touched=False, merge_alg=_replace())
+
+    # Islands: pixels inside a filled hole. Rasterised with the SAME centre-in-
+    # polygon rule as the lakes, so island and lake tile the polygon exactly and no
+    # third state can appear between them.
+    island_arr = np.zeros(shape, dtype=np.uint8)
+    if hole_shapes:
+        rasterize(hole_shapes, out=island_arr, transform=transform,
+                  all_touched=False, merge_alg=_replace())
+    island_mask = (island_arr > 0) & (lake_id_arr > 0)
 
     # Keep the order grid as it stood BEFORE lakes claimed their pixels. Elvenett
     # runs lake-through-lines across every lake, and those pixels are about to be
@@ -916,7 +1129,7 @@ def rasterize_water(
     weight_arr[lake_mask] = 0
 
     return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table,
-                     weight_raw=weight_raw)
+                     weight_raw=weight_raw, lake_island=island_mask)
 
 
 def _replace():

@@ -89,18 +89,22 @@ python -m kvterrain.cli build --bbox 8.30 61.28 8.55 61.40 --spacing 5 \
     --out ./out --demo --water
 ```
 
-Draw a rectangle with the toolbar (top-left of the map). The sidebar previews the
-snapped grid, tile count, pyramid depth and fetch-request count before you commit —
-plus, if **Fetch rivers & lakes** is on, the extra `.water`/`.wsurf` budget.
-**Demo mode** builds from a synthetic surface (and a synthetic river + lake) with
-no network, so you can verify the whole pipeline end-to-end before fetching real
-data.
+Draw a rectangle with the toolbar (top-left of the map). A **dashed orange outline**
+appears around it: that is the area actually exported, which is bigger than what you
+drew because the grid is padded out to whole power-of-two tiles. Use the toolbar's
+**edit tool to drag or resize** the rectangle — the outline and the plan follow it —
+so you can slide the export off a border or a coverage gap instead of deleting and
+redrawing by eye. The sidebar previews the snapped grid, the exported extent in UTM,
+how much padding was added on each axis, tile count, pyramid depth and fetch-request
+count before you commit. **Demo mode** builds from a synthetic surface (and a
+synthetic river + lake) with no network, so you can verify the whole pipeline
+end-to-end before fetching real data.
 
 Water flags: `--water` turns it on; `--river-width-scale` multiplies modelled
 channel widths (how many pixels each river seeds); `--no-main-rivers` skips the
 `hovedelv` size-upgrade pass; `--lake-max-depth` (default **20**, real metres) is
-how far below the water surface a lake bed is carved; `--lake-ramp-radius`
-(default **10** m) is the shore-bevel width.
+how far below the water surface a lake bed is carved; `--lake-shore-slope`
+(default **1.0**) is how fast it gets there, in metres of depth per metre of shore.
 
 ### Validate against ground truth
 
@@ -178,29 +182,91 @@ Where the surface comes from:
 
 - **Lakes:** the lake's resolved level, stamped on every one of its pixels (flat),
   and stored per lake in `manifest.water.lake_table[id].level_m`.
-  NVE `hoyde` where it exists — but it very often does not (25% of lake records in
-  a Lierne export, 11% in a Krøderen one), so by default those lakes get a level
-  read off the **LiDAR water surface inside the polygon** (`--no-estimate-lake-levels`
-  turns this off, and then they are left uncarved rather than guessed at).
+  **NVE `hoyde` is used exactly as published** wherever it exists — it is the
+  lake's authored level, and the DTM gets no vote on it. (It is worth being
+  explicit: the DTM is one flight's snapshot of where the water was that day, so on
+  a regulated lake it can sit metres below the level the place actually has.
+  Second-guessing `hoyde` against it drags recognisable lakes down and pulls their
+  shorelines inland.)
+  `hoyde` very often does not exist, though (25% of lake records in a Lierne
+  export, 11% in a Krøderen one). Those lakes get a level read off the **LiDAR
+  water surface inside the polygon**: the mean of its 1st–25th percentile band —
+  low enough that land inside an over-wide polygon cannot float the lake, high
+  enough that one stray low cell cannot sink it — and then **capped by a perimeter
+  scan**, a low percentile of the land ring just outside the polygon, so an
+  estimated lake cannot end up standing above the terrain that encircles it.
+  `--no-estimate-lake-levels` turns the estimate off (those lakes are then left
+  uncarved rather than guessed at); `--no-lake-perimeter-cap` turns off the cap.
   `lakes.json` carries the level used as `authored_level_m` and its provenance as
-  `level_source`; the raw NVE field stays visible, and null, as `hoyde_moh`.
-- **Rivers:** Elvenett has no elevation, so the surface is estimated from the
-  **leaf DTM along each channel**: sample the bed at the finest resolution, fit a
-  **monotone-descending** profile (isotonic regression — real river surfaces never
-  flow uphill; DTM noise, bridges and bank-catching cells do), add a small nominal
-  depth by stream order, **pin the ends to the lake surface** where a channel meets
-  a lake, then widen the centerline value across the modelled channel.
+  `level_source` (`nve_hoyde` or `dtm_interior_low`); the raw NVE field stays
+  visible, and null, as `hoyde_moh`.
+- **Rivers:** Elvenett has no elevation, so the surface is the **terrain height
+  under the channel's own centreline**, sampled from the leaf DTM before any carve
+  and spread flat across the samples that centreline seeded. So a river surface is
+  **level across a channel and descends along it**, like water — it is not each
+  sample's own ground, which would paint water onto whatever the rasterised buffer
+  covers and send a thin film climbing every cliff a channel runs past. A sample
+  more than `--river-bank-tolerance` (default 2 m) above that level is a bank: it
+  is neither carved nor flooded, so the waterline lands where the ground crosses
+  the level rather than where the buffer ends. The water column itself comes from a
+  **trench carved under the river** (see below). Where a channel meets a lake the
+  surface is **raised** to the lake's level — never lowered to it, or the last texel
+  or two of river would clip to zero depth and render as a dry gap.
 
-### The lake bed carve
+### The carves
 
 The DTM records a lake's **surface** flat at the water level (LiDAR gets no bed
-return), which fights the water in a depth renderer. So the tool carves each lake
-bed to a **flat depth below the known surface** (`--lake-max-depth`, default 20
-real metres) with a short shore bevel. The surface itself is placed by `hoyde`, so
-the bed carve is purely about giving the renderer enough depth to read opaque —
-it's not surveyed bathymetry. (If your engine compresses height, e.g. 1:5, size
-the carve so it still clears your opaque threshold after compression: 20 m → 4
-units at 1:5.)
+return), and a river's channel is likewise only as deep as the DTM resolved it.
+Neither leaves room for water in a depth renderer, so the tool cuts the bed down
+and leaves the water surface where the ground is:
+
+- **Lakes** descend on a **straight ramp** at `--lake-shore-slope` metres of depth
+  per metre of shore (default **1.0**) until they reach `--lake-max-depth` (default
+  20 real metres), and are flat from there inward. At the defaults that is 20 m of
+  depth over 20 m of shore — four texels at 5 m spacing, giving 0 / 5 / 10 / 15 / 20.
+  `--lake-ramp-radius` sets the ramp length in metres directly if you would rather
+  not think in slopes; `--lake-min-depth` (default 2 m) is the floor every body
+  reaches at its deepest sample, so a pond too small to ramp still holds water.
+
+  A lake wider than twice the ramp reaches full depth in the middle, which at the
+  default slope is most lakes. That is deliberate. An earlier revision stretched the
+  ramp to 150 m so that lake *size* decided depth and small lakes stayed shallow —
+  and the cost was that near-shore water was too shallow to render, so lakes came out
+  as rounded blobs sitting inside their own shorelines with every bay and headland
+  gone (measured at a 0.5 m visibility threshold: Kroktjønna rendered 55% of its own
+  polygon, median depth 0.61 m). Depth now follows distance from shore and nothing
+  else. Lower `--lake-max-depth` for shallower lakes, `--lake-shore-slope` for
+  gentler sides.
+- **Rivers** get a trench under the channel, deepest along the middle and feathering
+  out at the banks, scaled by stream order (1.5 m for a headwater stream to 11 m for
+  an order-8 trunk, × `--river-depth-scale`) and by the modelled channel width. It
+  is cut in full only within `--river-bank-tolerance` of the water level and tapers
+  to nothing at twice that, so terrain that will never hold water — a bank, a cliff
+  face the buffer lapped onto — is left alone rather than notched.
+
+Neither carve is surveyed bathymetry; both exist to give the renderer enough depth
+to read opaque. (If your engine compresses height, e.g. 1:5, size them so they still
+clear your opaque threshold after compression: 20 m → 4 units at 1:5.)
+
+**Shoreline snap.** An NVE outline and a Kartverket LiDAR block are independent
+products, so the polygon boundary lands *near* — not on — the flat plane the flight
+recorded for that lake, and it is then rasterised centre-in-polygon on top of that.
+The leftover ring, one or two texels wide, IS the lake's own water surface and would
+be classified as dry land: it keeps its flown height while the lake beside it is
+carved to the authored level, so it renders as a raised rim tracing the true
+shoreline just outside the water. `--lake-snap-px` (default 2) lets a lake claim
+those samples back — only samples within a couple of texels whose height is within
+0.35 m of that lake's own flown surface, so real bank stops the growth immediately.
+On the export that showed it, Kroktjønna went from 855 such samples rendered as land
+to 50, and its mask grew 9.6% to match the real shoreline.
+
+**Islands** — holes in a lake polygon — are rasterised **as lake**, so the water
+surface runs underneath them continuously, but their DTM height is left alone and
+they act as shore for the depth ramp. `depth = max(0, level − terrain)` then hides
+the surface again wherever the island stands above the water. Without this, the
+half-texel misalignment between a hole boundary and the sample lattice leaves a
+one-texel dry moat around every island. `--keep-lake-holes` restores the old
+behaviour.
 
 ### Design decisions worth knowing
 
@@ -211,9 +277,18 @@ units at 1:5.)
 - **Flow direction from geometry.** ELVIS polylines are digitised downstream, so a
   segment's bearing comes from its vertex order — no dependence on attribute names.
 - **River width & depth are modelled.** ELVIS has no width or discharge, so channel
-  width (pixels seeded) and nominal depth are heuristics keyed on Strahler order
+  width (pixels seeded) and carve depth are heuristics keyed on Strahler order
   (`manifest.water.width_model`, scaled by `--river-width-scale`). A river's
-  rendered depth is a modeled constant; its surface _trend_ follows real terrain.
+  rendered depth is a modeled constant; its surface _is_ the real terrain.
+- **Depth is carved, never raised.** Both water types put the surface on the ground
+  and cut the bed beneath it. Raising a surface above the terrain instead — which
+  is how river depth used to be produced — guarantees a water column at the price of
+  water standing proud of the landscape, which is exactly what it looks like.
+- **A water surface is a level, not a copy of the ground.** Lakes get one level per
+  lake; rivers get one level per channel cross-section, from the centreline. Any
+  rule that gives each _sample_ its own surface height paints water onto terrain —
+  the same artefact whether the surface floats above the ground or sits on it, and
+  most visible where the ground is steepest.
 - **Priority is lake > river > land** at any overlap, at every level.
 - **Two different pyramids.** The `.water` mask uses a **categorical** downsample
   (highest-priority feature in the 3×3 neighbourhood wins, so thin rivers survive
@@ -288,7 +363,12 @@ flip/placement logic applies.
 - `hoyde` is a reference level and the DTM is a single-day capture, so a lake's
   waterline won't trace the DTM contour to the centimetre — expect a thin shore
   ring that may read slightly wet or dry. `max(0, …)` handles it; it's data, not a
-  bug.
+  bug. Measured over a Lierne block, `hoyde` sits above the LiDAR shoreline on
+  about 11% of shore samples, by up to 0.92 m. That is **deliberately not
+  corrected**: the alternative — pulling `hoyde` down to the DTM — is metres wrong
+  on any regulated lake, where the flight caught the reservoir drawn down. A
+  sub-metre shore ring is the cheaper error, and the first texel of the shore ramp
+  feathers it.
 
 ---
 
@@ -300,8 +380,10 @@ flip/placement logic applies.
 - `kvterrain/water.py` — water engine: fetch NVE rivers/lakes, read lake `hoyde`,
   rasterise onto the height grid, categorical winner-take-all mask pyramid, pack
   `.water` tiles. Pulls in rasterio/shapely; imported lazily.
-- `kvterrain/bathymetry.py` — carves each lake bed a flat depth below its (known
-  `hoyde`, or estimated) surface, with a shore bevel.
+- `kvterrain/bathymetry.py` — resolves lake levels (published `hoyde`, else the
+  LiDAR interior capped by a perimeter scan) and carves both beds: lakes deepening
+  inward on a straight shore ramp, rivers as a trench under the channel that stops
+  at the waterline.
 - `kvterrain/watersurface.py` — computes the unified per-pixel water surface
   (lakes = `hoyde`, rivers = DTM-estimated, monotone-descending, lake-tied),
   the water-only surface pyramid, and packs the `.wsurf` tiles.
@@ -325,13 +407,23 @@ flip/placement logic applies.
   candidate lists in `kvterrain/water.py`.
 - **Modelled river width & depth** are heuristics, not surveyed values. Tune
   `--river-width-scale` / the `width_by_order` table; width only affects how many
-  pixels a river seeds.
+  pixels a river seeds (and, now, how wide the channel trench feathers).
+- **Lake depth follows distance from shore**, not lake size: at the default 1:1
+  slope every lake deeper than four texels from its bank is at `--lake-max-depth`.
+  If you want small lakes shallower, lower that; `--lake-min-depth` is only the
+  floor for bodies too small to ramp at all.
 - **River confluences** are not cross-segment reconciled: each channel segment is
   internally monotone and lake junctions are pinned, but two tributaries meeting
   can differ slightly in surface until a full segment graph is added.
-- **Coarse rivers.** A ~5 m channel in a coarse (~16 m) cell has its bed averaged
-  with its banks, so `surface − coarse_terrain` can shrink and distant thin rivers
-  may render faint even though the surface field keeps the cell marked as water.
+- **Coarse rivers fade.** A ~5 m channel in a coarse cell has its bed averaged with
+  its banks, so `surface − coarse_terrain` shrinks and distant thin rivers render
+  faint even though the surface field keeps the cell marked as water. Carving the
+  channel instead of raising its surface made this start one level earlier: over a
+  Lierne block, river samples still holding >0.25 m of depth went 100% / 74% / 35%
+  (L0/L1/L2) under the old raise and 100% / 40% / 8% under the trench. `--river-depth-scale`
+  is the knob if distant rivers matter more than close-up ones; the structural fix
+  would be to re-apply the channel carve to each pyramid level, which is not done
+  because it widens the trench to a whole coarse cell and pops as you approach.
 - `hovedelv` is slightly generalised; where it deviates from `elvenett` you can get
   a faint double line. `--no-main-rivers` avoids it at the cost of the size signal.
 - The sandbox these files were built in cannot reach `hoydedata.no` or

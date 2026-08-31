@@ -13,13 +13,25 @@ the depth is re-derived from whatever terrain is current.
 
 Lakes get their authoritative NVE `hoyde` (see water.WaterGrid.lake_surface_moh).
 Rivers have NO elevation in Elvenett (2D polylines), so their surface is derived
-here from the leaf DTM directly beneath each channel pixel:
+here from the leaf DTM under each channel's CENTRELINE:
 
-    surface(x) = height_leaf(x) + raise_for_order(order(x))
+    surface(x) = ground under the nearest centreline sample   # see channel_level
 
-i.e. every river pixel's surface tracks its OWN bed, plus a nominal raise chosen by
-that pixel's Strahler order. A river pixel adjacent to a lake is then pinned to that
-lake's surface, so the two agree exactly at the inlet/outlet.
+i.e. a river's water surface is level across its channel and descends along it,
+sitting on the ground rather than above it, and the water column comes from the
+trench `bathymetry.carve_river_beds` cuts beneath. A river pixel adjacent to a lake
+is RAISED to that lake's surface where the lake stands higher, so the two agree at
+a flooded inlet/outlet — but never lowered to it, which used to clip the last
+texels of every channel to zero depth and leave a dry gap between each river and
+the lake it runs into.
+
+Up to 0.5.0 this added a raise by Strahler order instead — `bed + 1.5..11 m` — and
+carved nothing. That guaranteed a water column, but it built it upward: the water
+sat proud of the terrain everywhere, which read as a hose of water lying over the
+landscape. The depth model is now the same one lakes use — a surface on the ground,
+a bed carved below it — so a river cannot stand above its banks however deep it is
+asked to be, and because the surface is a level rather than a copy of each sample's
+ground, it cannot be painted up the cliffs a channel runs past either.
 
 This is deliberately per-pixel and deliberately NOT a fitted profile. A previous
 revision rasterised each centreline, fitted a monotone-descending profile to the
@@ -45,49 +57,24 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
+from . import bathymetry as kvbathy
 from . import core
 from . import water as kvwater
 
 TYPE_RIVER = kvwater.TYPE_RIVER   # 1
 TYPE_LAKE = kvwater.TYPE_LAKE     # 2
 
-# How far the river surface sits above its (already-incised) bed, in metres, by
-# Strahler order. Rivers are NOT carved — the DTM already contains the channel and
-# ravine — so this raise is the ONLY thing that gives a river visible depth
-# (depth = surface - terrain), and it must clear the renderer's opaque threshold.
-#
-# Sizing rationale (mirrors the lake carve, which uses ~20 m real so it survives a
-# 1:5 vertical compression -> ~4 units and reads opaque): a 1-3 m raise was far
-# below that threshold, so rivers rendered essentially transparent — the symptom
-# that motivated this table. The raise ramps with stream order so big rivers,
-# which sit in deep incised channels, fill those channels and read solidly opaque,
-# while small streams (shallow/no channel) get just a few metres and don't balloon
-# a wide sheet of water over flat ground. depth_for_order clamps any order beyond
-# the table ends, so orders past 8 also get the order-8 value. The whole table is
-# multiplied by `depth_scale` (UI "River surface raise ×" / CLI --river-depth-scale)
-# for per-renderer tuning without editing code.
-#
-# HALVED in 0.5.0. The previous table topped out at 22 m for an order-8 trunk,
-# which overshot: a 22 m column is wider than most real Norwegian channels are
-# deep, so big rivers read as bulging sheets rather than as water sitting in a
-# ravine. Every entry is exactly half its former value. If you need the old look
-# back, --river-depth-scale 2.0 reproduces it precisely.
-DEFAULT_DEPTH_BY_ORDER = {
-    1: 1.5, 2: 2.25, 3: 3.0, 4: 4.0, 5: 5.5, 6: 7.0, 7: 9.0, 8: 11.0,
-}
+# NOTE: `DEFAULT_DEPTH_BY_ORDER` and `depth_for_order` lived here and now live in
+# `bathymetry` as `DEFAULT_RIVER_DEPTH_BY_ORDER` / `depth_for_order`. The numbers
+# are the same; they no longer describe how far a river's surface is RAISED above
+# its bed, they describe how deep the bed is CARVED below its surface. The table
+# belongs beside the carve that applies it, and leaving a copy of it here would
+# invite the two to drift.
 
 
 # --------------------------------------------------------------------------- #
 # Small numerical helpers                                                      #
 # --------------------------------------------------------------------------- #
-
-def depth_for_order(order: int, table: dict, scale: float = 1.0) -> float:
-    if not table:
-        return 0.5 * scale
-    keys = sorted(table)
-    o = min(max(int(order), keys[0]), keys[-1])
-    return float(table[o]) * float(scale)
-
 
 # NOTE (0.5.0): `_pava_nondecreasing` / `isotonic_decreasing` lived here and are
 # now DELETED. They were the last remnants of the removed centreline approach
@@ -160,66 +147,159 @@ def _bresenham_path(rc):
 # River surface                                                                #
 # --------------------------------------------------------------------------- #
 
+def channel_level(plan: core.GridPlan, feats: kvwater.WaterFeatures,
+                  is_river: np.ndarray, ground: np.ndarray,
+                  half_width_m: np.ndarray,
+                  bank_tolerance_m: float = kvbathy.DEFAULT_BANK_TOLERANCE_M
+                  ) -> np.ndarray:
+    """
+    The water LEVEL across each channel: the ground under the channel's own
+    CENTRELINE, spread sideways to the samples that centreline seeded.
+
+    A water surface is level across its channel and descends along it. Giving every
+    sample its own ground instead — which is what this used to do — paints water
+    onto whatever the rasterised buffer happens to cover, so wherever a channel
+    runs past the foot of a cliff, the samples that lapped onto the rock carried
+    water up it: a thin film climbing the cliff. Over a Lierne block that was 16.5%
+    of all river samples standing above their own channel's level, a median of
+    2.4 m up the bank and as much as 12.3 m of it.
+
+    WHY THE CENTRELINE AND NOT A LOCAL MINIMUM. A minimum over each channel's own
+    width is the obvious fix and it was measured first. It removes the film, but it
+    also takes the minimum ALONG the channel, and a channel is supposed to descend:
+    on any reach falling faster than the trench is deep, every sample sits above the
+    level taken from its downstream neighbour and the whole reach clips to dry. The
+    wet channel came apart into thousands of fragments (204 mask components ->
+    1487-3259 wet runs, with 12-17% of centreline samples dry). The centreline has
+    no such failure by construction: the level at a centreline sample is that
+    sample's own ground, so every centreline sample keeps the full trench depth and
+    the channel stays continuous however steep it gets. Only the sideways spread is
+    flattened, which is the direction the artefact actually lives in.
+
+    Two guards:
+      * a sample further from any centreline than its own channel is wide keeps its
+        own ground (a buffer with no centreline of its own — which happens where a
+        centreline lies under a lake — must not inherit a level from some unrelated
+        channel across the map), and
+      * the level is capped at `bank_tolerance_m` above the sample's own ground, so
+        water can never stand more than that above the terrain anywhere. Without it
+        a channel running along a CLIFF TOP would hang a wall of water off the edge
+        — the same artefact upside down.
+    """
+    from rasterio.features import rasterize
+    from scipy.ndimage import distance_transform_edt
+    from shapely.geometry import LineString
+
+    out = np.where(is_river, ground, np.nan).astype(np.float32)
+    if not is_river.any():
+        return out
+
+    shapes = [(LineString(s.xy), 1)
+              for s in list(feats.rivers) + list(feats.main_rivers)
+              if s.xy.shape[0] >= 2]
+    if not shapes:
+        return out
+    centre = np.zeros(is_river.shape, dtype=np.uint8)
+    rasterize(shapes, out=centre, transform=kvwater.sample_grid_transform(plan, 0),
+              all_touched=True)
+    # Only centrelines that landed on RIVER samples count. A lake-through-line's
+    # ground is the pool's flat surface, and letting that be the level for a
+    # channel climbing away from the lake would drain the channel; the lake tie-in
+    # below is what joins those two, and it only ever raises.
+    src = (centre > 0) & is_river & np.isfinite(ground)
+    if not src.any():
+        return out
+
+    dist, ind = distance_transform_edt(
+        ~src, sampling=(plan.spacing_m, plan.spacing_m),
+        return_distances=True, return_indices=True)
+    lvl = ground[ind[0], ind[1]].astype(np.float32)
+
+    far = dist > (np.asarray(half_width_m, dtype=np.float32) + plan.spacing_m)
+    lvl = np.where(far, ground, lvl)
+    lvl = np.minimum(lvl, ground.astype(np.float32) + float(bank_tolerance_m))
+
+    out = np.where(is_river & np.isfinite(ground), lvl, np.nan).astype(np.float32)
+    return out
+
+
 def river_surface_moh(
     plan: core.GridPlan,
     feats: kvwater.WaterFeatures,
     wg: kvwater.WaterGrid,
-    height_leaf: np.ndarray,
+    height_uncarved: np.ndarray,
     *,
-    depth_by_order: Optional[dict] = None,
-    depth_scale: float = 1.0,
     lake_surface: Optional[np.ndarray] = None,
+    width_by_order: Optional[dict] = None,
+    width_scale: float = 1.0,
+    bank_tolerance_m: float = kvbathy.DEFAULT_BANK_TOLERANCE_M,
 ) -> np.ndarray:
     """
     Per-pixel river water-surface elevation (m.o.h.), float32, NaN off-river.
 
-    Each river pixel's surface is simply its OWN leaf-DTM bed height plus a small nominal
-    depth chosen by that pixel's stream order (wg.weight):
+    Each river pixel's surface is its CHANNEL's level — the leaf-DTM ground under that
+    channel's centreline, spread flat across the buffer that centreline seeded, read from the
+    bed as it stood BEFORE `bathymetry.carve_river_beds` cut the trench:
 
-        surface(x) = height_leaf(x) + depth_for_order(order(x))
+        surface(x) = channel_level(x)        # see channel_level
 
-    The runtime derives depth as (surface - terrain) against the SAME leaf DTM, so this yields
-    a UNIFORM ~depth_for_order water column along every channel. It cannot spike, because the
-    surface tracks the local bed by construction (surface - terrain == bump, everywhere).
+    The runtime derives depth as (surface - terrain) against the CARVED terrain it ships with,
+    so the water column is the full trench depth along the channel, tapers off as the ground
+    rises away from it, and reaches zero on the bank — the waterline lands where the ground
+    crosses the level, at the resolution of the height data rather than at the resolution of
+    the rasterised buffer.
 
-    This replaces the earlier centreline approach (rasterise each Elvenett polyline, fit a
-    monotone-descending isotonic profile to the sampled bed, then widen to the buffer). That
-    fit deviated from the local bed: wherever the straight Bresenham line between sparse
-    vertices cut across a ridge/bank, the sampled bed was non-monotone, PAVA pooled the surface
-    metres ABOVE the bed, and the widen smeared that inflated value onto lower neighbours. The
-    runtime then read depth = surface - terrain >> 0 there — the river "spikes". Only rivers
-    synthesise their surface (lakes use authoritative NVE hoyde), so only rivers spiked. Tying
-    the surface to each pixel's own bed removes the failure mode entirely, at every LOD (the
-    coarse min-over-water surface minus the averaged terrain is still <= bump, never a spike).
+    THREE RULES HAVE BEEN TRIED HERE, and the shape of the failures is the argument for this
+    one. 0.5.0 rasterised each Elvenett polyline, fitted a monotone-descending isotonic
+    profile (PAVA) to the sampled bed and widened it to the buffer; wherever the chord between
+    sparse vertices cut across a ridge the fit pooled the surface metres ABOVE the bed and the
+    widen smeared it onto lower neighbours — rivers spiked. 0.5.0's replacement gave every
+    sample its own bed plus a raise by stream order, which could not spike but stood the whole
+    river on top of the landscape — the water-hose. Dropping the raise and carving instead
+    fixed the floating but kept the underlying mistake: a surface derived per SAMPLE follows
+    the terrain, so water climbed every cliff the buffer lapped onto.
 
-    `height_leaf` is the LEAF (finest) DTM (SY,SX). `lake_surface` (from
-    WaterGrid.lake_surface_moh), when given, pins river pixels adjacent to a lake to the lake
-    surface so the two agree at the inlet/outlet. `feats` is no longer needed (kept for a
-    stable signature); per-pixel stream order comes from the rasterised wg.weight.
+    A water surface is a LEVEL. It is flat across its channel and descends along it, and that
+    is a property of the channel, not of the sample. Deriving it from the centreline is what
+    makes it one, and it is why neither of the two failure modes can return: the level cannot
+    spike (it is measured ground, never fitted) and cannot float (it is capped at
+    `bank_tolerance_m` above any sample's own ground).
+
+    `height_uncarved` is the LEAF (finest) DTM (SY,SX), void-repaired but not yet river-carved.
+    `feats` supplies the centrelines. `lake_surface` (from WaterGrid.lake_surface_moh), when
+    given, RAISES river pixels adjacent to a lake to the lake's surface — never lowers them —
+    so the two agree at a flooded inlet/outlet without leaving a dry seam at every other one.
     """
-    depth_by_order = depth_by_order or DEFAULT_DEPTH_BY_ORDER
     SX, SY = kvwater._level_samples(plan, 0)
-    if height_leaf.shape != (SY, SX):
-        raise ValueError(f"height_leaf {height_leaf.shape} != grid {(SY, SX)}")
+    if height_uncarved.shape != (SY, SX):
+        raise ValueError(f"height_uncarved {height_uncarved.shape} != grid {(SY, SX)}")
 
     is_river = wg.type == TYPE_RIVER
     out = np.full((SY, SX), np.nan, dtype=np.float32)
     if not is_river.any():
         return out
 
-    # Per-pixel nominal depth from the per-pixel stream order (wg.weight; the rasteriser stores
-    # the order clamped to 1..255). Fill by unique order so depth_for_order runs a handful of
-    # times rather than per pixel; the table lookup itself clamps orders beyond the table ends.
-    orders = wg.weight.astype(np.int32)
-    bump = np.zeros((SY, SX), dtype=np.float32)
-    for o in np.unique(orders[is_river]):
-        bump[is_river & (orders == o)] = depth_for_order(int(o), depth_by_order, depth_scale)
+    # surface = the level across this sample's own channel. A NaN (nodata) bed stays NaN ->
+    # that pixel reads no water. The half-width is the SAME one the carve shapes its trench
+    # with, so the level is flattened over exactly the width that gets carved.
+    half_w = kvbathy.channel_half_width_m(
+        wg.weight, is_river, plan.spacing_m, width_by_order, width_scale)
+    out = channel_level(plan, feats, is_river, height_uncarved, half_w,
+                        bank_tolerance_m=bank_tolerance_m)
 
-    # surface = own bed + own bump. A NaN (nodata) bed stays NaN -> that pixel reads no water.
-    out[is_river] = height_leaf[is_river].astype(np.float32) + bump[is_river]
-
-    # Lake tie-in: a river pixel adjacent to a lake is pinned to that lake's surface, so the
-    # river and lake meet exactly at the inlet/outlet (overrides bed+bump on those pixels).
+    # Lake tie-in: a river pixel adjacent to a lake is RAISED to that lake's surface where
+    # the lake stands higher, so the two meet exactly at a flooded inlet/outlet.
+    #
+    # The tie-in only ever lifts. Pinning outright — taking the lake's level whether it is
+    # above or below the channel — is what put a dry gap between every river and the lake it
+    # runs into. A lake sits BELOW the ground beside it at 81% of these pixels (measured over
+    # a Lierne block: 545 of 673), because a channel arrives over a bank; forcing the water
+    # surface down to the pool's level there drops it below the carved bed, `depth =
+    # max(0, surface - terrain)` clips to zero, and the last texel or two of river renders as
+    # dry ground. That was 7.4% of all junction pixels. Taking the max instead leaves those
+    # pixels at their own ground level — the channel keeps its full carved depth right up to
+    # the shoreline — and still floods the ones the lake genuinely covers. Zero dry junction
+    # pixels, same measurement.
     if lake_surface is not None:
         from scipy.ndimage import binary_dilation
         is_lake = wg.type == TYPE_LAKE
@@ -229,7 +309,10 @@ def river_surface_moh(
             nearest_lake_surf = lake_surface[linds[0], linds[1]]
             touch = is_river & binary_dilation(is_lake, iterations=1)
             good = touch & np.isfinite(nearest_lake_surf)
-            out[good] = nearest_lake_surf[good].astype(np.float32)
+            # fmax, not maximum: a nodata bed leaves NaN in `out`, and at a lake
+            # edge the lake's own surface is a better answer than "no water".
+            out[good] = np.fmax(
+                out[good], nearest_lake_surf[good].astype(np.float32))
 
     return out
 
@@ -366,11 +449,15 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
         "runtime": "surface = (code==65535) ? NO_WATER : height_min_m + code/65534*(height_max_m-height_min_m); "
                    "depth = max(0, surface - terrain_height). Unifies lakes and rivers; "
                    "no rim scan, no rain-fill, valid across terrain edits.",
-        "lake_surface": "authoritative NVE hoyde (metres above sea level)",
-        "river_surface": "leaf-DTM bed + a raise by stream order (see river_raise_by_order_m), "
-                         "so depth = raise everywhere along a channel; pinned to the lake "
-                         "surface where a river meets a lake.",
-        "river_raise_by_order_m": {str(k): v for k, v in DEFAULT_DEPTH_BY_ORDER.items()},
+        "lake_surface": "authoritative NVE hoyde, or a level read off the LiDAR water "
+                        "surface inside the polygon (metres above sea level)",
+        "river_surface": "the UNCARVED leaf-DTM ground height under the channel — the river "
+                         "surface sits ON the terrain, and the water column comes from the "
+                         "trench carved beneath it (see river_carve_depth_by_order_m); "
+                         "raised to the lake surface, never lowered to it, where a river "
+                         "meets a lake.",
+        "river_carve_depth_by_order_m": {
+            str(k): v for k, v in kvbathy.DEFAULT_RIVER_DEPTH_BY_ORDER.items()},
         "tiles_written": tiles_written,
     }
     # Provenance for the NVE-derived water.

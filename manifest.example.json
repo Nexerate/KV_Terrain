@@ -6,16 +6,27 @@
   "row_order": "north_to_south",
   "byte_order": "little_endian",
   "bits": 16,
-  "origin_utm": [457000.0, 6785210.0],
+  "origin_utm": [
+    500000.0,
+    6785060.0
+  ],
   "leaf_spacing_m": 10.0,
   "tile_cells": 64,
   "tile_samples": 65,
-  "leaf_tiles": [32, 32],
+  "leaf_tiles": [
+    32,
+    32
+  ],
   "num_levels": 6,
-  "height_min_m": 240.11724853515625,
-  "height_max_m": 696.0228881835938,
+  "height_min_m": 240.03114318847656,
+  "height_max_m": 759.7891235351562,
   "nodata_fill_m": 0.0,
-  "region_bbox_utm": [457000.0, 6785210.0, 477480.0, 6805690.0],
+  "region_bbox_utm": [
+    500000.0,
+    6785060.0,
+    520480.0,
+    6805540.0
+  ],
   "atlas": {
     "format": "dense_v1",
     "height_file": "heights.atlas",
@@ -33,9 +44,9 @@
     "units": "metres_above_sea_level",
     "row_order": "north_to_south",
     "runtime": "surface = (code==65535) ? NO_WATER : height_min_m + code/65534*(height_max_m-height_min_m); depth = max(0, surface - terrain_height). Unifies lakes and rivers; no rim scan, no rain-fill, valid across terrain edits.",
-    "lake_surface": "authoritative NVE hoyde (metres above sea level)",
-    "river_surface": "leaf-DTM bed + a raise by stream order (see river_raise_by_order_m), so depth = raise everywhere along a channel; pinned to the lake surface where a river meets a lake.",
-    "river_raise_by_order_m": {
+    "lake_surface": "authoritative NVE hoyde, or a level read off the LiDAR water surface inside the polygon (metres above sea level)",
+    "river_surface": "the UNCARVED leaf-DTM ground height under the channel \u2014 the river surface sits ON the terrain, and the water column comes from the trench carved beneath it (see river_carve_depth_by_order_m); raised to the lake surface, never lowered to it, where a river meets a lake.",
+    "river_carve_depth_by_order_m": {
       "1": 1.5,
       "2": 2.25,
       "3": 3.0,
@@ -77,12 +88,48 @@
       "default_order_minor": 2
     },
     "lake_count": 1,
+    "lake_levels": {
+      "lakes_total": 1,
+      "levels_from_nve": 1,
+      "levels_estimated": 0,
+      "levels_capped_to_perimeter": 0,
+      "levels_cap_max_drop_m": 0.0,
+      "perimeter_cap_enabled": true,
+      "levels_unresolved": 0,
+      "estimation_enabled": true,
+      "margin_m": 0.0,
+      "band_pct": [
+        1.0,
+        25.0
+      ],
+      "method": "a published NVE hoyde is used verbatim. For a lake without one: the mean of the 1-25th percentile band of the void-repaired DTM inside the polygon (LiDAR returns the water surface), ignoring island pixels, minus margin_m, then capped at the 25th percentile of the land ring just outside the polygon so the estimate cannot stand above the terrain around it."
+    },
     "lake_bathymetry": {
       "enabled": true,
       "carve_depth_m": 20.0,
-      "bevel_px": 1,
-      "method": "flat_below_known_surface_with_shore_bevel",
-      "rationale": "LiDAR returns the lake SURFACE as terrain height, so without a carve the water plane and the terrain are coincident. Safe for the solver: bevelled, never breaks the rim, and the lake level is authored and pinned."
+      "shore_slope_m_per_m": 1.0,
+      "shore_ramp_m": 20.0,
+      "min_depth_m": 2.0,
+      "method": "linear_ramp_below_known_surface",
+      "ramp_anchor": "waterline",
+      "ramp_profile_m": "a STRAIGHT ramp: depth = carve_depth_m * clip((metres from the waterline) / shore_ramp_m, 0, 1), flat from there inward. shore_ramp_m = carve_depth_m / shore_slope_m_per_m, so at slope 1.0 a 20 m bed takes 20 m of shore. A body too small to reach carve_depth_m has its profile scaled up just far enough to reach min_depth_m at its deepest sample",
+      "shoreline_snap": {
+        "max_px": 2,
+        "tol_m": 0.35,
+        "samples_added": 1254,
+        "lakes_grown": 1
+      },
+      "islands": "lake polygon holes are rasterised as lake so the surface runs through them, but their DTM height is left alone and they act as shore for the ramp; depth = max(0, level - terrain) hides them",
+      "rationale": "LiDAR returns the lake SURFACE as terrain height, so without a carve the water plane and the terrain are coincident. Safe for the solver: ramped, never breaks the rim, and the lake level is authored and pinned."
+    },
+    "river_bathymetry": {
+      "enabled": true,
+      "depth_scale": 1.0,
+      "method": "trench_under_the_channel_scaled_by_modelled_width",
+      "bank_tolerance_m": 2.0,
+      "level": "the ground under the channel's own centreline, spread flat across the samples that centreline seeded \u2014 so the water surface is level ACROSS a channel and descends ALONG it",
+      "profile": "depth = depth_by_order(order) * smoothstep(distance from bank / modelled channel half-width), cut in full while the sample is within bank_tolerance_m of the water level and tapering to nothing at twice that; a one-sample channel takes full depth as a step",
+      "rationale": "the river water surface is the uncarved ground under the channel, so the trench is the entire water column. Carving down rather than raising the surface keeps a river in its landscape instead of on top of it; levelling across the channel and stopping the carve at the waterline keeps it off the cliffs beside it."
     }
   },
   "water_id": {
@@ -118,12 +165,13 @@
         "level_surface_m"
       ],
       "vertex_order": "upstream_to_downstream",
-      "note": "z is the sampled DTM BED \u2014 burn against this. level is the water SURFACE (bed + raise by stream order, or the lake's authored hoyde inside a lake span) \u2014 pin to this. Loaded once, resident; not streamed."
+      "note": "z is the sampled DTM BED \u2014 the floor of the carved channel \u2014 burn against this. level is the water SURFACE (the ground above that channel, or the lake's authored level inside a lake span) \u2014 pin to this. Loaded once, resident; not streamed."
     },
     "lakes": {
       "file": "lakes.json",
       "count": 1,
-      "with_authored_level": 1
+      "with_authored_level": 1,
+      "with_estimated_level": 0
     },
     "junctions": {
       "file": "junctions.json",
@@ -137,16 +185,32 @@
       "vertex_stride_m": 10.0,
       "junctions": 2,
       "lakes": 1,
+      "clip_source_features": 6,
+      "clip_features_clipped": 0,
+      "clip_features_dropped": 0,
+      "clip_segments_split": 0,
+      "clip_vertices_dropped": 0,
+      "clip_vertices_dropped_pct": 0.0,
+      "clip_note": "vertices outside the export region are dropped and a feature that re-enters is split; sampling them would clamp to an edge pixel and fabricate bed, level and lake id.",
+      "lake_spans_raw": 3,
+      "lake_spans_merged": 0,
+      "lake_spans_dropped_short": 0,
+      "lake_spans_kept": 3,
+      "lake_span_min_vertices": 3,
+      "lake_span_close_gap": 2,
       "descent_vertices_checked": 4470,
-      "descent_rising_vertices": 1928,
-      "descent_rising_pct": 43.131991051454136,
+      "descent_rising_vertices": 1896,
+      "descent_rising_pct": 42.41610738255034,
       "descent_segments_with_rise": 5,
-      "descent_worst_rise_m": 94.6221923828125,
+      "descent_worst_rise_m": 106.76959228515625,
+      "descent_rising_pct_in_lake_span": 0.351493848857645,
+      "descent_rising_pct_open_channel": 48.551653422199436,
       "descent_note": "reported only; not corrected. The runtime burn's running-minimum enforces descent.",
       "flowdir_segments_checked": 6,
       "flowdir_disagreements": 3,
       "flowdir_disagreement_pct": 50.0,
       "flowdir_lake_touching_segments": 3,
+      "flowdir_vatnlnr_segments": 3,
       "flowdir_disagreement_pct_lake_touching": 33.333333333333336,
       "flowdir_disagreement_pct_non_lake": 66.66666666666667,
       "flowdir_note": "source vertex order is authoritative; Z is an independent QA signal only and never flips a segment.",
@@ -159,29 +223,42 @@
   "generator": {
     "name": "kvterrain",
     "version": "0.5.0",
-    "generated_utc": "2026-07-23T09:30:31+00:00",
+    "generated_utc": "2026-08-14T15:13:48+00:00",
     "crs": "EPSG:25832",
     "transform": {
-      "origin_utm": [457000.0, 6785210.0],
+      "origin_utm": [
+        500000.0,
+        6785060.0
+      ],
       "leaf_spacing_m": 10.0,
-      "samples": [2049, 2049],
+      "samples": [
+        2049,
+        2049
+      ],
       "row_order": "north_to_south",
       "sampling": "corner_centered_pixel_is_a_point"
     },
     "parameters": {
       "source_kind": "DTM",
       "nodata_fill_m": 0.0,
-      "height_min_m": 240.11724853515625,
-      "height_max_m": 696.0228881835938,
+      "height_min_m": 240.03114318847656,
+      "height_max_m": 759.7891235351562,
       "tile_cells": 64,
       "water": {
         "river_width_scale": 1.0,
         "river_depth_scale": 1.0,
+        "river_bank_tolerance_m": 2.0,
         "river_vertex_stride_m": 10.0,
         "lake_carve_depth_m": 20.0,
-        "lake_bevel_px": 1,
+        "lake_shore_slope": 1.0,
+        "lake_shore_ramp_m": 20.0,
+        "lake_min_depth_m": 2.0,
+        "lake_snap_px": 2,
+        "lake_holes_filled": true,
         "ocean_level_m": 0.0,
-        "include_main_rivers": true
+        "include_main_rivers": true,
+        "estimate_lake_levels": true,
+        "lake_perimeter_cap": true
       }
     }
   }

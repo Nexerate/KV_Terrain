@@ -42,10 +42,16 @@ def cmd_build(a):
             "width_scale": a.river_width_scale,
             "lake_ramp_radius_m": a.lake_ramp_radius,
             "lake_max_depth_m": a.lake_max_depth,
+            "lake_min_depth_m": a.lake_min_depth,
+            "lake_shore_slope": a.lake_shore_slope,
+            "lake_snap_px": a.lake_snap_px,
             "river_depth_scale": a.river_depth_scale,
+            "river_bank_tolerance_m": a.river_bank_tolerance,
+            "fill_lake_holes": not a.keep_lake_holes,
             "ocean_level_m": a.ocean_level,
             "emit_geojson": a.emit_geojson,
             "estimate_lake_levels": a.estimate_lake_levels,
+            "lake_perimeter_cap": a.lake_perimeter_cap,
         }
         if a.river_vertex_stride is not None:
             water_opts["river_vertex_stride_m"] = a.river_vertex_stride
@@ -73,8 +79,11 @@ def cmd_build(a):
               f"packed in {atlas['surface_file']} (© NVE)")
         ll = wm.get("lake_levels")
         if ll:
-            print(f"    levels: {ll['levels_from_nve']} from NVE hoyde, "
-                  f"{ll['levels_estimated']} estimated from the LiDAR water surface, "
+            print(f"    levels: {ll['levels_from_nve']} from NVE hoyde (used "
+                  f"verbatim), {ll['levels_estimated']} estimated from the LiDAR "
+                  f"water surface ({ll.get('levels_capped_to_perimeter', 0)} of "
+                  f"those capped at the surrounding terrain, max drop "
+                  f"{ll.get('levels_cap_max_drop_m', 0.0):.2f} m), "
                   f"{ll['levels_unresolved']} unresolved (left uncarved)")
         wid = res.manifest.get("water_id", {})
         if wid:
@@ -92,10 +101,18 @@ def cmd_build(a):
             if wv.get("rivers_geojson"):
                 print(f"  + {wv['rivers_geojson']['file']} (debug sidecar)")
             _print_water_report(wv["validation"])
-        print(f"  + lake beds carved flat {a.lake_max_depth:.1f} m below the known "
-              f"NVE surface (bevel radius {a.lake_ramp_radius:.1f} m)")
-        print(f"  + river surface raised above the DTM channel by stream order "
-              f"(× {a.river_depth_scale:g})")
+        snap = wm.get("lake_bathymetry", {}).get("shoreline_snap")
+        if snap:
+            print(f"    shoreline snap: {snap['samples_added']} samples across "
+                  f"{snap['lakes_grown']} lakes were still the lake's own flat water "
+                  f"surface outside its polygon and are now part of it")
+        lb = wm.get("lake_bathymetry", {})
+        print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
+              f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
+              f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
+        print(f"  + river beds carved under the channel by stream order "
+              f"(× {a.river_depth_scale:g}); the surface is level across each "
+              f"channel and holds water within {a.river_bank_tolerance:.1f} m of it")
 
 
 def _print_water_report(rep: dict) -> None:
@@ -315,7 +332,9 @@ def cmd_validate_water(a):
     # this must not test `hoyde_moh`, or every estimated lake reads as unpinnable.
     no_level = [l["lake_id"] for l in lakes["lakes"]
                 if l.get("authored_level_m") is None]
-    est = [l for l in lakes["lakes"] if l.get("level_source") == "dtm_interior_median"]
+    from . import water as kvwater
+    est = [l for l in lakes["lakes"]
+           if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED]
     print(f"[lakes] {len(lake_ids)} lakes, {len(est)} with an estimated level, "
           f"{len(no_level)} without any level")
     if no_level:
@@ -419,12 +438,41 @@ def main(argv=None):
     b.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers")
     b.add_argument("--river-width-scale", type=float, default=1.0, dest="river_width_scale")
     b.add_argument("--river-depth-scale", type=float, default=1.0, dest="river_depth_scale",
-                   help="scales how far river surfaces sit above the DTM channel bed "
-                        "(per stream order); >1 = deeper/more opaque rivers")
-    b.add_argument("--lake-ramp-radius", type=float, default=10.0, dest="lake_ramp_radius",
-                   help="shore-to-max-depth distance in metres for synthetic lake beds")
+                   help="scales how deep the channel trench is carved under each "
+                        "river (per stream order); >1 = deeper/more opaque rivers. "
+                        "The water surface itself always sits on the terrain.")
+    b.add_argument("--river-bank-tolerance", type=float, default=2.0,
+                   dest="river_bank_tolerance",
+                   help="how far (metres) a channel sample may stand above its "
+                        "river's water level and still hold water. Bounds how far "
+                        "water can climb a bank or a cliff face the rasterised "
+                        "channel lapped onto; lower it if you still see water on "
+                        "rock, raise it if channels look too narrow.")
+    b.add_argument("--keep-lake-holes", action="store_true", dest="keep_lake_holes",
+                   help="do NOT fill lake polygon holes. By default islands are "
+                        "covered by the water surface (their own terrain hides it) "
+                        "because the polygon/raster misalignment otherwise leaves a "
+                        "one-texel dry moat around every island.")
+    b.add_argument("--lake-shore-slope", type=float, default=1.0, dest="lake_shore_slope",
+                   help="metres of lake depth gained per metre of shore, on a "
+                        "STRAIGHT ramp. At the default 1.0 a --lake-max-depth of 20 m "
+                        "is reached 20 m from shore (four texels at 5 m spacing). "
+                        "Lower = gentler sides over a longer ramp.")
+    b.add_argument("--lake-ramp-radius", type=float, default=0.0, dest="lake_ramp_radius",
+                   help="set the ramp length in metres directly, overriding "
+                        "--lake-shore-slope. 0 (default) derives it from the slope.")
     b.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
-                   help="maximum synthetic lake depth in metres")
+                   help="maximum synthetic lake depth in metres, reached only by "
+                        "lakes big enough to ramp that far")
+    b.add_argument("--lake-min-depth", type=float, default=2.0, dest="lake_min_depth",
+                   help="depth every lake reaches at its deepest sample, however "
+                        "small it is, so ponds don't render as dry ground")
+    b.add_argument("--lake-snap-px", type=int, default=2, dest="lake_snap_px",
+                   help="how many texels outside its polygon a lake may claim samples "
+                        "that are still its own flat water surface in the DTM. The NVE "
+                        "outline and the LiDAR block do not align to the pixel, and the "
+                        "leftover ring renders as a raised rim tracing the true "
+                        "shoreline. 0 disables.")
     b.add_argument("--ocean-level", type=float, default=0.0, dest="ocean_level",
                    help="sea level in metres above sea level for the Ocean class. "
                         "Kartverket heights are m.o.h., so 0 is real sea level; the "
@@ -441,6 +489,12 @@ def main(argv=None):
                         "by reading the LiDAR water surface inside the polygon "
                         "(default: on). With --no-estimate-lake-levels those lakes "
                         "are left uncarved and dry rather than guessed at.")
+    b.add_argument("--lake-perimeter-cap", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_perimeter_cap",
+                   help="cap an ESTIMATED lake level at the height of the land ring "
+                        "just outside the polygon, so a lake NVE gives no 'hoyde' "
+                        "for cannot end up standing above the terrain around it "
+                        "(default: on). A published hoyde is never capped.")
     b.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
                    help="also write rivers.geojson (debug sidecar for QGIS; "
                         "rivers.bin is the runtime format)")

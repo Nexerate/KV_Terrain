@@ -67,24 +67,55 @@ with st.sidebar:
                                   disabled=not want_water,
                                   help="Scales modelled channel widths → how many "
                                        "pixels each river seeds.")
-    river_depth_scale = st.slider("River surface raise ×", 0.25, 4.0, 1.0, 0.25,
+    river_depth_scale = st.slider("River carve depth ×", 0.25, 4.0, 1.0, 0.25,
                                   disabled=not want_water,
-                                  help="Scales how far each river's surface sits above "
-                                       "the DTM channel bed (by stream order). Rivers "
-                                       "aren't carved, so this is what gives them visible "
-                                       "depth/opacity — bigger fills the incised channel "
-                                       "and reads more solid. Sized like the lake carve so "
-                                       "it survives the renderer's height compression.")
-    lake_ramp_radius = st.slider("Lake shore bevel (m)", 0.5, 40.0, 10.0, 0.5,
-                                 disabled=not want_water,
-                                 help="Width of the shore bevel where the lake bed "
-                                      "ramps from the waterline down to full depth.")
+                                  help="Scales the trench carved UNDER each river (by "
+                                       "stream order). A river's water surface always "
+                                       "sits on the terrain, so this trench is the whole "
+                                       "water column — bigger reads more solid. Sized "
+                                       "like the lake carve so it survives the renderer's "
+                                       "height compression.")
+    river_bank_tolerance = st.slider("River bank tolerance (m)", 0.5, 8.0, 2.0, 0.5,
+                                     disabled=not want_water,
+                                     help="How far a channel sample may stand above its "
+                                          "river's water level and still hold water. The "
+                                          "water surface is level across a channel, so "
+                                          "this is what stops a thin film of water "
+                                          "climbing a cliff the rasterised channel ran "
+                                          "past. Lower = water stays in the channel; "
+                                          "higher = wider, more forgiving channels.")
+    lake_shore_slope = st.slider("Lake shore slope (m depth / m shore)",
+                                 0.1, 2.0, 1.0, 0.1, disabled=not want_water,
+                                 help="The lake bed descends on a STRAIGHT ramp at this "
+                                      "slope until it reaches the carve depth. At 1.0 a "
+                                      "20 m carve is reached 20 m from shore — four "
+                                      "texels at 5 m spacing. Lower = gentler sides.")
     lake_max_depth = st.slider("Lake carve depth (m, real)", 1.0, 40.0, 20.0, 1.0,
                                disabled=not want_water,
-                               help="Real metres the flat lake bed sits below the known "
-                                    "NVE surface. Must exceed the renderer's opaque "
+                               help="Deepest the lake bed goes below the authored "
+                                    "surface, reached only by lakes big enough to ramp "
+                                    "that far. Must exceed the renderer's opaque "
                                     "threshold AFTER any height compression (e.g. 20 m "
                                     "real → 4 units at 1:5).")
+    lake_min_depth = st.slider("Lake minimum depth (m)", 0.0, 10.0, 2.0, 0.5,
+                               disabled=not want_water,
+                               help="Every lake reaches at least this depth at its "
+                                    "deepest sample, however small it is, so ponds "
+                                    "don't render as dry ground.")
+    lake_snap_px = st.slider("Shoreline snap (texels)", 0, 4, 2, 1,
+                             disabled=not want_water,
+                             help="How far outside its polygon a lake may claim samples "
+                                  "that are still its own flat water surface in the DTM. "
+                                  "The NVE outline and the LiDAR block don't align to the "
+                                  "pixel, and the leftover ring renders as a raised rim "
+                                  "tracing the true shoreline just outside the water.")
+    fill_lake_holes = st.toggle("Cover lake islands with the water surface", value=True,
+                                disabled=not want_water,
+                                help="Islands (polygon holes) keep their own terrain, "
+                                     "which hides the water again — but the surface runs "
+                                     "underneath continuously, which removes the one-texel "
+                                     "dry moat the polygon/raster misalignment leaves "
+                                     "around every island.")
     estimate_lake_levels = st.toggle("Estimate missing lake levels", value=True,
                                      disabled=not want_water,
                                      help="NVE leaves 'hoyde' blank on a lot of small "
@@ -93,6 +124,14 @@ with st.sidebar:
                                           "level is read from the DTM inside the polygon "
                                           "and used as if it were authored. Off: those "
                                           "lakes stay flat, dry ground.")
+    lake_perimeter_cap = st.toggle("Cap estimated levels at the surrounding terrain",
+                                   value=True, disabled=not want_water,
+                                   help="For lakes NVE gives no 'hoyde' for, cap the "
+                                        "estimated level at the height of the land ring "
+                                        "just outside the polygon, so the lake cannot "
+                                        "end up standing above the terrain around it. A "
+                                        "published hoyde is always used exactly as "
+                                        "published and is never capped.")
     ocean_level = st.number_input("Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0,
                                   disabled=not want_water,
                                   help="Kartverket heights are metres above sea level, "
@@ -126,25 +165,15 @@ with st.sidebar:
 # --------------------------------------------------------------------------- #
 # Map with draw control                                                        #
 # --------------------------------------------------------------------------- #
-col_map, col_info = st.columns([3, 2])
-
-with col_map:
-    m = folium.Map(location=[61.3, 8.3], zoom_start=6, tiles="OpenStreetMap")
-    Draw(
-        export=False,
-        draw_options={"rectangle": True, "polygon": False, "polyline": False,
-                      "circle": False, "marker": False, "circlemarker": False},
-        edit_options={"edit": False},
-    ).add_to(m)
-    map_state = st_folium(m, height=540, width=None,
-                          returned_objects=["last_active_drawing", "all_drawings"])
-
-
 def _bbox_from_drawing(state):
-    draw = (state or {}).get("last_active_drawing") or None
-    if not draw:
-        drawings = (state or {}).get("all_drawings") or []
-        draw = drawings[-1] if drawings else None
+    """(lon_min, lat_min, lon_max, lat_max) of the current rectangle, or None.
+
+    `all_drawings` is preferred over `last_active_drawing` because it is what
+    reflects an EDIT: after the rectangle is dragged or resized, the active
+    drawing can still be the shape as it was first drawn.
+    """
+    drawings = (state or {}).get("all_drawings") or []
+    draw = drawings[-1] if drawings else ((state or {}).get("last_active_drawing"))
     if not draw:
         return None
     coords = draw["geometry"]["coordinates"][0]
@@ -153,20 +182,86 @@ def _bbox_from_drawing(state):
     return min(lons), min(lats), max(lons), max(lats)
 
 
+def _plan_outline_latlon(plan):
+    """The plan's padded UTM extent as a lat/lon ring, for drawing on the map."""
+    from pyproj import Transformer
+
+    tr = Transformer.from_crs(f"EPSG:{plan.epsg}", "EPSG:4326", always_xy=True)
+    x0, y0, x1, y1 = plan.bbox_utm
+    ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    return [(lat, lon) for lon, lat in (tr.transform(x, y) for x, y in ring)]
+
+
+# THE MAP SPEC MUST NOT CHANGE BETWEEN RERUNS. streamlit-folium keys the component
+# on a hash of the map's generated leaflet JS (`generate_js_hash`), so anything that
+# alters that JS — adding a layer, or feeding the user's current centre/zoom back
+# into folium.Map — remounts the iframe, and a remount wipes the rectangle the user
+# drew and resets the view. The padded-extent outline is therefore passed through
+# `feature_group_to_add`, which st_folium sends as a SEPARATE argument and applies
+# to the live map, and the view is left to the component to keep.
+st.session_state.setdefault("bbox", None)
+
+# Plan for the rectangle as it stood at the end of the last run: this is what the
+# padded-extent overlay is drawn from.
+plan = None
+if st.session_state.bbox:
+    plan = core.plan_grid(*st.session_state.bbox, spacing_m=spacing_m,
+                          tile_cells=tile_cells, epsg=epsg)
+
+col_map, col_info = st.columns([3, 2])
+
+with col_map:
+    m = folium.Map(location=[61.3, 8.3], zoom_start=6, tiles="OpenStreetMap")
+    Draw(
+        export=False,
+        draw_options={"rectangle": True, "polygon": False, "polyline": False,
+                      "circle": False, "marker": False, "circlemarker": False},
+        # Editing is ON so a rectangle can be dragged and resized after it is
+        # drawn: pick the toolbar's edit (pencil) tool, drag the rectangle or its
+        # corner handles, then Save. That is the point of showing the padded
+        # extent — you can watch it overshoot a border or the data coverage and
+        # slide the rectangle until it doesn't, instead of deleting and redrawing
+        # by eye.
+        edit_options={"edit": True, "remove": True},
+    ).add_to(m)
+
+    overlay = None
+    if plan is not None:
+        overlay = folium.FeatureGroup(name="export_extent")
+        overlay.add_child(folium.Polygon(
+            _plan_outline_latlon(plan),
+            color="#e8590c", weight=2, dash_array="6,5", fill=True,
+            fill_opacity=0.06, fill_color="#e8590c",
+            tooltip=(f"Exported area: {plan.width_m:,.0f} × {plan.height_m:,.0f} m "
+                     f"({plan.leaf_tiles_x}×{plan.leaf_tiles_y} tiles) — padded out "
+                     f"from your rectangle to whole power-of-two tiles")))
+
+    map_state = st_folium(
+        m, key="draw_map", height=540, width=None,
+        feature_group_to_add=overlay,
+        returned_objects=["last_active_drawing", "all_drawings"])
+
+# A new or edited rectangle needs one rerun for the overlay to be rebuilt around
+# it. This cannot loop: the map spec is identical across the rerun, so the
+# component keeps its state and returns the same rectangle.
 bbox = _bbox_from_drawing(map_state)
+if bbox != st.session_state.bbox:
+    st.session_state.bbox = bbox
+    st.rerun()
 
 # --------------------------------------------------------------------------- #
 # Plan preview                                                                 #
 # --------------------------------------------------------------------------- #
 with col_info:
     st.subheader("Plan")
-    if bbox is None:
-        st.info("Draw a rectangle on the map (top-left toolbar) to begin.")
-        plan = None
+    if plan is None:
+        st.info("Draw a rectangle on the map (top-left toolbar) to begin. "
+                "The dashed orange outline that appears is the area actually "
+                "exported — bigger than what you draw, because the grid is padded "
+                "out to whole power-of-two tiles. Use the toolbar's edit tool to "
+                "drag or resize the rectangle until that outline sits where you "
+                "want it.")
     else:
-        lon_min, lat_min, lon_max, lat_max = bbox
-        plan = core.plan_grid(lon_min, lat_min, lon_max, lat_max,
-                              spacing_m=spacing_m, tile_cells=tile_cells, epsg=epsg)
         fetch_chunks = (
             -(-plan.samples_x // max_fetch_px) * -(-plan.samples_y // max_fetch_px))
         approx_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 2 / 1e6
@@ -182,7 +277,23 @@ with col_info:
 - **Fetch requests:** {fetch_chunks} (≤ {max_fetch_px}px each)
 """)
         ox, oy = plan.origin_x, plan.origin_y
-        st.caption(f"SW origin (UTM): {ox:,.1f}, {oy:,.1f}")
+        x1, y1 = ox + plan.width_m, oy + plan.height_m
+        st.caption(f"Exported extent (UTM {plan.epsg}): "
+                   f"{ox:,.0f}, {oy:,.0f} → {x1:,.0f}, {y1:,.0f}")
+
+        # How much of the exported area is padding, and on which sides — the thing
+        # you need in order to nudge the rectangle off a border.
+        from pyproj import Transformer as _T
+        _tr = _T.from_crs("EPSG:4326", f"EPSG:{plan.epsg}", always_xy=True)
+        _dx = [c[0] for c in (_tr.transform(st.session_state.bbox[0], st.session_state.bbox[1]),
+                              _tr.transform(st.session_state.bbox[2], st.session_state.bbox[3]))]
+        _dy = [c[1] for c in (_tr.transform(st.session_state.bbox[0], st.session_state.bbox[1]),
+                              _tr.transform(st.session_state.bbox[2], st.session_state.bbox[3]))]
+        pad_w = plan.width_m - (max(_dx) - min(_dx))
+        pad_h = plan.height_m - (max(_dy) - min(_dy))
+        st.caption(f"Padding beyond your rectangle: +{max(pad_w, 0):,.0f} m E–W, "
+                   f"+{max(pad_h, 0):,.0f} m N–S (the padding is added north and "
+                   f"east of the SW origin, which snaps down to the sample grid)")
         if want_water:
             wsurf_mb = plan.total_tiles() * (tile_cells + 1) ** 2 * 2 / 1e6
             st.caption(f"+ water surface: surface.atlas "
@@ -192,10 +303,12 @@ with col_info:
                        f"height atlas")
             st.caption("+ river polylines: rivers.bin + lakes.json + junctions.json "
                        "(vectors, loaded once at runtime — not streamed)")
-            st.caption(f"+ lake beds carved flat {lake_max_depth:.0f} m below the "
-                       f"known NVE surface ({lake_ramp_radius:.0f} m shore bevel)")
-            st.caption(f"+ river surfaces raised above the DTM channel by stream "
-                       f"order (× {river_depth_scale:g})")
+            st.caption(f"+ lake beds carved on a straight ramp to {lake_max_depth:.0f} m "
+                       f"over {lake_max_depth/max(lake_shore_slope,1e-6):.0f} m of shore "
+                       f"(min {lake_min_depth:.1f} m)")
+            st.caption(f"+ river beds carved under the channel by stream order "
+                       f"(× {river_depth_scale:g}); the surface is level across each "
+                       f"channel (bank tolerance {river_bank_tolerance:.1f} m)")
         if plan.fetch_pixels() > 60_000 * 60_000:
             st.warning("Very large area — consider the bulk DTM1 download instead.")
 
@@ -243,11 +356,16 @@ if go and plan is not None:
                 "include_main_rivers": main_rivers,
                 "width_scale": river_width_scale,
                 "river_depth_scale": river_depth_scale,
-                "lake_ramp_radius_m": lake_ramp_radius,
+                "river_bank_tolerance_m": river_bank_tolerance,
+                "fill_lake_holes": fill_lake_holes,
+                "lake_shore_slope": lake_shore_slope,
                 "lake_max_depth_m": lake_max_depth,
+                "lake_min_depth_m": lake_min_depth,
+                "lake_snap_px": lake_snap_px,
                 "ocean_level_m": ocean_level,
                 "emit_geojson": emit_geojson,
                 "estimate_lake_levels": estimate_lake_levels,
+                "lake_perimeter_cap": lake_perimeter_cap,
             }
             if river_vertex_stride > 0:
                 water_opts["river_vertex_stride_m"] = river_vertex_stride
@@ -308,11 +426,13 @@ if go and plan is not None:
             prev_cols[1].image(np.clip(rgb, 0, 1), caption="Water (blue=lake, cyan=river)",
                                clamp=True, width=260)
             st.caption(f"Water surface: {lake_count} lake(s); per-pixel surface packed "
-                       f"in surface.atlas (u16 m.o.h.). Lakes use NVE hoyde; rivers "
-                       f"sit on the DTM channel raised by stream order "
-                       f"(× {river_depth_scale:g}). {kvwater.WATER_ATTRIBUTION}.")
-            st.caption(f"Lake beds carved flat {lake_max_depth:.0f} m below the known "
-                       f"NVE surface ({lake_ramp_radius:.0f} m shore bevel).")
+                       f"in surface.atlas (u16 m.o.h.). Lakes use their authored level; "
+                       f"river surfaces sit on the terrain, with the channel carved "
+                       f"beneath by stream order (× {river_depth_scale:g}). "
+                       f"{kvwater.WATER_ATTRIBUTION}.")
+            st.caption(f"Lake beds carved on a straight ramp to {lake_max_depth:.0f} m "
+                       f"over {lake_max_depth/max(lake_shore_slope,1e-6):.0f} m of shore "
+                       f"(min {lake_min_depth:.1f} m).")
 
             wv = res.manifest.get("water_vector")
             if wv:
