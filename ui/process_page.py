@@ -344,13 +344,30 @@ def _reports(state: dict) -> None:
         st.json(man)
 
 
-def _history() -> None:
-    hist = st.session_state.get("process_history") or []
-    if len(hist) < 2:
-        return
+def _history(ds: ds_mod.Dataset) -> None:
+    """Every process run ever made on THIS dataset, from its runs.jsonl.
+
+    Persisted rather than session-only because the question it answers — "was the
+    shoreline better at slope 0.8 or 1.0?" — arrives days later, and because
+    `process` overwrites the export in place, so the export itself only ever
+    remembers the last run."""
+    from kvterrain import runlog
     import pandas as pd
-    with st.expander(f"Run history ({len(hist)}) — what changed between runs"):
-        st.dataframe(pd.DataFrame(hist), width="stretch", hide_index=True)
+
+    hist = runlog.read(ds.root)
+    if not hist:
+        return
+    with st.expander(f"Run history for {ds.name} ({len(hist)} runs) — settings "
+                     f"paired with what they produced", expanded=len(hist) > 1):
+        df = pd.DataFrame(hist)
+        cols = [c for c in runlog.DISPLAY_COLUMNS if c in df.columns]
+        show = df[cols].iloc[::-1]          # newest first
+        show = show.assign(
+            when_utc=show["when_utc"].astype(str).str.replace("T", " ").str[:16])
+        st.dataframe(show, width="stretch", hide_index=True)
+        st.caption(f"Logged to `{runlog.path_for(ds.root)}` — one JSON object per "
+                   f"line, beside the dataset so it outlives any single export. "
+                   f"Full records (including per-stage timings) are in that file.")
 
 
 # --------------------------------------------------------------------------- #
@@ -458,28 +475,17 @@ def render() -> None:
             "weight": wg.weight if wg is not None else None,
             "raw": np.asarray(ds.heights()),
         }
-        wo = opts["water_opts"] or {}
-        st.session_state.setdefault("process_history", []).append({
-            "run": len(st.session_state.get("process_history", [])) + 1,
-            "dataset": ds.name,
-            "tile_cells": opts["tile_cells"],
-            "water": bool(opts["include_water"]),
-            "lake_depth_m": wo.get("lake_max_depth_m"),
-            "lake_slope": wo.get("lake_shore_slope"),
-            "lake_min_m": wo.get("lake_min_depth_m"),
-            "snap_px": wo.get("lake_snap_px"),
-            "river_width": wo.get("width_scale"),
-            "river_depth": wo.get("river_depth_scale"),
-            "bank_tol_m": wo.get("river_bank_tolerance_m"),
-            "seconds": round(elapsed, 1),
-        })
+        # The run itself is logged by `process_dataset`, beside the dataset, so
+        # the CLI records history too rather than only the UI.
 
     # ---- results ----------------------------------------------------------- #
+    _history(ds)
+
     state = st.session_state.get("process_result")
     if not state or state["dataset"] != ds.root:
         if state:
-            st.info("The result below is from a different dataset — run this one to "
-                    "replace it.")
+            st.info("The result panels below are from a different dataset — run "
+                    "this one to replace them.")
         W.attribution_footer()
         return
 
@@ -502,7 +508,6 @@ def render() -> None:
 
     st.subheader("Reports")
     _reports(state)
-    _history()
 
     # ---- download ----------------------------------------------------------- #
     st.divider()

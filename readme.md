@@ -28,12 +28,13 @@ a slider, so the tool comes apart in the middle:
 ```
         FETCH                      dataset                    PROCESS
   ┌──────────────────┐      ┌───────────────────┐      ┌──────────────────┐
-  │ rectangle        │      │ heights.npy       │      │ rasterise water  │
+  │ rectangle        │      │ heights.hgt.gz    │      │ rasterise water  │
   │ spacing, DTM/DOM │─────▶│ (raw float32,     │─────▶│ repair, snap     │
   │ Kartverket       │      │  as fetched)      │      │ resolve levels   │
   │ NVE elvenett     │      │ water/*.geojson.gz│      │ carve, pyramid   │
   │ NVE innsjø       │      │ dataset.json      │      │ pack the atlases │
-  └──────────────────┘      │ preview.png       │      └──────────────────┘
+  │                  │      │ preview.png       │      │                  │
+  └──────────────────┘      │ runs.jsonl        │      └──────────────────┘
      network, minutes       └───────────────────┘        no network, re-run
                              data/datasets/<name>/         as often as you like
 ```
@@ -47,9 +48,10 @@ The **exported format is unchanged** — same `manifest.json`, same atlases, sam
 `rivers.bin`, byte for byte. The dataset format in between is internal and ours
 to change; see [The dataset format](#the-dataset-format-intermediate).
 
-The Streamlit app is one process with two pages, **Fetch** and **Process**, and
-the CLI has the matching `fetch` / `process` subcommands. `build` still does both
-in one pass for when you genuinely only want the region once.
+The Streamlit app is one process with three pages — **Fetch**, **Process**, and
+**Exports** (open a finished export and check it holds together) — and the CLI
+has the matching `fetch` / `process` / `validate-*` subcommands. `build` still
+does both stages in one pass for when you genuinely only want the region once.
 
 ---
 
@@ -130,7 +132,8 @@ commit. Leave the name blank and the dataset is named after the municipality
 under its centre (Kartverket's `kommuneinfo` API). **Demo mode** builds from a
 synthetic surface and a synthetic river + lake with no network.
 
-**Process.** Pick a dataset, tune the pipeline, run it. The picker shows each
+**Process.** Pick a dataset, tune the pipeline, run it. Its run history for that
+dataset is right there, so you can see what you tried last time and what it did. The picker shows each
 fetch's stored thumbnail, area, resolution, height range, coverage and size, and
 what NVE vectors came with it. After a run you get, as pictures:
 
@@ -144,8 +147,11 @@ what NVE vectors came with it. After a run you get, as pictures:
 
 …plus a **detail inspector** at native resolution (the overview panels are
 strided down, and a shoreline judged from a 900-px thumbnail of a 4097-px lattice
-is not judged), the lake-level breakdown, the advisory network validation, stage
-timings, and a run history of what you changed between runs.
+is not judged), the lake-level breakdown, the advisory network validation, and
+stage timings.
+
+**Exports.** Open a finished export and check it — see
+[Reading an export back](#reading-an-export-back).
 
 ### Headless
 
@@ -153,6 +159,10 @@ timings, and a run history of what you changed between runs.
 # stage one: fetch a region into data/datasets/<name>/
 python -m kvterrain.cli fetch --bbox 8.30 61.28 8.55 61.40 \
     --spacing 5 --source DTM
+
+# tighter on disk, still lossless (the default); --compress mm halves it again
+python -m kvterrain.cli fetch --bbox 8.30 61.28 8.55 61.40 \
+    --spacing 5 --compress lossless
 
 # what have I already got?
 python -m kvterrain.cli datasets
@@ -179,7 +189,8 @@ including the `tile_cells` values its lattice can be re-tiled to.
 
 **Which flags go where.** A flag belongs to `fetch` if changing it means new
 bytes have to come off the network — the rectangle, `--spacing`, `--epsg`,
-`--source`, `--max-px`, and `--no-main-rivers` (a second NVE query). Everything
+`--source`, `--max-px`, `--compress`, and `--no-main-rivers` (a second NVE
+query). Everything
 else is a `process` flag and is free to re-run: `--river-width-scale`,
 `--river-depth-scale`, `--river-bank-tolerance`, `--lake-max-depth` (default
 **20**, real metres, how far below the water surface a lake bed is carved),
@@ -203,14 +214,35 @@ Ours to change; not what your engine consumes.
 ```
 data/datasets/<slug>/
   dataset.json                 lattice, provenance, stats, what's inside
-  heights.npy                  float32 (samples_y, samples_x), north-up, NaN = nodata
+  heights.hgt.gz               float32 (samples_y, samples_x), north-up, NaN = nodata
+  runs.jsonl                   every process run made on this dataset
   preview.png                  stored thumbnail for the picker
   water/rivers.geojson.gz      NVE elvenett  — RAW GeoJSON features
   water/main_rivers.geojson.gz NVE hovedelv  — RAW GeoJSON features
   water/lakes.geojson.gz       NVE Innsjødatabase — RAW GeoJSON features
 ```
 
-Four decisions worth knowing:
+### How the lattice is stored
+
+Plain gzip on float32 elevations only saves ~17%: the high bytes of neighbouring
+samples are nearly identical, but the mantissa bytes are noise, and interleaving
+them hands zlib no runs to find. A **byte shuffle** fixes that — group byte-plane
+0 of every sample, then plane 1, and so on, so each plane is internally smooth.
+
+Measured on real Kartverket DTM10:
+
+| mode | size | error | notes |
+| --- | --- | --- | --- |
+| `none` | 100% | — | plain `.npy`, memory-mappable |
+| `lossless` **(default)** | **60%** | none | byte shuffle + gzip |
+| `mm` | 47% | ≤ 0.6 mm | rounds first — 200× finer than the DTM's own accuracy |
+| `cm` | 32% | ≤ 5 mm | rounds first — at the DTM's own accuracy |
+
+Decompression is ~60 ms on a full 4097² lattice, which is nothing next to a
+process run. `--compress` on `fetch` picks the mode; `dataset.json` records it
+and the layout, so a reader never has to guess.
+
+### Five decisions worth knowing:
 
 * **Heights are stored uncooked** — exactly what `core.assemble_region` returned,
   before void repair, before the shoreline snap, before any carve. All of those
@@ -232,19 +264,57 @@ Four decisions worth knowing:
 * **Nothing here is a Unity product.** The final format is produced only by
   `kvterrain.process` and is unchanged.
 
-`process` records which dataset an export came from under `generator.dataset` in
-the exported `manifest.json` — an additive provenance block; every pre-existing
-key is untouched.
+* **`runs.jsonl` remembers what you tried.** `process` overwrites its output in
+  place, so the export only ever carries the LAST run's settings. The log lives
+  beside the dataset — one JSON object per line, appended — and pairs each run's
+  settings with what they produced: unresolved lakes, vertical range, flow-direction
+  disagreement, per-stage timings. Settings alone tell you what you did; the
+  pairing tells you whether it worked. Written by `process_dataset`, so the CLI
+  logs too, not just the UI.
 
-### Validate against ground truth
+`process` records which dataset an export came from under `generator.dataset` in
+the exported `manifest.json` — an additive provenance block (name, slug, fetch
+date; no absolute path, which would bake one machine's layout into a file that
+ships onward). Every pre-existing key is untouched.
+
+---
+
+## Reading an export back
+
+The **Exports** page — and `kvterrain/exports.py` behind it — opens a finished
+export from the outside: what is in it, which fetch and which settings produced
+it, what it looks like, and whether it holds together.
+
+The previews are assembled tile by tile through `core.atlas_tile_offset`, the
+same arithmetic a consumer has to implement. That makes the page a test as much
+as a viewer: a picture that comes out right is evidence the header and the bytes
+agree, which a preview drawn from the in-memory arrays could never be.
+
+Three checks, shared with the CLI so the two cannot drift:
+
+| check | CLI | needs network |
+| --- | --- | --- |
+| dense atlases: exact size, sampled offsets land on full tiles | `validate-atlas` | no |
+| `rivers.bin` walks cleanly, links resolve, junctions name real lakes, `water_id` is dense | `validate-water` | no |
+| packed heights vs Kartverket's point API | `validate` | **yes** |
+
+One caveat on the last one, and it is a big one on a water-heavy export: the
+packed heights are the **carved** bed, while the point API returns untouched DTM.
+A sample landing in a lake disagrees by roughly the carve depth, and that is the
+pipeline working. Each sample is therefore tagged with the water class it hit,
+and the **dry-only median** is the number that actually measures alignment — on
+a 10 m Grong export that is 0.26 m, while the all-sample median is dragged to
+0.50 m by one 20.00 m lake sample that is exactly the 20 m carve.
 
 ```bash
-python -m kvterrain.cli validate --out ./out --n 12
+python -m kvterrain.cli validate-atlas  --out ./exports/lierne
+python -m kvterrain.cli validate-water  --out ./exports/lierne
+python -m kvterrain.cli validate        --out ./exports/lierne --n 12
 ```
 
-Spot-checks packed leaf heights against Kartverket's open point API
-(`ws.geonorge.no/hoydedata/v1/punkt`). If the call errors, check the live Swagger
-page and adjust `ost`/`nord`/`koordsys` in `cli.py`.
+The ground-truth check calls `ws.geonorge.no/hoydedata/v1/punkt`. If it errors,
+check the live Swagger page and adjust `ost`/`nord`/`koordsys` in
+`exports.check_against_point_api`.
 
 ---
 
@@ -517,6 +587,12 @@ flip/placement logic applies.
   rasterise, repair, snap, resolve levels, river surface, carve, pyramid, water
   id, polylines, pack — with staged progress and per-stage timings. This is
   `core.run_export`'s old second half, unmoved and unchanged in behaviour.
+- `kvterrain/exports.py` — the only module that opens a finished export from the
+  OUTSIDE: reassembles a pyramid level from an atlas by computed byte offset,
+  unpacks it, and holds the three checks (`check_atlas`, `check_water`,
+  `check_against_point_api`) that both the CLI and the Exports page run.
+- `kvterrain/runlog.py` — the per-dataset `runs.jsonl`: each process run's
+  settings paired with the outcomes they produced.
 
 **The engine**
 
@@ -541,13 +617,17 @@ flip/placement logic applies.
 - `kvterrain/preview.py` — hillshade, hypsometric, depth, signed-delta and water
   ramps; the dataset thumbnail. Presentation only, numpy + Pillow, no matplotlib.
 - `kvterrain/cli.py` — `fetch`, `datasets`, `process`, `build`, `validate`,
-  `validate-atlas`, `validate-water`, `describe-services`.
+  `validate-atlas`, `validate-water`, `describe-services`. The three `validate*`
+  commands print reports that `exports.py` produces, so the CLI and the UI check
+  exactly the same things.
 
 **The UI**
 
 - `app.py` — the router: one Streamlit process, two pages.
 - `ui/fetch_page.py` — draw a rectangle, fetch it, store it.
 - `ui/process_page.py` — pick a dataset, tune, run, look at what it did.
+- `ui/exports_page.py` — open a finished export, preview it from its own bytes,
+  run the checks.
 - `ui/widgets.py` — shared formatting, dataset cards, map overlays, image panels.
 
 ## Known caveats

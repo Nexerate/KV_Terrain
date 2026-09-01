@@ -17,7 +17,6 @@ import json
 import os
 import sys
 
-import numpy as np
 
 from . import core
 
@@ -83,8 +82,14 @@ def _water_opts(a) -> dict:
 # fetch — stage one                                                            #
 # --------------------------------------------------------------------------- #
 
+def _ds_mod():
+    """`dataset` imported for argparse's choices, without paying for it at import."""
+    from . import dataset
+    return dataset
+
+
 def cmd_fetch(a):
-    from . import fetch as kvfetch
+    from . import fetch as kvfetch, dataset as ds_mod
 
     lon_min, lat_min, lon_max, lat_max = a.bbox
     plan = core.plan_grid(lon_min, lat_min, lon_max, lat_max,
@@ -101,6 +106,7 @@ def cmd_fetch(a):
         max_fetch_px=a.max_px,
         include_water=a.water,
         include_main_rivers=not a.no_main_rivers,
+        compression=a.compress or ds_mod.DEFAULT_COMPRESSION,
         demo=a.demo,
         progress=_bar("fetch"),
         request_bbox_lonlat=(lon_min, lat_min, lon_max, lat_max),
@@ -118,8 +124,12 @@ def cmd_fetch(a):
               f"segments, {s['lakes']:,} lake polygons")
     else:
         print("  water: not fetched")
+    hb = d.manifest["heights"]
     print(f"  {s['bytes_total'] / 1e6:,.1f} MB on disk  "
           f"({res.seconds_heights:.0f}s heights + {res.seconds_water:.0f}s water)")
+    print(f"  lattice stored '{s['compression']}': {hb['bytes'] / 1e6:,.1f} MB "
+          f"vs {hb['uncompressed_bytes'] / 1e6:,.1f} MB raw "
+          f"({100 * hb['bytes'] / max(hb['uncompressed_bytes'], 1):.0f}%)")
     print(f"  tile_cells at fetch {s['tile_cells']}; this lattice can also be "
           f"processed as {s['valid_tile_cells']}")
     print(f"\nnext:  kvterrain process --dataset {s['slug']} --out out/")
@@ -302,121 +312,49 @@ def _print_water_report(rep: dict) -> None:
 
 
 def cmd_validate(a):
-    import requests
+    """Spot-check packed leaf heights against Kartverket's open point API. The
+    checking is in `exports.check_against_point_api`; this only prints it."""
+    from . import exports as kvexports
 
-    with open(os.path.join(a.out, "manifest.json")) as f:
-        man = json.load(f)
-    epsg = int(man["crs"].split(":")[1])
-    hmin, hmax = man["height_min_m"], man["height_max_m"]
-    tc = man["tile_cells"]
-    ts = man["tile_samples"]
-    spacing = man["leaf_spacing_m"]
-    ox, oy = man["origin_utm"]
-    lx, ly = man["leaf_tiles"]
-    nlev = man["num_levels"]
-
-    # Everything about a leaf tile is implied by the header — its atlas byte offset and its
-    # world-space SW corner — so we sample leaf tiles directly from the grid, no per-tile
-    # metadata needed. Read the packed u16 grid out of the height atlas by computed offset.
-    tile_bytes = core.atlas_tile_bytes(ts)
-    atlas_path = os.path.join(a.out, man["atlas"]["height_file"])
-    rng = np.random.default_rng(0)
-    coords = [(x, y) for y in range(ly) for x in range(lx)]      # level-0 grid
-    pick = rng.choice(len(coords), min(a.n, len(coords)), replace=False)
-
-    sess = requests.Session()
-    errs = []
-    with open(atlas_path, "rb") as atlas_fh:
-        for idx in pick:
-            x, y = coords[int(idx)]
-            off = core.atlas_tile_offset(lx, ly, nlev, ts, 0, x, y)
-            atlas_fh.seek(off)
-            a16 = np.frombuffer(atlas_fh.read(tile_bytes), dtype="<u2").reshape(ts, ts)
-
-            i = int(rng.integers(0, tc + 1)); j = int(rng.integers(0, tc + 1))
-            packed = a16[tc - j, i]
-            h_packed = hmin + (packed / 65535.0) * (hmax - hmin)
-            # Tile SW corner in world CRS, then the sampled cell within it.
-            X = ox + (x * tc + i) * spacing
-            Y = oy + (y * tc + j) * spacing
-            try:
-                r = sess.get(core.POINT_API,
-                             params={"ost": X, "nord": Y, "koordsys": epsg},
-                             timeout=30)
-                data = r.json()
-                h_api = data.get("punkter", [{}])[0].get("z")
-            except Exception as ex:
-                print(f"  point API call failed ({ex}); check param names live.")
-                return
-            if h_api is None:
-                continue
-            errs.append(abs(h_api - h_packed))
-            print(f"  ({X:.0f},{Y:.0f})  packed {h_packed:7.2f}  api {h_api:7.2f}  "
-                  f"d={abs(h_api - h_packed):.2f} m")
-    if errs:
-        print(f"\nmedian |error| = {np.median(errs):.2f} m  "
-              f"(includes R16 quantisation ~{(hmax - hmin) / 65535:.3f} m)")
+    rep = kvexports.check_against_point_api(kvexports.load(a.out), n=a.n)
+    for s in rep["samples"]:
+        print(f"  ({s['x']:.0f},{s['y']:.0f})  packed {s['packed_m']:7.2f}  "
+              f"api {s['api_m']:7.2f}  d={s['abs_error_m']:.2f} m")
+    for err in rep["errors"]:
+        print(f"  {err}")
+    if rep["median_abs_error_m"] is not None:
+        print(f"\nmedian |error| = {rep['median_abs_error_m']:.2f} m  "
+              f"(includes R16 quantisation ~{rep['quantisation_m']:.3f} m)")
 
 
 def cmd_validate_atlas(a):
-    """Verify a dense atlas against the manifest header and (if present) the
-    per-tile files: exact file size, and byte-for-byte equality of a sample of
-    tiles extracted by computed offset. Implements the §8 export-side checks."""
-    with open(os.path.join(a.out, "manifest.json")) as f:
-        man = json.load(f)
+    """Verify each dense atlas against the manifest header: exact file size, and
+    that a sample of computed tile offsets each land on a full tileBytes block.
 
-    atlas = man.get("atlas")
-    if not atlas:
-        print("no 'atlas' block in manifest — not a kvterrain atlas export.")
-        sys.exit(1)
+    The checking lives in `exports.check_atlas` so the UI runs the same code —
+    this function only prints the report it hands back."""
+    from . import exports as kvexports
 
-    lx, ly = man["leaf_tiles"]
-    nlev = man["num_levels"]
-    ts = man["tile_samples"]
-    tile_bytes = core.atlas_tile_bytes(ts)
-    expect = core.atlas_total_bytes(lx, ly, nlev, ts)
+    exp = kvexports.load(a.out)
+    rep = kvexports.check_atlas(exp, samples_per_level=a.n)
 
-    targets = [("height", atlas.get("height_file"))]
-    if atlas.get("surface_file"):
-        targets.append(("surface", atlas["surface_file"]))
-
-    rng = np.random.default_rng(0)
-    ok = True
-    for kind, fname in targets:
-        path = os.path.join(a.out, fname)
-        if not os.path.exists(path):
-            print(f"[{kind}] MISSING atlas file {fname}")
-            ok = False
+    for entry in rep["atlases"]:
+        if entry.get("error"):
+            print(f"[{entry['kind']}] {entry['error']}")
             continue
-
-        actual = os.path.getsize(path)
-        size_ok = actual == expect
-        ok &= size_ok
-        print(f"[{kind}] {fname}: {actual} bytes, expected {expect} "
-              f"-> {'OK' if size_ok else 'MISMATCH (grid not dense!)'}")
-        if not size_ok:
+        print(f"[{entry['kind']}] {entry['file']}: {entry['bytes']} bytes, expected "
+              f"{rep['expected_bytes']} -> "
+              f"{'OK' if entry['size_ok'] else 'MISMATCH (grid not dense!)'}")
+        if not entry["size_ok"]:
             continue
+        for sr in entry["short_reads"]:
+            print(f"    L{sr['level']} {sr['x']},{sr['y']}: short read at offset "
+                  f"{sr['offset']}")
+        print(f"    sampled {entry['offsets_checked']} tile offsets, "
+              f"{'all full-length' if not entry['short_reads'] else 'SHORT READS ABOVE'}")
 
-        # Sample tiles across levels and confirm each computed offset yields a full
-        # tileBytes block inside the file (offsets land where the header implies).
-        checked = 0
-        with open(path, "rb") as fh:
-            for lvl in range(nlev):
-                tx, ty = core.tiles_at_level(lx, ly, lvl)
-                coords = [(x, y) for y in range(ty) for x in range(tx)]
-                for idx in rng.choice(len(coords), size=min(a.n, len(coords)),
-                                      replace=False):
-                    x, y = coords[int(idx)]
-                    off = core.atlas_tile_offset(lx, ly, nlev, ts, lvl, x, y)
-                    fh.seek(off)
-                    if len(fh.read(tile_bytes)) != tile_bytes:
-                        print(f"    L{lvl} {x},{y}: short read at offset {off}")
-                        ok = False
-                    checked += 1
-        print(f"    sampled {checked} tile offsets, all full-length")
-
-    print("RESULT:", "PASS" if ok else "FAIL")
-    sys.exit(0 if ok else 1)
+    print("RESULT:", "PASS" if rep["ok"] else "FAIL")
+    sys.exit(0 if rep["ok"] else 1)
 
 
 def cmd_validate_water(a):
@@ -427,118 +365,48 @@ def cmd_validate_water(a):
     the right size. Advisory checks (descent, flow direction) are replayed from
     the stored report rather than recomputed — the tool never corrects them, so
     the numbers only need surfacing.
+
+    As with the atlas check, the checking itself is in `exports.check_water`.
     """
-    import struct
+    from . import exports as kvexports
 
-    from . import rivernet
-
-    with open(os.path.join(a.out, "manifest.json")) as f:
-        man = json.load(f)
-
-    wv = man.get("water_vector")
-    if not wv:
-        print("no 'water_vector' block in manifest — build with --water.")
+    exp = kvexports.load(a.out)
+    rep = kvexports.check_water(exp)
+    if rep.get("skipped"):
+        print(f"no 'water_vector' block in manifest — {rep['skipped']}")
         sys.exit(1)
 
-    ok = True
+    r = rep["rivers"]
+    if r:
+        print(f"[rivers] {r['file']}: v{r['version']} EPSG:{r['epsg']} "
+              f"stride {r['stride_m']:g} m, {r['segments']} segments, "
+              f"{r['vertices']} vertices")
+        if not rep["errors"]:
+            print(f"    parsed cleanly; {r['vertices_walked']} vertices walked, "
+                  f"all downstream links resolve")
 
-    # ---- rivers.bin ------------------------------------------------------
-    path = os.path.join(a.out, wv["rivers"]["file"])
-    with open(path, "rb") as fh:
-        hdr = fh.read(48)
-        (magic, version, epsg, ox, oy, stride, nseg, nvert, _res) = struct.unpack(
-            "<8sIIddfIII", hdr)
-        if magic != rivernet.BIN_MAGIC:
-            print(f"[rivers] BAD MAGIC {magic!r}")
-            sys.exit(1)
-        print(f"[rivers] {wv['rivers']['file']}: v{version} EPSG:{epsg} "
-              f"stride {stride:g} m, {nseg} segments, {nvert} vertices")
-
-        seen_ids = set()
-        downstream_refs = []
-        total_v = 0
-        for _ in range(nseg):
-            (sid, strekn, vatn, order, down) = struct.unpack("<IqqHi", fh.read(26))
-            (nup,) = struct.unpack("<H", fh.read(2))
-            fh.read(4 * nup)
-            (ln,) = struct.unpack("<B", fh.read(1)); fh.read(ln)
-            (ln,) = struct.unpack("<B", fh.read(1)); fh.read(ln)
-            (nspan,) = struct.unpack("<H", fh.read(2))
-            fh.read(10 * nspan)
-            fh.read(16)
-            (nv,) = struct.unpack("<I", fh.read(4))
-            fh.read(16 * nv)
-            seen_ids.add(sid)
-            total_v += nv
-            if down >= 0:
-                downstream_refs.append((sid, down))
-        trailing = fh.read()
-
-    if trailing:
-        print(f"    {len(trailing)} trailing bytes after the last segment")
-        ok = False
-    if total_v != nvert:
-        print(f"    vertex count mismatch: header {nvert}, actual {total_v}")
-        ok = False
-    dangling = [(s, d) for s, d in downstream_refs if d not in seen_ids]
-    if dangling:
-        print(f"    {len(dangling)} downstream links point at missing segments")
-        ok = False
-    else:
-        print(f"    parsed cleanly; {len(downstream_refs)} downstream links all resolve")
-
-    # ---- lakes + junctions ----------------------------------------------
-    with open(os.path.join(a.out, wv["lakes"]["file"])) as f:
-        lakes = json.load(f)
-    lake_ids = {l["lake_id"] for l in lakes["lakes"]}
-    # The pin reads `authored_level_m`, which carries an estimated level too — so
-    # this must not test `hoyde_moh`, or every estimated lake reads as unpinnable.
-    no_level = [l["lake_id"] for l in lakes["lakes"]
-                if l.get("authored_level_m") is None]
-    from . import water as kvwater
-    est = [l for l in lakes["lakes"]
-           if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED]
-    print(f"[lakes] {len(lake_ids)} lakes, {len(est)} with an estimated level, "
-          f"{len(no_level)} without any level")
-    if no_level:
-        print("    NOTE: lakes without a level cannot be pinned AuthoredWins. They "
-              "are also left uncarved, so they stay flat ground rather than "
-              "becoming an empty bowl — rerun without --no-estimate-lake-levels "
-              "to fill them in.")
-
-    with open(os.path.join(a.out, wv["junctions"]["file"])) as f:
-        junc = json.load(f)
-    bad = [j for j in junc["junctions"] if j["lake_id"] not in lake_ids]
-    orphan_seg = [j for j in junc["junctions"] if j["segment_id"] not in seen_ids]
-    print(f"[junctions] {len(junc['junctions'])} total")
-    if bad:
-        print(f"    {len(bad)} reference a lake_id with no lake record")
-        ok = False
-    if orphan_seg:
-        print(f"    {len(orphan_seg)} reference a segment_id not in rivers.bin")
-        ok = False
-    if not bad and not orphan_seg:
-        print("    all lake and segment references resolve")
-
-    # ---- water_id atlas --------------------------------------------------
-    wid = man.get("water_id")
+    lk = rep["lakes"]
+    if lk:
+        print(f"[lakes] {lk['with_ids']} lakes, {lk['estimated_level']} with an "
+              f"estimated level, {lk['without_level']} without any level")
+    jn = rep["junctions"]
+    if jn:
+        print(f"[junctions] {jn['count']} junctions, "
+              f"{jn['naming_unknown_lake']} naming a lake not in lakes.json")
+    wid = rep.get("water_id")
     if wid:
-        lx, ly = man["leaf_tiles"]
-        ts = man["tile_samples"]
-        expect = core.atlas_total_bytes(lx, ly, man["num_levels"], ts)
-        wpath = os.path.join(a.out, wid["atlas_file"])
-        actual = os.path.getsize(wpath) if os.path.exists(wpath) else -1
-        good = actual == expect
-        ok &= good
-        print(f"[water_id] {wid['atlas_file']}: {actual} bytes, expected {expect} "
-              f"-> {'OK' if good else 'MISMATCH'}")
-        hpath = os.path.join(a.out, man["atlas"]["height_file"])
-        if good and os.path.getsize(hpath) == actual:
-            print("    same size as the height atlas — tile offsets are shared")
+        print(f"[water_id] {wid['bytes']} bytes, expected {wid['expected_bytes']} "
+              f"-> {'OK' if wid['ok'] else 'MISMATCH'}")
 
-    _print_water_report(wv["validation"])
-    print("\nRESULT:", "PASS" if ok else "FAIL")
-    sys.exit(0 if ok else 1)
+    for note in rep.get("notes", []):
+        print(f"    NOTE: {note}")
+    for err in rep["errors"]:
+        print(f"    ERROR: {err}")
+    if rep.get("validation"):
+        _print_water_report(rep["validation"])
+
+    print("\nRESULT:", "PASS" if rep["ok"] else "FAIL")
+    sys.exit(0 if rep["ok"] else 1)
 
 
 def cmd_describe_services(a):
@@ -700,6 +568,13 @@ def main(argv=None):
     f.add_argument("--no-main-rivers", action="store_true", dest="no_main_rivers",
                    help="skip the hovedelv layer, which is the second NVE query and "
                         "the only thing that upgrades trunk-river size class")
+    f.add_argument("--compress", default=None, dest="compress",
+                   choices=sorted(_ds_mod().COMPRESSION_MODES),
+                   help="how the height lattice is stored (default: lossless — a "
+                        "byte shuffle then gzip, ~60%% of raw, exact). 'none' keeps "
+                        "a plain .npy; 'mm'/'cm' round to that step first and save "
+                        "roughly half, which is still finer than Kartverket's own "
+                        "DTM accuracy but is LOSSY.")
     f.set_defaults(func=cmd_fetch)
 
     dl = sub.add_parser("datasets", help="list the datasets already fetched")

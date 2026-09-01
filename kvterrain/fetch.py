@@ -112,6 +112,7 @@ def run_fetch(
     max_fetch_px: int = core.DEFAULT_MAX_FETCH_PX,
     include_water: bool = True,
     include_main_rivers: bool = True,
+    compression: str = ds_mod.DEFAULT_COMPRESSION,
     demo: bool = False,
     session=None,
     progress: Optional[Progress] = None,
@@ -220,6 +221,7 @@ def run_fetch(
         rivers=rivers, main_rivers=main_rivers, lakes=lakes,
         include_water=include_water,
         include_main_rivers=include_main_rivers,
+        compression=compression,
         preview_png=preview_png,
         request={
             "bbox_lonlat": list(request_bbox_lonlat) if request_bbox_lonlat else None,

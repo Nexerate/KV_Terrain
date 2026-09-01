@@ -7,6 +7,7 @@ to say to each other except through a dataset on disk:
 
     Fetch    draw a rectangle, pull Kartverket heights + NVE water, store it
     Process  pick a stored dataset, tune the pipeline, build the Unity export
+    Exports  open a finished export, look at it, check it holds together
 
 Fetching costs minutes of network and never changes for a given region; the
 post-processing is what you actually iterate on. Keeping them in one process but
@@ -23,13 +24,15 @@ import streamlit as st
 st.set_page_config(page_title="kvterrain — Kartverket → Unity terrain",
                    page_icon="⛰️", layout="wide")
 
-from ui import fetch_page, process_page      # noqa: E402 — must follow set_page_config
+from ui import exports_page, fetch_page, process_page   # noqa: E402 — after set_page_config
 
 PAGES = [
     st.Page(fetch_page.render, title="Fetch", icon=":material/download:",
             url_path="fetch"),
     st.Page(process_page.render, title="Process", icon=":material/terrain:",
             url_path="process", default=True),
+    st.Page(exports_page.render, title="Exports", icon=":material/inventory_2:",
+            url_path="exports"),
 ]
 
 st.navigation(PAGES).run()

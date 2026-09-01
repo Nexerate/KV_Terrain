@@ -497,6 +497,7 @@ def process_dataset(
         stage(0.0, "parsing stored NVE vectors")
         features = ds.water_features()
 
+    started = time.time()
     res = run_process(
         plan, ds.heights(), out_dir,
         features=features,
@@ -509,11 +510,13 @@ def process_dataset(
     )
 
     # Record which dataset this came from, so an export can always be traced back
-    # to the fetch it was built from (and reproduced from it).
+    # to the fetch it was built from (and reproduced from it). Slug, not path:
+    # `kvterrain process --dataset <slug>` finds it again, while an absolute path
+    # would bake one machine's directory layout into a file that ships onward and
+    # would go stale the moment the dataset moved.
     res.manifest.setdefault("generator", {})["dataset"] = {
         "name": ds.name,
         "slug": ds.slug,
-        "path": ds.root,
         "created_utc": ds.created_utc,
         "format": ds.manifest.get("format"),
         "source": ds.source_kind,
@@ -521,4 +524,21 @@ def process_dataset(
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(res.manifest, f, indent=2)
+
+    # Log the run beside the DATASET, not the export: `process` overwrites the
+    # export in place, so the export only ever remembers the last run's settings.
+    # The question you actually have two runs later — "was the shoreline better at
+    # slope 0.8 or 1.0?" — needs the history, and it has to outlive the export.
+    from . import runlog
+    runlog.append(ds.root, runlog.summarise_run(
+        manifest=res.manifest,
+        tile_cells=plan.tile_cells,
+        include_water=include_water,
+        water_opts=water_opts,
+        nodata_fill_m=nodata_fill_m,
+        height_min=height_min, height_max=height_max,
+        out_dir=out_dir,
+        seconds=time.time() - started,
+        stage_seconds=res.stage_seconds,
+    ))
     return res

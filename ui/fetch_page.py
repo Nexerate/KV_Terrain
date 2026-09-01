@@ -89,6 +89,23 @@ def render() -> None:
                  "it exists so the raster burn upgrades trunk-river size class.")
 
         st.divider()
+        st.subheader("Storage")
+        modes = list(ds_mod.COMPRESSION_MODES)
+        compression = st.selectbox(
+            "Height lattice on disk", modes,
+            index=modes.index(ds_mod.DEFAULT_COMPRESSION),
+            format_func=lambda m: f"{m} — {ds_mod.COMPRESSION_MODES[m][1]}",
+            help="float32 elevations barely gzip (~17%) because the mantissa "
+                 "bytes are noise. Shuffling the bytes into planes first gets it "
+                 "to ~60% of raw, losslessly, and costs milliseconds to read "
+                 "back. The quantised modes round first and save roughly half — "
+                 "still finer than Kartverket's own DTM accuracy, but lossy.")
+        if ds_mod.COMPRESSION_MODES[compression][0] is not None:
+            st.caption("⚠️ Lossy. The stored lattice will not round-trip exactly. "
+                       "Fine for terrain you are going to carve anyway, but it is "
+                       "a one-way door for this dataset.")
+
+        st.divider()
         demo = st.toggle(
             "Demo mode (synthetic, no network)", value=False,
             help="Builds the dataset from a synthetic surface and a synthetic "
@@ -248,6 +265,7 @@ def render() -> None:
                 max_fetch_px=max_fetch_px,
                 include_water=want_water,
                 include_main_rivers=main_rivers,
+                compression=compression,
                 demo=demo,
                 progress=on_progress,
                 request_bbox_lonlat=st.session_state.fetch_bbox,
@@ -262,6 +280,14 @@ def render() -> None:
 
         bar.progress(1.0, text=f"done in {res.seconds_total:.0f}s")
         d = res.dataset
+        hb = d.manifest["heights"]
+        if hb.get("uncompressed_bytes"):
+            st.caption(
+                f"Lattice stored '{d.compression}': "
+                f"{W.fmt_bytes(hb['bytes'])} on disk vs "
+                f"{W.fmt_bytes(hb['uncompressed_bytes'])} raw "
+                f"({100 * hb['bytes'] / hb['uncompressed_bytes']:.0f}%)"
+                + ("" if hb.get("lossless") else " — LOSSY"))
         st.success(
             f"Stored **{d.name}** in `{d.root}` — "
             f"{res.seconds_heights:.0f}s of heights + {res.seconds_water:.0f}s of "
