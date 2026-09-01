@@ -277,6 +277,35 @@ the exported `manifest.json` — an additive provenance block (name, slug, fetch
 date; no absolute path, which would bake one machine's layout into a file that
 ships onward). Every pre-existing key is untouched.
 
+### Where the time goes
+
+`process` records per-stage timings on every run (see `runs.jsonl`), which is
+worth looking at before optimising anything. A 1 678 km² / 5 m Lierne export,
+87 131 river features:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| building the river polyline network | 1 075.4 s | **20.1 s** |
+| rasterising rivers & lakes | 36.6 s | 37.8 s |
+| everything else | 73.5 s | 81.8 s |
+| **total** | **1 185.5 s** | **139.7 s** |
+
+The river-network pass was 90.7% of the run. It was not an algorithmic problem —
+the pass is linear in features — but a single `np.asarray(water_surface,
+dtype=np.float64)` **inside** the per-feature loop. On an 8193² export that
+rebuilt the entire surface grid as float64 (537 MB), allocated it, converted it,
+read a few hundred values out of it and threw it away — once per feature, 87 131
+times. Selecting the vertices first and converting those is identical arithmetic
+on a few hundred elements instead of 67 million; every exported byte is
+unchanged.
+
+Two things worth taking from it. The cost scaled with *grid area × feature
+count*, so it stayed invisible on small test regions (Grong, 513×1025, was
+0.26 ms/feature; Lierne, 8193², was 12 ms/feature) — and per-stage timings are
+what made it visible at all. And a stage that runs for eighteen minutes behind a
+label that never changes is indistinguishable from a hang, which is why the
+longest loop now reports its own progress and every stage says which step it is.
+
 ---
 
 ## Reading an export back

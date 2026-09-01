@@ -30,7 +30,7 @@ def _bar(prefix: str):
     state = {"last": ""}
 
     def prog(frac: float, label: str) -> None:
-        line = f"\r  {prefix} {frac * 100:5.1f}%  {label:<52.52s}"
+        line = f"\r  {prefix} {frac * 100:5.1f}%  {label:<78.78s}"
         state["last"] = line
         print(line, end="", flush=True)
     return prog

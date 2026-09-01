@@ -78,6 +78,8 @@ class _Stages:
         self._t0 = None
         self._key = None
         active = [s for s in STAGES if s[0] not in skip]
+        self._order = [s[0] for s in active]
+        self._n = 0
         total = sum(s[2] for s in active) or 1.0
         self._bounds = {}
         acc = 0.0
@@ -89,8 +91,21 @@ class _Stages:
         self.end()
         lo, _, label = self._bounds.get(key, (0.0, 0.0, key))
         self._key, self._t0 = key, time.time()
+        self._n = self._order.index(key) + 1 if key in self._order else 0
         if self._progress:
-            self._progress(lo, label)
+            self._progress(lo, f"[{self._n}/{len(self._order)}] {label}")
+
+    def within(self, frac: float, note: str = "") -> None:
+        """Move the bar INSIDE the current stage. A stage that runs for minutes
+        with a frozen label is indistinguishable from a hang, which is exactly
+        how a slow river-network pass used to read."""
+        if not self._progress or self._key is None:
+            return
+        lo, hi, label = self._bounds.get(self._key, (0.0, 1.0, self._key))
+        text = f"[{self._n}/{len(self._order)}] {label}"
+        if note:
+            text += f" — {note}"
+        self._progress(lo + (hi - lo) * min(max(frac, 0.0), 1.0), text)
 
     def end(self) -> None:
         if self._key is not None:
@@ -326,7 +341,8 @@ def run_process(
         river_net = rivernet.build_river_network(
             plan, features, water_leaf, leaf_bed_uncarved,
             water_surface=water_surface,
-            vertex_stride_m=vertex_stride_m, depth_scale=depth_scale)
+            vertex_stride_m=vertex_stride_m, depth_scale=depth_scale,
+            progress=stages.within)
 
         water_params = {
             "river_width_scale": raster_opts.get("width_scale", 1.0),
