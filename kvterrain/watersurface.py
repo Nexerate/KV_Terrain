@@ -82,10 +82,10 @@ TYPE_LAKE = kvwater.TYPE_LAKE     # 2
 # whose widen step caused the river-spike failure described in
 # `river_surface_moh` below. Nothing called them.
 #
-# We do NOT reintroduce a profile fit. The tool must not smooth or correct river
-# Z — it reports non-monotonic descent as a warning and leaves the numbers alone;
-# the runtime's running-minimum during the burn is what enforces descent. See
-# `rivernet.validate_descent`.
+# We do NOT reintroduce a profile fit. Descent is enforced by a running MINIMUM
+# over densified profiles (`riverbed`, the downhill-only bed), which only ever
+# lowers and so cannot pool a level onto a bank the way the fit did. The level
+# computed here stays the measured ground; `riverbed` lowers it afterwards.
 #
 # The remaining helpers below (`_fill_nan_1d`, `_line_rc`, `_bresenham_path`) are
 # NOT dead: `rivernet` uses them to walk a centreline's pixel path and to repair
@@ -301,19 +301,40 @@ def river_surface_moh(
     # the shoreline — and still floods the ones the lake genuinely covers. Zero dry junction
     # pixels, same measurement.
     if lake_surface is not None:
-        from scipy.ndimage import binary_dilation
-        is_lake = wg.type == TYPE_LAKE
-        if is_lake.any():
-            _, linds = distance_transform_edt(
-                ~is_lake, return_distances=True, return_indices=True)
-            nearest_lake_surf = lake_surface[linds[0], linds[1]]
-            touch = is_river & binary_dilation(is_lake, iterations=1)
-            good = touch & np.isfinite(nearest_lake_surf)
-            # fmax, not maximum: a nodata bed leaves NaN in `out`, and at a lake
-            # edge the lake's own surface is a better answer than "no water".
-            out[good] = np.fmax(
-                out[good], nearest_lake_surf[good].astype(np.float32))
+        out = apply_lake_tie_in(out, lake_tie_in(wg, lake_surface))
 
+    return out
+
+
+def lake_tie_in(wg: kvwater.WaterGrid, lake_surface: np.ndarray):
+    """
+    Which river pixels touch a lake, and that lake's surface there: the inputs to
+    the raise-only tie-in described in `river_surface_moh`. Returned rather than
+    applied so a caller that adjusts the river level in between (the downhill
+    river bed) can re-apply the SAME raise afterwards without paying for the
+    distance transform twice. None when there is nothing to tie.
+    """
+    from scipy.ndimage import binary_dilation
+    is_lake = wg.type == TYPE_LAKE
+    if not is_lake.any():
+        return None
+    _, linds = distance_transform_edt(
+        ~is_lake, return_distances=True, return_indices=True)
+    nearest_lake_surf = lake_surface[linds[0], linds[1]]
+    touch = (wg.type == TYPE_RIVER) & binary_dilation(is_lake, iterations=1)
+    good = touch & np.isfinite(nearest_lake_surf)
+    return good, nearest_lake_surf[good].astype(np.float32)
+
+
+def apply_lake_tie_in(river_level: np.ndarray, tie) -> np.ndarray:
+    """Raise (never lower) the river pixels in `tie` to their lake's surface."""
+    if tie is None:
+        return river_level
+    good, vals = tie
+    out = np.array(river_level, dtype=np.float32, copy=True)
+    # fmax, not maximum: a nodata bed leaves NaN in `out`, and at a lake
+    # edge the lake's own surface is a better answer than "no water".
+    out[good] = np.fmax(out[good], vals)
     return out
 
 

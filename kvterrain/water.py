@@ -667,6 +667,13 @@ def features_from_geojson(
 
 LEVEL_SOURCE_NVE = "nve_hoyde"
 LEVEL_SOURCE_ESTIMATED = "dtm_interior_low"
+LEVEL_SOURCE_CORRECTED = "dtm_corrected"
+
+# A published NVE level more than this far above the RING_PERCENTILE of the land
+# just outside the polygon is contradicted by the terrain, and is replaced by the
+# DTM estimate (owner's decision, 2026-09-17: "above all the surrounding terrain").
+DEFAULT_LEVEL_MAX_ABOVE_SHORE_M = 2.0
+LEVEL_CHECK_RING_PERCENTILE = 90.0
 
 # How far outside its polygon a lake may claim samples that are still its own flat
 # water surface in the DTM, and how close to that surface they have to be.
@@ -777,7 +784,9 @@ def snap_lakes_to_flat_water(wg: WaterGrid, height_repaired: np.ndarray, *,
 def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                            enabled: bool = True, margin_m: Optional[float] = None,
                            island: Optional[np.ndarray] = None,
-                           perimeter_cap: bool = True) -> dict:
+                           perimeter_cap: bool = True,
+                           max_above_shore_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SHORE_M,
+                           ) -> dict:
     """
     Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
     estimating a level from the DTM for the lakes NVE gives no `hoyde` for.
@@ -800,12 +809,23 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     the caller MUST also stop carving them (`estimate_missing=False`) — otherwise
     it recreates the dry-pit bug this function was written to remove.
 
-    A PUBLISHED `hoyde` IS USED EXACTLY AS PUBLISHED. It is not averaged with the
-    DTM, not lowered to it, not sanity-checked against it. NVE is the authority on
-    what a lake's level is; the DTM is one flight's opinion of where the water was
-    that day, and on a regulated lake that is metres of drawdown below the level
-    the place actually has. See the note above `apply_estimated_levels` for the
-    version of this function that got that backwards.
+    A PUBLISHED `hoyde` IS USED AS PUBLISHED — unless the terrain flatly contradicts
+    it. It is not averaged with the DTM and not lowered to the flown water surface:
+    NVE is the authority on what a lake's level is, and on a regulated lake the
+    flight can have caught metres of drawdown. See the note above
+    `apply_estimated_levels` for the version of this function that got that
+    backwards.
+
+    The one exception (`max_above_shore_m`, 2 m by default; None disables it): a
+    `hoyde` standing more than that above the 90th percentile of the land ring just
+    outside the polygon is above practically ALL the surrounding terrain, which no
+    lake can be. On Lierne that is 46 lakes, mostly small ponds published 5-14 m
+    above both their shore and their own flown surface; left alone, the carve
+    builds their bowl from a waterline hanging in the air. Such a level is replaced
+    by the same DTM estimate a lake without `hoyde` gets (perimeter cap included),
+    with `level_source = "dtm_corrected"`; `hoyde_moh` keeps the published value. A
+    drawn-down reservoir is not caught by this, because its shore rises above its
+    real level: the 12 largest Lierne lakes all sit at or below their ring.
 
     THE PERIMETER CAP (`perimeter_cap`, on by default) therefore applies to
     ESTIMATED levels only. Those come from the polygon's interior, so the one
@@ -831,14 +851,49 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     estimated = 0
     capped = 0
     cap_max_m = 0.0
+    corrected: list = []
+    if island is None:
+        island = wg.lake_island
+    kw = {} if margin_m is None else {"margin_m": float(margin_m)}
+    lazy: dict = {}
+
+    def est_and_cap():
+        if not lazy:
+            lazy["est"] = bathymetry.estimate_levels_from_interior(
+                height_repaired, wg.lake_id, exclude=island, **kw)
+            lazy["cap"] = (bathymetry.perimeter_levels(
+                height_repaired, wg.lake_id, wg.type) if perimeter_cap else {})
+        return lazy["est"], lazy["cap"]
+
+    if max_above_shore_m is not None and table:
+        ring = bathymetry.perimeter_levels(
+            height_repaired, wg.lake_id, wg.type,
+            percentile=LEVEL_CHECK_RING_PERCENTILE)
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            r = ring.get(lid)
+            if h is None or r is None or not np.isfinite(r):
+                continue
+            if float(h) <= float(r) + float(max_above_shore_m):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            c = cap.get(lid)
+            if v is None or not np.isfinite(v):
+                v = c if c is not None and np.isfinite(c) else float(r)
+            elif c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            v = min(float(v), float(h))
+            info["level_m"] = v
+            info["level_source"] = LEVEL_SOURCE_CORRECTED
+            corrected.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                              "navn": info.get("navn"), "hoyde_moh": float(h),
+                              "ring_p90_m": round(float(r), 3),
+                              "level_m": round(v, 3),
+                              "lowered_m": round(float(h) - v, 3)})
+
     if enabled and missing:
-        kw = {} if margin_m is None else {"margin_m": float(margin_m)}
-        if island is None:
-            island = wg.lake_island
-        est = bathymetry.estimate_levels_from_interior(
-            height_repaired, wg.lake_id, exclude=island, **kw)
-        cap = (bathymetry.perimeter_levels(height_repaired, wg.lake_id, wg.type)
-               if perimeter_cap else {})
+        est, cap = est_and_cap()
         for lid in missing:
             v = est.get(lid)
             if v is None or not np.isfinite(v):
@@ -853,7 +908,21 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
             estimated += 1
 
     unresolved = sum(1 for i in table.values() if i.get("level_m") is None)
+    drops = [c["lowered_m"] for c in corrected]
     return {
+        "levels_corrected": len(corrected),
+        "levels_corrected_max_drop_m": float(max(drops)) if drops else 0.0,
+        "levels_corrected_median_drop_m": float(np.median(drops)) if drops else 0.0,
+        "correction": {
+            "enabled": max_above_shore_m is not None,
+            "max_above_shore_m": max_above_shore_m,
+            "ring_percentile": LEVEL_CHECK_RING_PERCENTILE,
+            "rule": "a published hoyde more than max_above_shore_m above this "
+                    "percentile of the land ring just outside the polygon is "
+                    "replaced by the DTM estimate (perimeter cap included), never "
+                    "raised; hoyde_moh keeps the published value",
+            "lakes": sorted(corrected, key=lambda c: -c["lowered_m"]),
+        },
         "lakes_total": len(table),
         "levels_from_nve": sum(1 for i in table.values()
                                if i.get("level_source") == LEVEL_SOURCE_NVE),

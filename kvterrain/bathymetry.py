@@ -182,7 +182,8 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
 
 
 def distance_to_shore_m(water_type: np.ndarray, spacing_m: float,
-                        *, island: np.ndarray | None = None) -> np.ndarray:
+                        *, island: np.ndarray | None = None,
+                        edge_is_shore: bool = False) -> np.ndarray:
     """
     Distance from each lake sample to the nearest NON-lake sample, in metres.
 
@@ -195,12 +196,24 @@ def distance_to_shore_m(water_type: np.ndarray, spacing_m: float,
     there so the water SURFACE runs through the island, but the island is dry land
     that must be ramped away from like any other bank; without this a lake would
     reach full depth immediately against its own islands.
+
+    `edge_is_shore` treats the ground beyond the MAP EDGE as shore. The EDT only
+    measures to non-lake samples inside the array, so without it a lake the export
+    boundary cuts through is at full depth right at the edge (Lierne: 26 lakes,
+    3 796 edge samples, median 20.0 m deep). The depression hierarchy makes every
+    edge sample an outlet, and such a lake would drain off the map through its own
+    floor. Padding with shore instead ramps the bed back up to the waterline at the
+    edge, so the cropped remainder is a bowl that holds its level.
     """
     is_lake = water_type == TYPE_LAKE_VALUE
     if island is not None:
         is_lake = is_lake & ~np.asarray(island, dtype=bool)
     if not is_lake.any():
         return np.zeros(water_type.shape, dtype=np.float32)
+    if edge_is_shore:
+        padded = np.pad(is_lake, 1, mode="constant", constant_values=False)
+        dist = distance_transform_edt(padded, sampling=(spacing_m, spacing_m))
+        return dist[1:-1, 1:-1].astype(np.float32)
     dist = distance_transform_edt(is_lake, sampling=(spacing_m, spacing_m))
     return dist.astype(np.float32)
 
@@ -230,7 +243,7 @@ SHORE_ANCHOR_M = 1.0
 
 def _carve_depth_m(is_lake: np.ndarray, dist: np.ndarray, spacing_m: float,
                    carve_depth_m: float, ramp_m: float,
-                   min_depth_m: float) -> np.ndarray:
+                   min_depth_m: float, *, bodies_8_connected: bool = False) -> np.ndarray:
     """
     The carve profile in METRES: a straight ramp from 0 at the waterline to
     `carve_depth_m` at `ramp_m` inward, flat from there.
@@ -267,7 +280,12 @@ def _carve_depth_m(is_lake: np.ndarray, dist: np.ndarray, spacing_m: float,
                  * np.clip((dist - anchor) / ramp, 0.0, 1.0)).astype(np.float32)
     depth[~is_lake] = 0.0
 
-    lbl, n = label(is_lake)
+    # Bodies for the min-depth floor. 4-connected by default (the original rule); a
+    # sliver touching its lake only diagonally is then a body of its own, too thin
+    # to ramp, and is STEPPED to min_depth_m right at the shoreline — a notch in the
+    # rim of an 8-connected depression hierarchy. See carve_lake_beds.
+    lbl, n = label(is_lake, structure=np.ones((3, 3), dtype=bool)
+                   if bodies_8_connected else None)
     if n == 0:
         return depth
 
@@ -658,6 +676,8 @@ def carve_lake_beds(
     min_depth_m: float = DEFAULT_MIN_DEPTH_M,
     island: np.ndarray | None = None,
     estimate_missing: bool = True,
+    edge_is_shore: bool = False,
+    shore_8_connected: bool = False,
     shore_band_px: int = DEFAULT_SHORE_BAND_PX,
     void_below_shore_m: float = DEFAULT_VOID_BELOW_SHORE_M,
     # ── legacy aliases (pre-known-surface / pre-ramp_m); mapped if provided ──
@@ -690,6 +710,16 @@ def carve_lake_beds(
     enough to render its own outline. Depth now follows distance from the shore, and
     nothing else. Lower `carve_depth_m` if lakes should be shallower; lower
     `shore_slope` if their sides should be gentler.
+
+    `shore_8_connected` makes the shoreline watertight for the 8-connected depression
+    hierarchy. The EDT puts the zero-depth waterline on samples with a non-lake
+    4-neighbour; a sample whose only dry neighbour is DIAGONAL is sqrt(2) cells from
+    shore and carved 2.07 m deep at the default slope and 5 m spacing. Wherever that
+    dry diagonal ground is below the level, the hierarchy's lake drains through the
+    corner: on Lierne about 390 lakes "spilled over land" up to exactly 2.08 m below
+    their authored level that way. With it on, every lake sample with a non-lake
+    8-neighbour sits on the waterline, and bodies for the min-depth floor are
+    8-connected too, so a diagonal sliver is not stepped 2 m deep at the shore.
 
     `island` marks lake pixels that are really filled polygon holes. They keep their
     DTM height (they are land) and count as shore for the ramp, so a lake shelves
@@ -780,9 +810,21 @@ def carve_lake_beds(
     # SHORE_ANCHOR_M for the measurement that motivated this. The subtraction can
     # only make the carve SHALLOWER, so it cannot deepen a bowl, widen one, or
     # lower a rim sample that was previously left alone.
-    dist = distance_to_shore_m(water_type, spacing_m, island=island)
+    dist = distance_to_shore_m(water_type, spacing_m, island=island,
+                               edge_is_shore=edge_is_shore)
     depth = _carve_depth_m(is_lake, dist, spacing_m, carve_depth_m, ramp_m,
-                           min_depth_m)
+                           min_depth_m, bodies_8_connected=shore_8_connected)
+    if shore_8_connected:
+        # Outside the array counts as lake here (border_value 0), so the map edge
+        # is left to edge_is_shore.
+        ring = is_lake & binary_dilation(~is_lake, structure=np.ones((3, 3), bool))
+        depth[ring] = 0.0
+    if edge_is_shore:
+        # The ramp already puts the edge ring on the waterline, except for a body
+        # too thin to ramp at all, which `_carve_depth_m` steps to min depth. On the
+        # map edge that step would be the outlet the lake drains through, so the
+        # ring is pinned to zero depth outright.
+        depth[0, :] = depth[-1, :] = depth[:, 0] = depth[:, -1] = 0.0
     bed = surf - depth
     out[have] = bed[have]
     return out
@@ -800,6 +842,7 @@ def carve_river_beds(
     depth_scale: float = 1.0,
     width_by_order: dict | None = None,
     width_scale: float = 1.0,
+    bed_target: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Cut a trench under every river pixel: deepest along the channel's middle,
@@ -849,6 +892,14 @@ def carve_river_beds(
     readme quantifies it). Carving each level instead would hold the depth, at the
     cost of widening the trench to a whole coarse cell and popping as the viewer
     approaches — a display trade, not a correctness one, and not taken here.
+
+    `bed_target` (m.o.h. per sample, NaN where unset; from
+    `riverbed.downhill_river_bed`) is the downhill-only bed. A sample standing above
+    it is lowered TOWARD it by the same weight the trench uses — cross-section times
+    bank taper — so the channel middle reaches it, a bank above the waterline is
+    still left alone, and no sample is ever cut below it. The taper keeps measuring
+    against `level` as passed, which must be the ORIGINAL channel level, not the
+    lowered one, or lowering the level would switch the carve off.
 
     `order` is the per-pixel stream order (`WaterGrid.weight`). Returns a copy.
     """
@@ -900,6 +951,7 @@ def carve_river_beds(
 
     with np.errstate(invalid="ignore", divide="ignore"):
         frac = _smoothstep(dist / np.maximum(ref, 1e-6))
+    weight = frac
     cut = depth_max * frac
 
     # Stop at the waterline. `e` is how far this sample stands above its channel's
@@ -913,7 +965,15 @@ def carve_river_beds(
         b = max(float(bank_tolerance_m), 1e-3)
         e = height_m.astype(np.float32) - np.asarray(level, dtype=np.float32)
         e = np.where(np.isfinite(e), e, 0.0)     # no level here -> no taper
-        cut = cut * np.clip((2.0 * b - e) / b, 0.0, 1.0)
+        taper = np.clip((2.0 * b - e) / b, 0.0, 1.0)
+        cut = cut * taper
+        weight = frac * taper
 
     out[is_river] = (out[is_river] - cut[is_river]).astype(out.dtype)
+    if bed_target is not None:
+        tgt = np.asarray(bed_target, dtype=np.float32)
+        h0 = height_m.astype(np.float32)
+        sel = is_river & np.isfinite(tgt) & (h0 > tgt)
+        pulled = h0[sel] - (h0[sel] - tgt[sel]) * weight[sel]
+        out[sel] = np.minimum(out[sel], pulled).astype(out.dtype)
     return out

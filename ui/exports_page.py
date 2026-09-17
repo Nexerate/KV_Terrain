@@ -129,15 +129,16 @@ def _checks(exp: kvexports.Export) -> None:
         rep = kvexports.check_atlas(exp)
     (st.success if rep["ok"] else st.error)(
         f"Atlases: {'PASS' if rep['ok'] else 'FAIL'} — every file must be exactly "
-        f"{rep['expected_bytes']:,} bytes ({rep['tile_bytes']:,}-byte tiles). A "
-        f"mismatch means the tile grid was not dense, and a reader using pure "
-        f"offset arithmetic would misalign every tile past the gap.")
+        f"the size its bytes per sample implies ({rep['expected_bytes']:,} bytes "
+        f"for a 2-byte atlas). A mismatch means the tile grid was not dense, and a "
+        f"reader using pure offset arithmetic would misalign every tile past the gap.")
     for a in rep["atlases"]:
         if a.get("error"):
             st.write(f"- **{a['kind']}** — {a['error']}")
             continue
         mark = "✅" if a["ok"] else "❌"
-        st.write(f"- {mark} **{a['kind']}** `{a['file']}` — {a['bytes']:,} bytes, "
+        st.write(f"- {mark} **{a['kind']}** `{a['file']}` — {a['bytes']:,} bytes "
+                 f"({a['bytes_per_sample']} bytes/sample), "
                  f"{a['offsets_checked']} sampled offsets, "
                  f"{len(a['short_reads'])} short reads")
 
@@ -166,6 +167,27 @@ def _checks(exp: kvexports.Export) -> None:
             st.warning(note)
         for err in wrep["errors"]:
             st.error(err)
+
+    st.divider()
+    st.markdown("**Depression hierarchy**")
+    if not exp.has_hierarchy:
+        st.info("No hierarchy in this export.")
+    else:
+        st.caption("Reads all of level 0 from heights.atlas and labels.atlas, checks "
+                   "the node table against them, and recomputes every coarse label "
+                   "level — a few seconds on a large export, so it is a button.")
+        if st.button("Check hierarchy.bin and labels.atlas", key="hier_go"):
+            with st.spinner("checking the hierarchy…"):
+                hrep = kvexports.check_hierarchy(exp)
+            (st.success if hrep["ok"] else st.error)(
+                f"Hierarchy: {'PASS' if hrep['ok'] else 'FAIL'}")
+            stt = hrep.get("stats") or {}
+            if stt:
+                st.write(f"- {stt['nodes']:,} nodes, {stt['leaves']:,} leaves, "
+                         f"{stt['minor']:,} minor, {stt['with_lake']:,} matched to a "
+                         f"lake, {stt['spilling_off_map']:,} children of the root")
+            for err in hrep["errors"]:
+                st.error(err)
 
     st.divider()
     st.markdown("**Ground truth (needs the network)**")

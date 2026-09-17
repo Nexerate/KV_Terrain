@@ -13,8 +13,8 @@ that were actually written, rather than against the arrays that were in memory
 at the time. A preview drawn by this module is proof the offsets are right;
 a preview drawn from `PackResult` is not.
 
-The checks here are the ones `kvterrain.cli validate-atlas` and `validate-water`
-have always run. They live in this module now, returning reports, and the CLI
+The checks here are the ones `kvterrain.cli validate-atlas`, `validate-water`
+and `validate-hierarchy` run. They live in this module now, returning reports, and the CLI
 prints them — so the UI and the CLI cannot drift into checking different things.
 
 Nothing here writes to an export. Reading is all it does.
@@ -37,8 +37,11 @@ DEFAULT_ROOT = os.path.join(PROJECT_ROOT, "exports")
 
 MANIFEST_NAME = "manifest.json"
 
-# The three atlases, in the order a reader most wants them.
-ATLAS_KINDS = ("height", "surface", "water_id")
+# The atlases, in the order a reader most wants them.
+ATLAS_KINDS = ("height", "surface", "water_id", "labels")
+_ATLAS_KEYS = {"height": "height_file", "surface": "surface_file",
+               "water_id": "water_id_file", "labels": "labels_file"}
+_DTYPE_BY_BYTES = {2: "<u2", 4: "<u4"}
 
 
 # --------------------------------------------------------------------------- #
@@ -96,13 +99,21 @@ class Export:
         return (self.manifest.get("generator", {}).get("dataset") or {}).get("slug")
 
     def atlas_path(self, kind: str) -> Optional[str]:
-        key = {"height": "height_file", "surface": "surface_file",
-               "water_id": "water_id_file"}[kind]
-        fn = self.manifest.get("atlas", {}).get(key)
+        fn = self.manifest.get("atlas", {}).get(_ATLAS_KEYS[kind])
         if not fn:
             return None
         p = os.path.join(self.root, fn)
         return p if os.path.exists(p) else None
+
+    def bytes_per_sample(self, kind: str) -> int:
+        """From `atlas.bytes_per_sample`; 2 for exports written before it existed."""
+        atlas = self.manifest.get("atlas", {})
+        fn = atlas.get(_ATLAS_KEYS[kind])
+        return int((atlas.get("bytes_per_sample") or {}).get(fn, 2))
+
+    @property
+    def has_hierarchy(self) -> bool:
+        return bool(self.manifest.get("hierarchy"))
 
     def files(self) -> list:
         """(name, bytes) for everything in the export, largest first."""
@@ -165,6 +176,10 @@ class Export:
         return (ty * tc + 1, tx * tc + 1)
 
     def read_level_u16(self, kind: str, level: int) -> np.ndarray:
+        """`read_level` for the 2-byte atlases, kept under its old name."""
+        return self.read_level(kind, level)
+
+    def read_level(self, kind: str, level: int) -> np.ndarray:
         """
         Reassemble a whole pyramid level from an atlas, by computed byte offset.
 
@@ -180,21 +195,23 @@ class Export:
         ts, tc = self.tile_samples, self.tile_cells
         tiles_x, tiles_y = core.tiles_at_level(lx, ly, level)
         SY, SX = self.level_shape(level)
-        out = np.zeros((SY, SX), dtype="<u2")
-        tile_bytes = core.atlas_tile_bytes(ts)
+        bps = self.bytes_per_sample(kind)
+        dtype = _DTYPE_BY_BYTES[bps]
+        out = np.zeros((SY, SX), dtype=dtype)
+        tile_bytes = core.atlas_tile_bytes(ts, bps)
 
         with open(path, "rb") as fh:
             for ty in range(tiles_y):
                 for tx in range(tiles_x):
                     off = core.atlas_tile_offset(lx, ly, self.num_levels, ts,
-                                                 level, tx, ty)
+                                                 level, tx, ty, bps)
                     fh.seek(off)
                     buf = fh.read(tile_bytes)
                     if len(buf) != tile_bytes:
                         raise ValueError(
                             f"{kind} atlas: short read for L{level} tile {tx},{ty} "
                             f"at offset {off} — the file does not match the header")
-                    tile = np.frombuffer(buf, dtype="<u2").reshape(ts, ts)
+                    tile = np.frombuffer(buf, dtype=dtype).reshape(ts, ts)
                     r0, c0, _ = core.north_up_tile_slice(SY, tc, tx, ty)
                     out[r0:r0 + ts, c0:c0 + ts] = tile
         return out
@@ -286,6 +303,8 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
     expect = core.atlas_total_bytes(lx, ly, exp.num_levels, ts)
 
     rng = np.random.default_rng(0)
+    # `expected_bytes` / `tile_bytes` describe the 2-byte atlases; each entry
+    # carries its own, since labels.atlas is 4 bytes per sample.
     report = {"expected_bytes": expect, "tile_bytes": tile_bytes,
               "atlases": [], "ok": True}
 
@@ -299,9 +318,14 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
             continue
 
         entry = {"kind": kind, "file": os.path.basename(path)}
+        bps = exp.bytes_per_sample(kind)
+        a_tile_bytes = core.atlas_tile_bytes(ts, bps)
+        a_expect = core.atlas_total_bytes(lx, ly, exp.num_levels, ts, bps)
         actual = os.path.getsize(path)
         entry["bytes"] = actual
-        entry["size_ok"] = (actual == expect)
+        entry["bytes_per_sample"] = bps
+        entry["expected_bytes"] = a_expect
+        entry["size_ok"] = (actual == a_expect)
         entry["offsets_checked"] = 0
         entry["short_reads"] = []
 
@@ -316,9 +340,9 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
                     for idx in pick:
                         x, y = coords[int(idx)]
                         off = core.atlas_tile_offset(lx, ly, exp.num_levels, ts,
-                                                     lvl, x, y)
+                                                     lvl, x, y, bps)
                         fh.seek(off)
-                        if len(fh.read(tile_bytes)) != tile_bytes:
+                        if len(fh.read(a_tile_bytes)) != a_tile_bytes:
                             entry["short_reads"].append(
                                 {"level": lvl, "x": x, "y": y, "offset": off})
                         entry["offsets_checked"] += 1
@@ -418,6 +442,9 @@ def check_water(exp: Export) -> dict:
                if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED]
         report["lakes"] = {"count": len(rows), "with_ids": len(lake_ids),
                            "estimated_level": len(est),
+                           "corrected_level": sum(
+                               1 for l in rows if l.get("level_source")
+                               == kvwater.LEVEL_SOURCE_CORRECTED),
                            "without_level": len(no_level)}
         if no_level:
             # Not an error: an unlevelled lake is left uncarved on purpose, so it
@@ -460,6 +487,153 @@ def check_water(exp: Export) -> dict:
         report["errors"].append("manifest names a water_id atlas that is not there")
 
     report["ok"] = not report["errors"]
+    return report
+
+
+def check_hierarchy(exp: Export) -> dict:
+    """
+    Re-read `hierarchy.bin` and `labels.atlas` and check them against the manifest
+    and against `heights.atlas` itself:
+
+      * the header agrees with the manifest and the file has no stray bytes;
+      * the tree is a tree: parents resolve, a parent id is greater than its
+        child's except under the root, spills never fall below floors, a child
+        spills no higher than its parent and floors no lower;
+      * the stored codes are the atlas's codes: floor_code at floor_cell, and
+        spill_code = max over spill_cell and outlet_cell;
+      * each saddle sits where it says: spill_cell drains into the node's own
+        subtree, outlet_cell into overflow_to's;
+      * every level-0 label is 0 or a leaf, and the per-node sample counts match;
+      * every coarse label level is recomputed from the level below and the
+        heights at that level, and must match exactly.
+
+    Reads a whole level 0 of heights and labels, so it takes a few seconds and a
+    few hundred MB on a large export.
+    """
+    from . import hierarchy as H
+
+    hb = exp.manifest.get("hierarchy")
+    if not hb:
+        return {"ok": True, "skipped": "no hierarchy block — built without one"}
+    report = {"ok": True, "errors": [], "notes": [], "stats": {}}
+    errors = report["errors"]
+
+    def fail(msg):
+        errors.append(msg)
+
+    path = os.path.join(exp.root, hb["file"])
+    try:
+        header, nodes = H.read_hierarchy_bin(path)
+    except Exception as e:      # noqa: BLE001
+        fail(f"{hb['file']}: {e}")
+        report["ok"] = False
+        return report
+    report["header"] = header
+    SY, SX = exp.level_shape(0)
+    for key, want in (("node_count", hb["node_count"]), ("leaf_count", hb["leaf_count"]),
+                      ("record_bytes", hb["record_bytes"]), ("samples_x", SX),
+                      ("samples_y", SY), ("connectivity", hb["connectivity"]),
+                      ("trailing_bytes", 0)):
+        if header[key] != want:
+            fail(f"header {key} = {header[key]}, expected {want}")
+
+    n = int(header["node_count"])
+    P = int(header["leaf_count"])
+    ids = np.arange(n, dtype=np.int64)
+    parent = nodes["parent"].astype(np.int64)
+    flags = nodes["flags"]
+    if n == 0 or parent[H.ROOT] != H.NONE:
+        fail("node 0 is not a root")
+    nonroot = ids != H.ROOT
+    bad = nonroot & ((parent == H.NONE) | (parent >= n))
+    if bad.any():
+        fail(f"{int(bad.sum())} nodes have an unresolvable parent")
+    else:
+        p = parent[nonroot]
+        v = ids[nonroot]
+        if ((p != H.ROOT) & (p <= v)).any():
+            fail("a parent id is not greater than its child's")
+        has = (flags & H.FLAG_HAS_SPILL) != 0
+        if not has[nonroot].all():
+            fail("a non-root node has no spill")
+        if (nodes["spill_code"][nonroot] < nodes["floor_code"][nonroot]).any():
+            fail("a node spills below its own floor")
+        inner = p != H.ROOT
+        if (nodes["spill_code"][v[inner]] > nodes["spill_code"][p[inner]]).any():
+            fail("a child spills higher than its parent")
+        if (nodes["floor_code"][p[inner]] > nodes["floor_code"][v[inner]]).any():
+            fail("a parent's floor is above its child's")
+        head = nodes["outflow_head_m"]
+        if not (np.isfinite(head) & (head >= 0)).all():
+            fail("an outflow_head_m is negative or not finite")
+        leaf_flag = (flags & H.FLAG_LEAF) != 0
+        if not np.array_equal(leaf_flag, (ids >= 1) & (ids <= P)):
+            fail("leaf flags do not match ids 1..leaf_count")
+        ov = nodes["overflow_to"].astype(np.int64)
+        if (ov[nonroot] >= n).any():
+            fail("an overflow_to id does not resolve")
+    if errors:
+        report["ok"] = False
+        return report
+
+    codes = exp.read_level("height", 0).ravel()
+    cells = (nodes["floor_cell"].astype(np.int64))
+    if (cells >= codes.size).any() or (codes[cells] != nodes["floor_code"]).any():
+        fail("floor_code does not match heights.atlas at floor_cell")
+    sc = nodes["spill_cell"][nonroot].astype(np.int64)
+    oc = nodes["outlet_cell"][nonroot].astype(np.int64)
+    if (sc >= codes.size).any() or (oc >= codes.size).any():
+        fail("a spill or outlet cell is off the lattice")
+    elif (np.maximum(codes[sc], codes[oc]) != nodes["spill_code"][nonroot]).any():
+        fail("spill_code is not max(code at spill_cell, code at outlet_cell)")
+
+    labels = exp.read_level("labels", 0)
+    lflat = labels.ravel()
+    if int(lflat.max()) > P:
+        fail("a level-0 label is not a leaf id")
+    counts = np.bincount(lflat, minlength=n)
+    if not np.array_equal(counts[:n].astype(np.uint32), nodes["cell_count"]):
+        fail("cell_count does not match the level-0 label histogram")
+    sub = nodes["cell_count"].astype(np.int64)
+    for v in range(1, n):
+        sub[parent[v]] += sub[v]
+    if not np.array_equal(sub.astype(np.uint32), nodes["subtree_cells"]):
+        fail("subtree_cells is not the sum over each subtree")
+
+    if not errors:
+        tin, tout = H.subtree_intervals(nodes)
+        v = ids[nonroot]
+        ls = lflat[sc].astype(np.int64)
+        if ((tin[ls] < tin[v]) | (tin[ls] >= tout[v])).any():
+            fail("a spill_cell does not drain into its own node's subtree")
+        ov = nodes["overflow_to"][nonroot].astype(np.int64)
+        lo = lflat[oc].astype(np.int64)
+        if ((tin[lo] < tin[ov]) | (tin[lo] >= tout[ov])).any():
+            fail("an outlet_cell does not drain into overflow_to's subtree")
+    del codes, lflat
+
+    prev_labels = labels
+    for lvl in range(1, exp.num_levels):
+        heights_prev = exp.read_level("height", lvl - 1)
+        want = H.build_label_pyramid(prev_labels, [heights_prev, None])[1]
+        got = exp.read_level("labels", lvl)
+        if not np.array_equal(want, got):
+            fail(f"labels level {lvl} does not follow from level {lvl - 1} "
+                 f"(lowest child in the 3x3 gather)")
+            break
+        prev_labels = got
+
+    fl = nodes["flags"]
+    report["stats"] = {
+        "nodes": n, "leaves": P,
+        "minor": int(((fl & H.FLAG_MINOR) != 0).sum()),
+        "with_lake": int(((fl & H.FLAG_AUTHORED_LAKE) != 0).sum()),
+        "spilling_off_map": int(((fl & H.FLAG_SPILLS_OFF_MAP) != 0).sum()),
+    }
+    audit = exp.manifest.get("water_audit")
+    if audit:
+        report["audit_summary"] = audit.get("summary")
+    report["ok"] = not errors
     return report
 
 

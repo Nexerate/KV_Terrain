@@ -126,12 +126,51 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
                  "height of the land ring just outside the polygon, so the lake "
                  "cannot end up standing above the terrain around it. A published "
                  "hoyde is always used exactly as published and is never capped.")
+        correct_levels = st.toggle(
+            "Correct published levels the terrain contradicts", value=True, disabled=d,
+            help="A published NVE level standing more than the margin below above "
+                 "the 90th percentile of the land ringing the lake is above "
+                 "practically all of its shore, so it is wrong. It is replaced by "
+                 "the DTM estimate; lakes.json keeps the published value.")
+        max_above_shore = st.slider(
+            "Margin above the shore (m)", 0.5, 10.0, 2.0, 0.5,
+            disabled=d or not correct_levels,
+            help="How far a published level may stand above the 90th percentile of "
+                 "its shore ring before it is corrected.")
         ocean_level = st.number_input(
             "Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0, disabled=d,
             help="Kartverket heights are metres above sea level, so 0 is real sea "
                  "level. Ocean is flood-filled inward from the map edges, not "
                  "thresholded, so inland below-sea-level ground is never "
                  "mislabelled as sea.")
+
+        st.divider()
+        st.subheader("Water redesign")
+        st.caption("First milestone of WATER_REDESIGN.md. These change or add "
+                   "exported files; with all of them off, and the level correction "
+                   "above off, the export is the pre-redesign one, byte for byte.")
+        downhill_bed = st.toggle(
+            "Downhill-only river bed", value=True, disabled=d,
+            help="Before carving, hold every river's bed and water level to a "
+                 "running minimum going downstream — across links and through "
+                 "lakes — so no mapped channel has a pit the depression hierarchy "
+                 "must explain. Changes heights.atlas.")
+        lake_edge_is_shore = st.toggle(
+            "Lakes ramp up at the map edge", value=True, disabled=d,
+            help="Treat the map edge as shore when carving a lake the boundary cuts "
+                 "through. Every edge sample is an outlet in the hierarchy, so "
+                 "without this a cropped lake drains off the map.")
+        lake_shore_8 = st.toggle(
+            "Lake shorelines watertight diagonally", value=True, disabled=d,
+            help="Every lake sample with a dry neighbour, diagonal ones included, "
+                 "sits on the waterline. Otherwise a sample diagonal to dry ground is "
+                 "carved ~2 m deep and the 8-connected hierarchy drains the lake "
+                 "through that corner.")
+        build_hierarchy = st.toggle(
+            "Depression hierarchy + water audit", value=True, disabled=d,
+            help="Build the Priority-Flood depression hierarchy on the packed "
+                 "heights and check the authored water against it. Writes "
+                 "labels.atlas, hierarchy.bin and water_audit.json.")
 
         st.divider()
         st.subheader("River polylines")
@@ -163,6 +202,11 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "emit_geojson": emit_geojson,
             "estimate_lake_levels": estimate_lake_levels,
             "lake_perimeter_cap": lake_perimeter_cap,
+            "lake_level_max_above_shore_m": max_above_shore if correct_levels else None,
+            "downhill_river_bed": downhill_bed,
+            "lake_edge_is_shore": lake_edge_is_shore,
+            "lake_shore_8_connected": lake_shore_8,
+            "hierarchy": build_hierarchy,
         }
         if river_vertex_stride > 0:
             water_opts["river_vertex_stride_m"] = river_vertex_stride
@@ -253,14 +297,125 @@ def _detail_inspector(state: dict) -> None:
                f"{ox:,.0f}, {oy:,.0f} · {win * state['spacing_m']:,.0f} m across")
 
 
+def _audit_map(state: dict, audit: dict) -> None:
+    """Every finding as a marker over the hillshade: lakes red (above spill) or
+    grey (no node), river pits orange, rivers leaving their corridor magenta,
+    unexplained depressions yellow."""
+    terr = state["terrain"]
+    s = kvpreview.stride_for(terr.shape, PREVIEW_PX)
+    base = kvpreview.terrain_rgb(terr[::s, ::s], state["spacing_m"] * s,
+                                 hmin=state["hmin"], hmax=state["hmax"]) * 0.6
+    rgb = base.copy()
+    H_, W_ = rgb.shape[:2]
+    SY = terr.shape[0]
+
+    def mark(xy, colour, r=2):
+        col = int(round((xy[0] - state["origin_x"]) / state["spacing_m"])) // s
+        row = int(round(SY - 1 - (xy[1] - state["origin_y"]) / state["spacing_m"])) // s
+        rgb[max(row - r, 0):min(row + r + 1, H_), max(col - r, 0):min(col + r + 1, W_)] = colour
+
+    for d in audit.get("depressions", []):
+        mark(d["floor_xy"], (1.0, 0.9, 0.2))
+    for rv in audit.get("rivers", []):
+        mark(rv["xy"], (1.0, 0.55, 0.1) if rv["status"] == "pit" else (0.9, 0.2, 0.9), 1)
+    for lk in audit.get("lakes", []):
+        if lk["status"] == "level_above_spill":
+            mark(lk.get("spill_xy", lk["xy"]), (0.9, 0.1, 0.1))
+        elif lk["status"] == "no_node":
+            mark(lk["xy"], (0.75, 0.75, 0.75))
+    W.panel_grid([(rgb, "Audit findings — red: lake above its spill (at the spill); "
+                        "grey: lake with no node; orange: river pit; magenta: river "
+                        "leaves its corridor; yellow: unexplained depression")],
+                 columns=1)
+
+
+def _audit_tab(state: dict) -> None:
+    import pandas as pd
+
+    audit = state.get("water_audit")
+    hb = state["manifest"].get("hierarchy")
+    if not audit or not hb:
+        st.caption("No hierarchy in this run — turn on *Depression hierarchy + water "
+                   "audit*.")
+        return
+    summ = audit["summary"]
+    lk = summ["lakes_by_status"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Hierarchy nodes", f"{hb['node_count']:,}",
+              help=f"{hb['leaf_count']:,} leaves (pits); "
+                   f"{hb['stats']['nodes_minor']:,} minor")
+    c2.metric("Lakes consistent",
+              f"{lk.get('ok', 0) + lk.get('held_by_outflow', 0):,} / {summ['lakes']:,}",
+              help=f"{lk.get('ok', 0):,} at or below their spill, "
+                   f"{lk.get('held_by_outflow', 0):,} above it but within the "
+                   f"depth of their outflow river there")
+    c3.metric("Lakes above spill", f"{lk.get('level_above_spill', 0):,}",
+              help="Authored level higher than the terrain lets the lake stand. By "
+                   "what the saddle is: " + ", ".join(
+                       f"{k} {v:,}" for k, v in
+                       summ.get("lakes_above_spill_by_spill_through", {}).items()))
+    c4.metric("Unexplained depressions", f"{summ['unexplained_depressions']:,}",
+              help="Deep, large, and no lake. Geometric only until catchment "
+                   "areas exist.")
+    rf = summ.get("river_findings_by_status", {})
+    st.caption(
+        f"Rivers: {summ['river_segments_walked']:,} segments walked by steepest "
+        f"descent; {rf.get('pit', 0):,} end in a pit at least "
+        f"{audit['thresholds']['river_pit_list_min_depth_m']} m deep "
+        f"({summ.get('river_pits_below_list_depth', 0):,} shallower ones not listed), "
+        f"{rf.get('leaves_corridor', 0):,} leave their corridor. "
+        f"Lakes: " + ", ".join(f"{k} {v:,}" for k, v in lk.items()) + ".")
+    bed = state["manifest"].get("water_surface", {}).get(
+        "river_bathymetry", {}).get("downhill_bed", {})
+    if "pixel_steps_checked" in bed:
+        st.caption(
+            f"River bed along the polylines' own samples: "
+            f"{bed['pixel_steps_rising']:,} of {bed['pixel_steps_checked']:,} "
+            f"open-channel steps rise ({bed['pixel_rising_pct']:.2f} %), worst "
+            f"{bed['pixel_worst_rise_m']:.2f} m"
+            + (f"; downhill bed lowered {bed['vertices_bed_lowered']:,} vertices, "
+               f"median {bed['bed_lowered_median_m']:.2f} m, max "
+               f"{bed['bed_lowered_max_m']:.1f} m." if bed.get("enabled") else
+               " (downhill bed off)."))
+
+    _audit_map(state, audit)
+
+    sub = st.tabs(["Lakes", "Rivers", "Depressions"])
+    with sub[0]:
+        rows = [r for r in audit["lakes"] if r["status"] != "ok"]
+        if rows:
+            df = pd.DataFrame(rows)
+            if "excess_m" in df.columns:
+                df = df.sort_values("excess_m", ascending=False, na_position="last")
+            st.dataframe(df, width="stretch", hide_index=True)
+        else:
+            st.caption("Every lake matched a node at its authored level.")
+    with sub[1]:
+        if audit["rivers"]:
+            st.dataframe(pd.DataFrame(audit["rivers"]), width="stretch", hide_index=True)
+        else:
+            st.caption("No river findings.")
+    with sub[2]:
+        if audit["depressions"]:
+            st.dataframe(pd.DataFrame(audit["depressions"]), width="stretch",
+                         hide_index=True)
+        else:
+            st.caption("No unexplained depressions.")
+    st.caption(f"Full report: `{os.path.join(state['out_dir'], 'water_audit.json')}`")
+
+
 def _reports(state: dict) -> None:
     man = state["manifest"]
     wv = man.get("water_vector")
     wm = man.get("water_surface", {})
 
-    tabs = st.tabs(["Lake levels", "Network validation", "Stage timings", "manifest.json"])
+    tabs = st.tabs(["Water audit", "Lake levels", "Network validation",
+                    "Stage timings", "manifest.json"])
 
     with tabs[0]:
+        _audit_tab(state)
+
+    with tabs[1]:
         ll = wm.get("lake_levels")
         if not ll:
             st.caption("No water in this run.")
@@ -268,14 +423,26 @@ def _reports(state: dict) -> None:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Lakes", f"{wm.get('lake_count', 0):,}")
             c2.metric("From NVE hoyde", f"{ll['levels_from_nve']:,}",
-                      help="Used verbatim. The DTM does not get a vote on a "
-                           "published level.")
+                      help="Used as published, unless it stands above practically "
+                           "all of the lake's shore (see Corrected below).")
             c3.metric("Estimated", f"{ll['levels_estimated']:,}",
                       help="Read off the LiDAR water surface inside the polygon, "
                            "because NVE published no hoyde.")
             c4.metric("Unresolved", f"{ll['levels_unresolved']:,}",
                       help="Neither source gave a level. These are left UNCARVED — "
                            "carving them is how lakes became dry pits.")
+            corr = ll.get("correction") or {}
+            if ll.get("levels_corrected"):
+                st.caption(
+                    f"{ll['levels_corrected']:,} published levels stood more than "
+                    f"{corr.get('max_above_shore_m', 0):g} m above the 90th percentile "
+                    f"of their shore and were replaced by the DTM estimate (median "
+                    f"drop {ll['levels_corrected_median_drop_m']:.1f} m, max "
+                    f"{ll['levels_corrected_max_drop_m']:.1f} m).")
+                import pandas as pd
+                with st.expander("Corrected lakes"):
+                    st.dataframe(pd.DataFrame(corr.get("lakes", [])), width="stretch",
+                                 hide_index=True)
             capped = ll.get("levels_capped_to_perimeter", 0)
             if capped:
                 st.caption(f"{capped:,} estimated levels were capped at the "
@@ -293,7 +460,7 @@ def _reports(state: dict) -> None:
                            f"flat water surface outside its polygon and are now part "
                            f"of it.")
 
-    with tabs[1]:
+    with tabs[2]:
         if not wv:
             st.caption("No water in this run.")
         else:
@@ -319,13 +486,15 @@ def _reports(state: dict) -> None:
   {rep['connectivity_source_segments']:,} sources,
   {rep['connectivity_sink_segments']:,} sinks.
 """)
-            st.caption("Nothing here is corrected. Source vertex order stays "
-                       "authoritative and river Z is left alone; the runtime burn's "
-                       "running-minimum enforces descent. Disagreement concentrated "
+            st.caption("These are advisory. Source vertex order stays "
+                       "authoritative. `z` is sampled bilinearly from the carved bed, "
+                       "so it also reads the banks beside a channel; with the "
+                       "downhill-only bed on, descent along the polylines' own "
+                       "samples is in the Water audit tab. Disagreement concentrated "
                        "in lake-touching segments would suggest a real ordering "
                        "problem rather than DTM noise.")
 
-    with tabs[2]:
+    with tabs[3]:
         secs = state.get("stage_seconds") or {}
         if not secs:
             st.caption("No timings recorded.")
@@ -340,7 +509,7 @@ def _reports(state: dict) -> None:
             st.caption(f"Total {sum(secs.values()):.1f}s in the pipeline. Reach for "
                        f"this when you want to know what a re-run actually costs.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.json(man)
 
 
@@ -416,8 +585,9 @@ def render() -> None:
     out_dir = out_col.text_input(
         "Output folder", value=st.session_state.get("process_out", default_out),
         help="Where the Unity export is written: manifest.json, heights.atlas, "
-             "surface.atlas, water_id.atlas, rivers.bin, lakes.json, junctions.json. "
-             "Re-running overwrites it.")
+             "surface.atlas, water_id.atlas, rivers.bin, lakes.json, junctions.json, "
+             "and with the hierarchy on labels.atlas, hierarchy.bin and "
+             "water_audit.json. Re-running overwrites it.")
     st.session_state["process_out"] = out_dir
     btn_col.write("")
     btn_col.write("")
@@ -474,6 +644,7 @@ def render() -> None:
             "wtype": wg.type if wg is not None else None,
             "weight": wg.weight if wg is not None else None,
             "raw": np.asarray(ds.heights()),
+            "water_audit": res.water_audit,
         }
         # The run itself is logged by `process_dataset`, beside the dataset, so
         # the CLI records history too rather than only the UI.

@@ -39,8 +39,11 @@ neighbours, so the runtime read depth >> 0 and the river spiked.
 
 The defence here is DENSIFICATION, not fitting. Vertices are resampled to the leaf
 spacing before Z is sampled, so the polyline follows the real channel instead of
-cutting chords across it. Non-monotonic descent that survives is REPORTED, never
-corrected: the runtime's running-minimum is what enforces descent during the burn.
+cutting chords across it. This module REPORTS non-monotonic descent and never
+corrects `z`; descent is enforced on the terrain before the carve, by
+`riverbed` (the downhill-only bed), and `z` is sampled from that carved bed. The
+numbers here sample bilinearly, so they also read the banks beside a trench and
+do not reach zero even when the channel's own samples never rise.
 
 FLOW DIRECTION
 --------------
@@ -316,54 +319,49 @@ class RiverNetwork:
 # Build                                                                        #
 # --------------------------------------------------------------------------- #
 
-def build_river_network(
+@dataclass
+class TracedNetwork:
+    """
+    The polyline network with its GEOMETRY settled and nothing sampled yet:
+    densified, clipped to the region, ordered, lake spans found, links built.
+
+    Tracing and sampling used to be one pass at the very end of the pipeline. They
+    are two now because the downhill river bed (`riverbed`) needs the linked,
+    densified centrelines BEFORE the river carve, while `z` must still be sampled
+    AFTER it. Both stages read this one object, so the bed that was enforced and
+    the polylines that ship are the same segments, vertex for vertex.
+    """
+    segments: list                  # RiverSegment, z/level still None
+    stride_m: float
+    clip: dict
+    span_stats: dict
+
+
+def trace_river_network(
     plan: core.GridPlan,
     feats: kvwater.WaterFeatures,
     wg: kvwater.WaterGrid,
-    height_leaf: np.ndarray,
+    height_nodata: np.ndarray,
     *,
-    water_surface: Optional[np.ndarray] = None,
     vertex_stride_m: Optional[float] = None,
-    depth_by_order: Optional[dict] = None,
-    depth_scale: float = 1.0,
     progress: Optional[Callable[[float, str], None]] = None,
-) -> RiverNetwork:
+) -> TracedNetwork:
     """
-    Turn the elvenett polylines into the serialisable network: densified, Z-sampled,
-    connected, clipped at lake boundaries, validated.
+    Everything `build_river_network` does that does not depend on heights.
 
-    `height_leaf` must be the LEAF DTM the surface raster was built against, so the
-    polyline `z` (the bed) matches the bed the raster used.
-
-    `water_surface` is the COMBINED raster surface field. When supplied, each
-    vertex's `level` is read straight out of it, which makes polyline/raster
-    agreement exact rather than merely close. Recomputing `bed + raise`
-    independently is not good enough: the raster applies rules the recomputation
-    would miss — most importantly it pins river pixels ADJACENT to a lake to that
-    lake's surface, so a vertex near an inlet would otherwise carry `bed + raise`
-    while the raster carried the lake's `hoyde`. On steep inlet banks that is a
-    100 m+ disagreement on the handful of vertices that matter most, since they
-    are precisely where the burn hands off to the lake basin.
-
-    Without `water_surface` the function falls back to `bed + carve depth` plus
-    lake-span pinning, which is correct in the interior and wrong only at those
-    boundaries.
+    `height_nodata` is only consulted for WHERE it is NaN: a run whose every bed
+    sample would be nodata is dropped here, before segment ids and links are
+    handed out, exactly as the single pass used to drop it. The carves never change
+    that NaN mask before `leaf_bed_uncarved` is snapshotted, so tracing on the
+    post-snap bed and sampling on the river-carved one agree about which segments
+    exist.
     """
-    depth_by_order = depth_by_order or DEFAULT_RIVER_DEPTH_BY_ORDER
     stride = float(vertex_stride_m) if vertex_stride_m else float(plan.spacing_m)
     weight_raw = wg.weight_raw if wg.weight_raw is not None else wg.weight
 
     SY, SX = plan.samples_y, plan.samples_x
-    if height_leaf.shape != (SY, SX):
-        raise ValueError(f"height_leaf {height_leaf.shape} != grid {(SY, SX)}")
-
-    # Resolved level, not the raw NVE field: a polyline crossing a lake whose level
-    # was estimated must be pinned to that same level, or the polyline and the
-    # surface raster disagree at exactly the inlet/outlet the burn hands off at.
-    lake_hoyde = {lid: wg.lake_level(info)
-                  for lid, info in (wg.lake_table or {}).items()}
-
-    ws = None if water_surface is None else np.asarray(water_surface)
+    if height_nodata.shape != (SY, SX):
+        raise ValueError(f"height {height_nodata.shape} != grid {(SY, SX)}")
 
     segments: list = []
     clip = {"features": 0, "clipped": 0, "split": 0,
@@ -413,49 +411,14 @@ def build_river_network(
             xy = xy_full[v0:v1 + 1]
 
             row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
-            z = _bilinear(height_leaf, row, col)
-            # Nodata bed samples along the channel are interpolated from their finite
-            # neighbours rather than dropped — a hole in the middle of a polyline would
-            # otherwise break the burn's running minimum.
-            z = _fill_nan_1d(z)
-            if not np.isfinite(z).any():
+            if not np.isfinite(_bilinear(height_nodata, row, col)).any():
                 continue
-
-            # Fallback surface: the trench floor plus the depth that was carved to
-            # make it, i.e. the ground the channel was cut from. Overwritten below
-            # wherever the raster actually carries a surface at this vertex.
-            level = z + depth_for_order(order, depth_by_order, depth_scale)
 
             ri, ci = _nearest_idx(plan, xy)
             lake_at = wg.lake_id[ri, ci].astype(np.int64)
             spans, st = _runs_of_lake(lake_at)
             for k in span_stats:
                 span_stats[k] += st[k]
-
-            # Inside a lake, the authored lake surface wins over bed+raise: the lake's
-            # NVE `hoyde` is real data and the raise is a synthetic constant, so a
-            # through-line must not disagree with the pool it crosses.
-            for a, b, lid in spans:
-                h = lake_hoyde.get(int(lid))
-                if h is not None and np.isfinite(h):
-                    level[a:b + 1] = float(h)
-
-            # Then, wherever the raster actually carries water at this vertex's pixel,
-            # take ITS value verbatim. The raster is the display authority; this makes
-            # the two products identical instead of independently derived, and it picks
-            # up the adjacent-to-lake pinning that bed+raise cannot know about.
-            if ws is not None:
-                # INDEX FIRST, convert after. `np.asarray(ws, dtype=np.float64)`
-                # here would rebuild the ENTIRE surface grid as float64 — 537 MB
-                # on an 8193² export — allocate it, convert it, read a few hundred
-                # values out of it, and throw it away. Once per segment. On Lierne
-                # (87k segments) that one conversion was 90% of the whole
-                # post-processing run: 1075 s of the 1185 s total. Selecting the
-                # vertices first and converting those is identical arithmetic on
-                # a few hundred elements instead of 67 million.
-                ras = ws[ri, ci].astype(np.float64)
-                take = np.isfinite(ras)
-                level[take] = ras[take]
 
             segments.append(RiverSegment(
                 seg_id=len(segments),
@@ -465,8 +428,8 @@ def build_river_network(
                 geom_hash=geometry_hash(xy),
                 order=int(order),
                 xy=xy,
-                z=z.astype(np.float32),
-                level=level.astype(np.float32),
+                z=None,
+                level=None,
                 strekn_lnr=seg.strekn_lnr,
                 elvid=seg.elvid,
                 vassdragsnr=seg.vassdragsnr,
@@ -477,6 +440,111 @@ def build_river_network(
     if progress:
         progress(1.0, f"linking {len(segments):,} segments")
     _link_segments(segments, tol_m=ENDPOINT_TOL_CELLS * plan.spacing_m)
+    return TracedNetwork(segments=segments, stride_m=stride, clip=clip,
+                         span_stats=span_stats)
+
+
+def build_river_network(
+    plan: core.GridPlan,
+    feats: kvwater.WaterFeatures,
+    wg: kvwater.WaterGrid,
+    height_leaf: np.ndarray,
+    *,
+    water_surface: Optional[np.ndarray] = None,
+    vertex_stride_m: Optional[float] = None,
+    depth_by_order: Optional[dict] = None,
+    depth_scale: float = 1.0,
+    traced: Optional[TracedNetwork] = None,
+    progress: Optional[Callable[[float, str], None]] = None,
+) -> RiverNetwork:
+    """
+    Turn the elvenett polylines into the serialisable network: densified, Z-sampled,
+    connected, clipped at lake boundaries, validated.
+
+    `traced` is the geometry from `trace_river_network`; without it the trace is
+    run here, which is what every caller did before the two were split.
+
+    `height_leaf` must be the LEAF DTM the surface raster was built against, so the
+    polyline `z` (the bed) matches the bed the raster used.
+
+    `water_surface` is the COMBINED raster surface field. When supplied, each
+    vertex's `level` is read straight out of it, which makes polyline/raster
+    agreement exact rather than merely close. Recomputing `bed + raise`
+    independently is not good enough: the raster applies rules the recomputation
+    would miss — most importantly it pins river pixels ADJACENT to a lake to that
+    lake's surface, so a vertex near an inlet would otherwise carry `bed + raise`
+    while the raster carried the lake's `hoyde`. On steep inlet banks that is a
+    100 m+ disagreement on the handful of vertices that matter most, since they
+    are precisely where the burn hands off to the lake basin.
+
+    Without `water_surface` the function falls back to `bed + carve depth` plus
+    lake-span pinning, which is correct in the interior and wrong only at those
+    boundaries.
+    """
+    depth_by_order = depth_by_order or DEFAULT_RIVER_DEPTH_BY_ORDER
+
+    SY, SX = plan.samples_y, plan.samples_x
+    if height_leaf.shape != (SY, SX):
+        raise ValueError(f"height_leaf {height_leaf.shape} != grid {(SY, SX)}")
+
+    if traced is None:
+        traced = trace_river_network(plan, feats, wg, height_leaf,
+                                     vertex_stride_m=vertex_stride_m,
+                                     progress=progress)
+    segments = traced.segments
+    stride, clip, span_stats = traced.stride_m, traced.clip, traced.span_stats
+
+    # Resolved level, not the raw NVE field: a polyline crossing a lake whose level
+    # was estimated must be pinned to that same level, or the polyline and the
+    # surface raster disagree at exactly the inlet/outlet the burn hands off at.
+    lake_hoyde = {lid: wg.lake_level(info)
+                  for lid, info in (wg.lake_table or {}).items()}
+
+    ws = None if water_surface is None else np.asarray(water_surface)
+
+    for s in segments:
+        xy = s.xy
+        row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
+        z = _bilinear(height_leaf, row, col)
+        # Nodata bed samples along the channel are interpolated from their finite
+        # neighbours rather than dropped — a hole in the middle of a polyline would
+        # otherwise break the burn's running minimum.
+        z = _fill_nan_1d(z)
+
+        # Fallback surface: the trench floor plus the depth that was carved to
+        # make it, i.e. the ground the channel was cut from. Overwritten below
+        # wherever the raster actually carries a surface at this vertex.
+        level = z + depth_for_order(s.order, depth_by_order, depth_scale)
+
+        # Inside a lake, the authored lake surface wins over bed+raise: the lake's
+        # NVE `hoyde` is real data and the raise is a synthetic constant, so a
+        # through-line must not disagree with the pool it crosses.
+        for a, b, lid in s.lake_spans:
+            h = lake_hoyde.get(int(lid))
+            if h is not None and np.isfinite(h):
+                level[a:b + 1] = float(h)
+
+        # Then, wherever the raster actually carries water at this vertex's pixel,
+        # take ITS value verbatim. The raster is the display authority; this makes
+        # the two products identical instead of independently derived, and it picks
+        # up the adjacent-to-lake pinning that bed+raise cannot know about.
+        if ws is not None:
+            # INDEX FIRST, convert after. `np.asarray(ws, dtype=np.float64)`
+            # here would rebuild the ENTIRE surface grid as float64 — 537 MB
+            # on an 8193² export — allocate it, convert it, read a few hundred
+            # values out of it, and throw it away. Once per segment. On Lierne
+            # (87k segments) that one conversion was 90% of the whole
+            # post-processing run: 1075 s of the 1185 s total. Selecting the
+            # vertices first and converting those is identical arithmetic on
+            # a few hundred elements instead of 67 million.
+            ri, ci = _nearest_idx(plan, xy)
+            ras = ws[ri, ci].astype(np.float64)
+            take = np.isfinite(ras)
+            level[take] = ras[take]
+
+        s.z = z.astype(np.float32)
+        s.level = level.astype(np.float32)
+
     junctions = _detect_junctions(segments, wg)
     lakes = build_lake_records(plan, wg)
 
@@ -710,9 +778,10 @@ def build_lake_records(plan: core.GridPlan, wg: kvwater.WaterGrid) -> list:
 
 def validate_descent(segments: list, tol_m: float = DESCENT_TOL_M) -> dict:
     """
-    Count vertices whose bed rises going downstream. Reported, NOT fixed: the tool
-    must not smooth or correct river Z. The runtime's running minimum during the
-    burn is what enforces descent, and it does so without inventing elevations.
+    Count vertices whose bed rises going downstream. Reported, NOT fixed here:
+    `z` is sampled, never smoothed. Descent is enforced on the terrain itself by
+    `riverbed` before the carve; bilinear sampling still reads the banks beside a
+    narrow trench, so this count does not reach zero.
     """
     rising = 0
     total = 0
@@ -754,8 +823,11 @@ def validate_descent(segments: list, tol_m: float = DESCENT_TOL_M) -> dict:
             100.0 * in_ris / in_tot) if in_tot else 0.0,
         "descent_rising_pct_open_channel": (
             100.0 * out_ris / out_tot) if out_tot else 0.0,
-        "descent_note": "reported only; not corrected. The runtime burn's "
-                        "running-minimum enforces descent.",
+        "descent_note": "reported from bilinearly sampled z. With the downhill "
+                        "river bed on, descent is enforced on the terrain along each "
+                        "polyline's own samples (water_surface.river_bathymetry."
+                        "downhill_bed.pixel_*); the bilinear samples also read the "
+                        "banks, so this does not reach zero.",
     }
 
 
@@ -993,6 +1065,13 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
                 "this export actually used.",
         "lakes": net.lakes,
     }
+    # Only described when used, so an export with the correction off stays
+    # byte-identical to one made before the correction existed.
+    if any(l.get("level_source") == kvwater.LEVEL_SOURCE_CORRECTED for l in net.lakes):
+        doc["level_sources"][kvwater.LEVEL_SOURCE_CORRECTED] = (
+            "NVE publishes a hoyde, but it stands more than the configured margin "
+            "above practically all the land around the lake, so it was replaced by "
+            "the same DTM estimate. `hoyde_moh` still holds the published value.")
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)
     return {"file": os.path.basename(path), "count": len(net.lakes),
@@ -1000,7 +1079,10 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
                 1 for l in net.lakes if l.get("authored_level_m") is not None),
             "with_estimated_level": sum(
                 1 for l in net.lakes
-                if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED)}
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_ESTIMATED),
+            "with_corrected_level": sum(
+                1 for l in net.lakes
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_CORRECTED)}
 
 
 def write_junctions_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:

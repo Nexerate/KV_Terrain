@@ -1,11 +1,14 @@
 # Water Redesign — Exporter Design Document
 
-> **STATUS: NOT IMPLEMENTED. DESIGN ONLY (2026-09-17).**
+> **STATUS: FIRST MILESTONE IMPLEMENTED (2026-09-17); THE REST IS DESIGN ONLY.**
 >
-> Nothing below exists in code. The exporter that runs today is the pipeline in
-> `kvterrain/process.py` and documented in `readme.md`, producing `heights.atlas`,
-> `surface.atlas`, `water_id.atlas`, `rivers.bin`, `lakes.json` and `junctions.json`. Stage names,
-> files and formats below are PROPOSALS.
+> Implemented, on branch `water/hierarchy`: §4.1 downhill-only river bed, §4.2 depression
+> hierarchy (node table and labels), §4.4 lake matching and the audit (without catchment), and
+> the `labels.atlas` / `hierarchy.bin` / `water_audit.json` exports with a `validate-hierarchy`
+> check. `readme.md` documents them as they run, including formats and Lierne numbers; where it
+> and this document differ, the readme describes the code. Each section below is marked
+> IMPLEMENTED, PARTLY IMPLEMENTED or NOT IMPLEMENTED. Everything unmarked or marked not
+> implemented is a PROPOSAL.
 >
 > The runtime half of this design lives in the Terraform repository: `WATER_REDESIGN.md` (branch
 > `water/redesign`). Read its §1–§4 first. This document only covers what the exporter must do.
@@ -45,6 +48,40 @@ These are settled; the rest of the document is read in their light.
 
    Out of scope for now: flow-direction atlas and flat resolve (§4.3), hypsometry (§4.5), discharge
    and width (§4.6), `rivers.bin` v2, and embankment treatment (§7).
+
+5. **Edges and lake spans (owner, 2026-09-17, while implementing).** Every map-edge sample is an
+   outlet, and partially cropped lakes must not empty: the lake carve now treats the map edge as
+   shore so a cropped lake ramps back up to its level at the edge (it did not before: 26 Lierne
+   lakes were 20 m deep at the edge). The downhill running minimum is carried straight through lake
+   spans; an outlet channel that cuts a lake's rim is accepted.
+6. **Lakes stand above their spill by the outflow's depth (owner, 2026-09-17).** A spill is only
+   where a lake is stable up to; while water leaves, the lake stands higher by the depth of the
+   outflow river at the spill point, because everything leaving has to pass through there. The
+   authored level is right and guides it: each node carries `outflow_head_m` and holds water up to
+   `spill_m + outflow_head_m`.
+7. **A published level the terrain contradicts is corrected (owner, 2026-09-17).** An NVE level more
+   than 2 m above the 90th percentile of the land ringing the lake is replaced by the DTM estimate
+   before carving.
+
+### What the first milestone found (Lierne, 2026-09-17)
+
+- **Leaf pits:** 227 762 with every default on (268 466 nodes, 3.4 s). The "about 324 000" in §0.2
+  came from a looser pit definition; flats that drain are not pits here.
+- **Downhill bed:** rises along the polylines' own samples went from 21.0 % of open-channel steps to
+  1 in 3.28 M. That needed a burn along each polyline's sample path as well as the channel carve:
+  at 5 m spacing small streams rasterise to gappy masks the carve never touches.
+- **The lake carve was not watertight in 8-connectivity.** A lake sample whose only dry neighbour is
+  diagonal was carved 2.07 m deep, and the 8-connected hierarchy drained the lake through that
+  corner: about 1 580 lakes appeared to stand up to exactly 2.08 m above their spill (1 190 of them
+  "through their outflow trench", which is what prompted decision 6). With the shoreline
+  watertight, 2 173 of 2 180 lakes are consistent with their authored level and none needs the
+  outflow head on Lierne; the head is kept for lakes whose outflow does cut below the level, and
+  for derived lakes at runtime.
+- **Level correction:** 46 published levels corrected (median 8.0 m, max 14.0 m), all consistent
+  with the hierarchy afterwards.
+- **Remaining findings:** 4 lakes above spill + head, 3 504 river pits of 0.5 m or more, 1 493
+  rivers leaving their corridor, 796 unexplained depressions (plus 374 that fill into an authored
+  lake and are not listed).
 
 ---
 
@@ -127,6 +164,10 @@ are packed (17). Any step that touches heights after 11 invalidates it.
 
 ### 4.1 Monotone river bed
 
+**IMPLEMENTED** (`kvterrain/riverbed.py`, `--downhill-river-bed`). As designed, plus a burn along
+each polyline's own 8-connected sample path after the carve, and the carve pulls samples toward
+the downhill bed rather than cutting extra depth from each sample's ground.
+
 The runtime currently enforces descent itself: `rivernet` reports non-monotonic descent and
 leaves the running minimum to the runtime burn. Under the redesign there is no runtime burn, so
 the enforcement moves here.
@@ -143,6 +184,10 @@ the enforcement moves here.
   clamp it to never rise downstream either.
 
 ### 4.2 Priority-Flood and the depression hierarchy
+
+**IMPLEMENTED** except `catchment_m2` and `hypso` (they need §4.3 and §4.5), plus `outflow_head_m`
+(decision 6). Node layout, ids and flags are in `readme.md`. Every edge sample is an outlet; merges
+happen during the flood.
 
 Build Barnes' depression hierarchy (Barnes, Callaghan & Wickert 2020) on the carved lattice.
 
@@ -182,6 +227,8 @@ for them, and mark nodes below a depth/area threshold as never-displayed.
 
 ### 4.3 Flow directions and accumulation
 
+**NOT IMPLEMENTED.**
+
 - D8 directions on the carved terrain, with flats resolved (Garbrecht & Martz 1997, or Barnes'
   improved flat resolution). A flat resolve was declined for the **runtime** because it was costly
   and the pools already produce the partition; offline it is cheap and the runtime walks need a
@@ -195,6 +242,9 @@ for them, and mark nodes below a depth/area threshold as never-displayed.
   majority vote.
 
 ### 4.4 Matching authored water, and the audit
+
+**PARTLY IMPLEMENTED.** Lakes and rivers as described (rivers by steepest descent on the packed
+heights). Unexplained depressions are geometric only: no catchment filter until §4.3.
 
 **Lakes.** For each authored lake, find the node whose cells best cover its rasterised mask at its
 authored level. Check:
@@ -218,6 +268,8 @@ page, like the existing lake-level breakdown and network validation.
 
 ### 4.5 Hypsometry
 
+**NOT IMPLEMENTED.**
+
 For each node large enough to hold a visible lake: a cumulative area-by-elevation curve from
 `floor_m` to `spill_m`, including its descendants' cells. This lets the runtime solve
 `L = min(spill, Area⁻¹(Q / E))` with a lookup.
@@ -229,6 +281,8 @@ For each node large enough to hold a visible lake: a cumulative area-by-elevatio
   (`bed_is_carved`).
 
 ### 4.6 Discharge and width
+
+**NOT IMPLEMENTED.**
 
 Elvenett has no width or discharge; today width is a heuristic on Strahler order.
 
@@ -244,6 +298,10 @@ Elvenett has no width or discharge; today width is a heuristic on Strahler order
 ---
 
 ## 5. Export format additions (sketch)
+
+**PARTLY IMPLEMENTED:** `labels.atlas`, `hierarchy.bin` (node table only, no hypsometry blob),
+`water_audit.json`, and the manifest's hierarchy/label descriptors and per-atlas bytes per sample.
+The rest of the table is not implemented.
 
 | File | Contents |
 |---|---|
@@ -262,6 +320,10 @@ agree.
 ---
 
 ## 6. Testing
+
+**PARTLY IMPLEMENTED** (`tests/`): synthetic bowls, saddles, flats, cropped bowls and a river
+through a pit, and the brute-force comparison. The round trip against `surface.atlas` and the
+in-place update prototype are not done.
 
 - **Synthetic worlds** (demo mode already exists): a bowl with a known spill level, two bowls
   merging at a known saddle, a river through a pit, a flat, an embankment with a culvert. Assert

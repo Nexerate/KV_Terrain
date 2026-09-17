@@ -41,9 +41,10 @@ class and identity are merged into one u16:
     THIS                  =              2 bytes/sample
 
 and, more valuably, 2 bytes/sample is exactly what the height and surface atlases
-use. So `core.atlas_*` needs no generalisation beyond its hardcoded 2 bytes, and
-a water-id tile sits at the IDENTICAL byte offset as its height and surface
-twins: three file handles, one offset computation, no format-contract change.
+use, so a water-id tile sits at the IDENTICAL byte offset as its height and
+surface twins: one offset computation for all three. (`core.atlas_*` later gained
+a bytes-per-sample parameter for the 4-byte `labels.atlas`; its default of 2 is
+this atlas's.)
 
 This is a deliberate deviation from the letter of the spec'd uint8 enum. It
 satisfies every stated USE of that enum and adds the identity the pin requires.

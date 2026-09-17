@@ -15,9 +15,13 @@ authored lake identity). Beside them go the river network as polylines
 (`junctions.json`). Depth is `max(0, water_surface − terrain)` — no rim
 reconstruction, no seed-fill.
 
-> **Planned, not implemented:** a redesign of the water exports around a
-> depression hierarchy is described in [`WATER_REDESIGN.md`](WATER_REDESIGN.md).
-> Everything in this readme describes the tool as it runs today.
+> **Water redesign, first milestone implemented (2026-09-17):** the river bed is
+> enforced downhill, and every export now carries a depression hierarchy
+> (`hierarchy.bin`, `labels.atlas`) and a water audit (`water_audit.json`) — see
+> [Depression hierarchy and water audit](#depression-hierarchy-and-water-audit).
+> The rest of the redesign (flow directions, hypsometry, discharge, `rivers.bin`
+> v2) is still design only, in [`WATER_REDESIGN.md`](WATER_REDESIGN.md). This
+> readme describes the tool as it runs today.
 
 Height data © Kartverket, licensed **CC BY 4.0**. Water data © **NVE** (Elvenett /
 Innsjødatabase). Attribute "© Kartverket" and "© NVE" in anything you ship.
@@ -51,9 +55,17 @@ the servers returned it, plus the raw NVE vectors that intersect it. Nothing in
 it has been carved, rasterised, repaired or packed. Fetch Lierne once, then carve
 it twenty different ways for free.
 
-The **exported format is unchanged** — same `manifest.json`, same atlases, same
-`rivers.bin`, byte for byte. The dataset format in between is internal and ours
-to change; see [The dataset format](#the-dataset-format-intermediate).
+The split itself changed nothing in the export. The water redesign's first
+milestone then changed it on purpose: the **file formats** of `manifest.json`,
+the atlases and `rivers.bin` are unchanged (the manifest only gained keys), but
+their **content** is not byte-identical to earlier exports, because the downhill
+river bed, the lake carve's edge ramp and watertight shoreline, and the correction
+of contradicted lake levels change `heights.atlas` and everything carved from it.
+Three new files sit beside the old ones. With `--no-downhill-river-bed
+--no-lake-edge-is-shore --no-lake-shore-8-connected --no-hierarchy
+--no-correct-lake-levels` every pre-existing file comes out byte for byte as
+before (checked on Lierne). The dataset format in between is internal
+and ours to change; see [The dataset format](#the-dataset-format-intermediate).
 
 The Streamlit app is one process with three pages — **Fetch**, **Process**, and
 **Exports** (open a finished export and check it holds together) — and the CLI
@@ -73,7 +85,13 @@ out/
   rivers.bin        river network polylines                     (water only)
   lakes.json        one record per authored lake                (water only)
   junctions.json    where rivers enter and leave lakes          (water only)
+  labels.atlas      u32 depression label per sample, same tiling (hierarchy)
+  hierarchy.bin     depression hierarchy node table             (hierarchy)
+  water_audit.json  authored water checked against the hierarchy (hierarchy)
 ```
+
+The last three are written when water is processed and `--hierarchy` is on (the
+default).
 
 ### The dense atlas format (`dense_v1`)
 
@@ -84,15 +102,18 @@ format contract, and the runtime must match them exactly.
 
 ```
 tile_samples        = tile_cells + 1                       (default 129)
-tileBytes           = tile_samples * tile_samples * 2
+tileBytes           = tile_samples * tile_samples * bytesPerSample
 tilesX(L), tilesY(L) = max(1, leaf_tiles >> L)
 levelByteBase(L)    = tileBytes * Σ_{l<L} tilesX(l) * tilesY(l)
 tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes
 ```
 
-Levels ascend (L0 finest first); tiles within a level are row-major. All three
-atlases use **2 bytes per sample**, so a tile sits at the **identical byte offset**
-in each of them: three file handles, one offset computation. Offsets exceed 32
+Levels ascend (L0 finest first); tiles within a level are row-major. Bytes per
+sample is recorded per file in `manifest.atlas.bytes_per_sample`. `heights`,
+`surface` and `water_id` are **2 bytes per sample**, so a tile sits at the
+**identical byte offset** in each of them. `labels.atlas` is **4 bytes per
+sample**: its tiles are at the same **tile index** but at twice the byte offset.
+The `core.atlas_*` helpers take `bytes_per_sample` (default 2). Offsets exceed 32
 bits on real exports, so use 64-bit arithmetic. Every atlas's size is checked
 against `atlas_total_bytes` when it is written.
 
@@ -134,6 +155,13 @@ sample `(i,j)` of tile `(L,x,y)` is the same world point in every one of them.
 pip install -r requirements.txt
 ```
 
+`numba` (for the depression hierarchy) is in there. For the tests:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
 ### The UI
 
 ```bash
@@ -167,7 +195,10 @@ what NVE vectors came with it. After a run you get, as pictures:
 | Water surface | how the level runs along a river and across a lake |
 | Ground changed (`fetched − processed`) | signed: blue removed by the carves, orange added by the lake void repair and the shoreline snap |
 
-…plus a **detail inspector** at native resolution (the overview panels are
+…plus a **Water audit** tab (the hierarchy's size, lake and river findings on a
+map, and the tables behind them — see
+[Depression hierarchy and water audit](#depression-hierarchy-and-water-audit)), a
+**detail inspector** at native resolution (the overview panels are
 strided down, and a shoreline judged from a 900-px thumbnail of a 4097-px lattice
 is not judged), the lake-level breakdown, the advisory network validation, and
 stage timings.
@@ -219,8 +250,11 @@ else is a `process` flag and is free to re-run: `--river-width-scale`,
 `--lake-shore-slope` (default **1.0**, how fast it gets there, in metres of depth
 per metre of shore), `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
-`--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair. `build` accepts
-both sets.
+`--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
+`--(no-)correct-lake-levels` with `--lake-level-max-above-shore` (default 2 m), and
+the water-redesign switches `--(no-)downhill-river-bed`, `--(no-)lake-edge-is-shore`,
+`--(no-)lake-shore-8-connected` and `--(no-)hierarchy` (all on by default). `build`
+accepts both sets.
 
 `--tile-cells` is the one that straddles the line: `fetch` needs one to pad the
 region out to whole power-of-two tiles, but the padded lattice supports every
@@ -284,7 +318,7 @@ and the layout, so a reader never has to guess.
   a process-time choice (`dataset.Lattice.valid_tile_cells`).
 
 * **Nothing here is a Unity product.** The final format is produced only by
-  `kvterrain.process` and is unchanged.
+  `kvterrain.process`.
 
 * **`runs.jsonl` remembers what you tried.** `process` overwrites its output in
   place, so the export only ever carries the LAST run's settings. The log lives
@@ -347,6 +381,7 @@ Three checks, shared with the CLI so the two cannot drift:
 | --- | --- | --- |
 | dense atlases: exact size, sampled offsets land on full tiles | `validate-atlas` | no |
 | `rivers.bin` walks cleanly, links resolve, junctions name real lakes, `water_id` is dense | `validate-water` | no |
+| `hierarchy.bin` is a well-formed tree whose codes, saddles and counts agree with `heights.atlas` and `labels.atlas`; every coarse label level recomputes exactly | `validate-hierarchy` | no |
 | packed heights vs Kartverket's point API | `validate` | **yes** |
 
 One caveat on the last one, and it is a big one on a water-heavy export: the
@@ -360,6 +395,7 @@ a 10 m Grong export that is 0.26 m, while the all-sample median is dragged to
 ```bash
 python -m kvterrain.cli validate-atlas  --out ./exports/lierne
 python -m kvterrain.cli validate-water  --out ./exports/lierne
+python -m kvterrain.cli validate-hierarchy --out ./exports/lierne
 python -m kvterrain.cli validate        --out ./exports/lierne --n 12
 ```
 
@@ -467,12 +503,22 @@ Where the surface comes from:
 
 - **Lakes:** the lake's resolved level, stamped on every one of its pixels (flat),
   and stored per lake in `lakes.json` as `authored_level_m`.
-  **NVE `hoyde` is used exactly as published** wherever it exists — it is the
-  lake's authored level, and the DTM gets no vote on it. (It is worth being
-  explicit: the DTM is one flight's snapshot of where the water was that day, so on
-  a regulated lake it can sit metres below the level the place actually has.
-  Second-guessing `hoyde` against it drags recognisable lakes down and pulls their
-  shorelines inland.)
+  **NVE `hoyde` is used as published** wherever it exists — it is the lake's
+  authored level, and the DTM gets no vote on it. (It is worth being explicit: the
+  DTM is one flight's snapshot of where the water was that day, so on a regulated
+  lake it can sit metres below the level the place actually has. Second-guessing
+  `hoyde` against it drags recognisable lakes down and pulls their shorelines
+  inland.) **The one exception is a `hoyde` the terrain flatly contradicts:** one
+  standing more than `--lake-level-max-above-shore` (default **2 m**) above the
+  **90th percentile of the land ring** just outside the polygon is above
+  practically all of the lake's shore, which no lake can be. Such a level is
+  replaced by the DTM estimate below (`level_source = dtm_corrected`, the published
+  value kept in `hoyde_moh`), before anything is carved from it. A drawn-down
+  reservoir is not caught, because its shore rises above its real level (the 12
+  largest Lierne lakes all sit at or below their ring). On Lierne 46 levels are
+  corrected, mostly small unnamed ponds, by a median 8.0 m and at most 14.0 m;
+  the manifest's `water_surface.lake_levels.correction.lakes` lists each one.
+  `--no-correct-lake-levels` turns the check off.
   `hoyde` very often does not exist, though (25% of lake records in a Lierne
   export, 11% in a Krøderen one). Those lakes get a level read off the **LiDAR
   water surface inside the polygon**: the mean of its 1st–25th percentile band —
@@ -483,8 +529,8 @@ Where the surface comes from:
   `--no-estimate-lake-levels` turns the estimate off (those lakes are then left
   uncarved rather than guessed at); `--no-lake-perimeter-cap` turns off the cap.
   `lakes.json` carries the level used as `authored_level_m` and its provenance as
-  `level_source` (`nve_hoyde` or `dtm_interior_low`); the raw NVE field stays
-  visible, and null, as `hoyde_moh`.
+  `level_source` (`nve_hoyde`, `dtm_interior_low` or `dtm_corrected`); the raw NVE
+  field stays visible (null where NVE has none) as `hoyde_moh`.
 - **Rivers:** Elvenett has no elevation, so the surface is the **terrain height
   under the channel's own centreline**, sampled from the leaf DTM before any carve
   and spread flat across the samples that centreline seeded. So a river surface is
@@ -529,6 +575,38 @@ and leaves the water surface where the ground is:
   to nothing at twice that, so terrain that will never hold water — a bank, a cliff
   face the buffer lapped onto — is left alone rather than notched.
 
+- **Downhill-only river bed** (`--downhill-river-bed`, on by default). Before the
+  river carve, each densified polyline's bed and water level are replaced by
+  their running minimum going downstream, separately (so a bigger stream order
+  downstream cannot raise the surface), carried across `downstream` links and
+  straight through lake spans. The lowered level becomes the river surface; the
+  carve pulls each channel sample toward the lowered bed with its usual
+  cross-section and bank taper, never below it. At 5 m spacing a 2–3 m stream
+  rasterises to a gappy mask, so a second pass then walks every polyline's own
+  8-connected sample path and lowers it to the running minimum of the carved bed
+  (lake samples carry the minimum but are left to the lake carve). An outlet
+  channel lower than a lake's inflow may therefore cut the lake's rim — accepted
+  (owner's decision, 2026-09-17). On Lierne: the level and bed were lowered at
+  1.45 M of 4.48 M vertices (median 0.07 m, max 59 m); rises along the polylines'
+  own samples went from 21.0 % of open-channel steps to 1 step in 3.28 M.
+- **Lakes ramp up at the map edge** (`--lake-edge-is-shore`, on by default). The
+  lake carve's distance-to-shore used to see only shore inside the array, so a
+  lake the export boundary cuts through was at full depth right at the edge
+  (Lierne: 26 lakes, 3 796 edge samples, median 20.0 m). Every edge sample is an
+  outlet in the depression hierarchy, so such a lake would drain off the map
+  through its own floor. The map edge now counts as shore: the bed ramps back up
+  to the waterline there (Lierne: median 0.005 m at the edge).
+- **Lake shorelines are watertight diagonally** (`--lake-shore-8-connected`, on by
+  default). The ramp is measured with a Euclidean distance, so the zero-depth
+  waterline sat only on samples with a dry 4-neighbour; a sample whose only dry
+  neighbour is diagonal is √2 cells from shore and was carved 2.07 m deep. The
+  depression hierarchy is 8-connected, so wherever that diagonal ground lies below
+  the lake level the lake drained through the corner. On Lierne that single
+  artefact was behind about 1 580 of the lakes the audit had standing above their
+  spill, each by up to exactly 2.08 m. Every lake sample with any dry 8-neighbour
+  now sits on the waterline, and lake bodies for the minimum-depth floor are
+  8-connected too, so a diagonal sliver is not stepped 2 m deep at the shore.
+
 Neither carve is surveyed bathymetry; both exist to give the renderer enough depth
 to read opaque. (If your engine compresses height, e.g. 1:5, size them so they still
 clear your opaque threshold after compression: 20 m → 4 units at 1:5.)
@@ -552,6 +630,113 @@ the surface again wherever the island stands above the water. Without this, the
 half-texel misalignment between a hole boundary and the sample lattice leaves a
 one-texel dry moat around every island. `--keep-lake-holes` restores the old
 behaviour.
+
+### Depression hierarchy and water audit
+
+WATER_REDESIGN.md §4.2 and §4.4, first milestone. Built by `process` when water
+is processed and `--hierarchy` is on (the default); `kvterrain/hierarchy.py` and
+`kvterrain/wateraudit.py`.
+
+**The hierarchy is built on `heights.atlas` level 0 as packed** — the u16 codes,
+not the floats. Unpacking is monotone, so this is exactly the hierarchy a reader
+of the atlas gets, and every stored `floor_code` / `spill_code` compares exactly
+against it. Nothing may touch the heights after it is built.
+
+- **Pits** are maximal 8-connected sets of equal-code samples with no strictly
+  lower neighbour and no map-edge sample. A flat that drains anywhere is not a pit
+  (one code step is ~1.5 cm on Lierne, so flats are everywhere).
+- **Priority-Flood** (Numba; one FIFO bucket per code, seeded with every pit and
+  every edge sample in raster order) labels each sample with the pit it drains
+  into. The first time two regions touch across already-flooded samples is their
+  lowest saddle, so merges happen during the flood with a union-find (Barnes,
+  Callaghan & Wickert 2020, implemented from scratch).
+- **Every map-edge sample is an outlet** into the root, node 0 ("off the map"):
+  an inland export has no other sensible choice. Cropped lakes are protected by
+  the lake edge ramp above.
+- Lierne (8193², 5 m), all defaults: 227 762 leaves, 268 466 nodes, 3.4 s for the
+  hierarchy, under a second for `validate-hierarchy`. The design doc's "about
+  324 000 leaf pits" was measured with a looser pit definition; with every
+  redesign switch but the hierarchy off, this definition gives 250 304.
+
+**`hierarchy.bin`** — a 40-byte header (`KVDEPH01`, version, header_bytes,
+record_bytes, node_count, leaf_count, samples_x, samples_y, connectivity = 8) and
+one 52-byte little-endian record per node:
+
+| offset | field | type | meaning |
+| ---: | --- | --- | --- |
+| 0 | `parent` | u32 | `0xFFFFFFFF` on the root |
+| 4 | `overflow_to` | u32 | the node across the saddle when it merged (its sibling); 0 for children of the root |
+| 8 | `floor_cell` | u32 | lowest sample; cell index = row × samples_x + col, row 0 north |
+| 12 | `spill_cell` | u32 | the sample on this node's side of its lowest saddle |
+| 16 | `outlet_cell` | u32 | the neighbour across that saddle |
+| 20 | `cell_count` | u32 | samples labelled with this node (leaves and root only) |
+| 24 | `subtree_cells` | u32 | samples in its subtree; area = × spacing² |
+| 28 | `floor_code` | u16 | exact, in `heights.atlas` units |
+| 30 | `spill_code` | u16 | max of the codes at `spill_cell` and `outlet_cell` |
+| 32 | `floor_m` | f32 | |
+| 36 | `spill_m` | f32 | NaN on the root |
+| 40 | `authored_level_m` | f32 | the matched lake's level, NaN if none |
+| 44 | `lake_id` | u16 | `lakes.json` lake id, 0 = none |
+| 46 | `flags` | u16 | leaf, has_spill, spills_off_map, outlet_ocean, authored_lake, minor |
+| 48 | `outflow_head_m` | f32 | depth the outflow river carries over the spill; the node holds water up to `spill_m + outflow_head_m` |
+
+Ids: 0 root, 1…leaf_count leaves (raster order of their first sample), then
+internal nodes in merge order, so every parent id is greater than its child's
+except under the root and ascending ids walk the tree bottom-up. Readers must take
+`record_bytes` from the header so fields can be appended later. `minor` marks
+nodes shallower than 0.5 m or smaller than 250 m² (kept in the tree, not worth
+displaying). `manifest.hierarchy` repeats the layout, the flag bits and the
+thresholds.
+
+**`labels.atlas`** — little-endian **u32**, 4 bytes per sample: the leaf the
+sample drains into, 0 for samples that drain straight off the map. Coarse levels
+take the label of the **lowest child** (by that level's `heights.atlas` code) in
+the same corner-anchored 3×3 gather `water_id` uses, ties to the lower label, so
+the whole pyramid can be recomputed from the export alone — which
+`validate-hierarchy` does.
+
+**`water_audit.json`** — the authored water checked against the hierarchy, with
+UTM coordinates. A summary also goes into `manifest.water_audit`.
+
+- **Lakes.** From the leaf under most of the lake's mask, climb the tree through
+  every node spilling below the lake's level (or at it, within tolerance); at each
+  node the pool up to `min(level, spill)` is flooded and compared with the mask,
+  and the best overlap is the lake's node (written into `hierarchy.bin`). Status:
+  - `ok` — the level is at or below the node's spill (tolerance 0.05 m plus one
+    height step);
+  - `held_by_outflow` — above the spill, but within the **outflow head** (below);
+  - `level_above_spill` — above spill + head, with `excess_m` measured from
+    there, the spill location and `spill_through`: `river_channel`, `land`,
+    `other_lake` or `map_edge`;
+  - `below_spill_regulated` (report only), `no_node`, `no_level`.
+- **Rivers.** Steepest descent on the packed heights from each segment's first
+  open-channel vertex (no flow-direction atlas yet). A walk that gets within two
+  samples of a lake has reached it. Findings: `pit` (listed from 0.5 m deep,
+  shallower ones counted) and `leaves_corridor`.
+- **Unexplained depressions.** Deep (≥ 2 m), large (≥ 5 000 m²), no lake in or
+  around them, outermost only, ranked by area × depth. One that spills into a
+  matched lake at or below that lake's level joins the lake (typically an inflow
+  trench carved below the lake level) and is only counted. Geometric only until
+  catchment areas exist.
+
+**Outflow head.** A spill is only the level a lake is *stable* up to. While water
+leaves through its outflow river, the lake stands higher by the river's depth at
+the spill point, because everything leaving has to pass through there. Each node
+therefore carries `outflow_head_m`, the exported river surface at its spill
+minus the spill (0 where the spill is on land), and holds water up to
+`spill_m + outflow_head_m`. The authored level is taken as right: a matched lake
+standing within that head gets its node's head raised to `authored_level_m −
+spill_m`, so the node reproduces it exactly.
+
+**Lierne, all defaults:** 2 173 of 2 180 lakes `ok`, 1 regulated, 2 with no
+node, 4 above spill + head (two by 5 m and 9 m over land, two over a neighbouring
+lake at a different level). None needed the outflow head once the shoreline was
+watertight: the ~1 190 lakes that earlier looked held by their outflow were
+leaking through diagonal shore corners (see [The carves](#the-carves)). River
+pits ≥ 0.5 m: 3 504 (34 445 shallower); rivers leaving their corridor: 1 493;
+unexplained depressions: 796, plus 374 that join a lake. For comparison, with
+the downhill bed off (and before the shoreline fix) there were 8 416 river pits
+and 878 depressions.
 
 ### Design decisions worth knowing
 
@@ -663,7 +848,8 @@ and offsets, so the same placement logic applies.
   corrected**: the alternative — pulling `hoyde` down to the DTM — is metres wrong
   on any regulated lake, where the flight caught the reservoir drawn down. A
   sub-metre shore ring is the cheaper error, and the first texel of the shore ramp
-  feathers it.
+  feathers it. Only a `hoyde` more than 2 m above practically the whole shore is
+  corrected (see [Water surface](#water-surface-surfaceatlas)).
 
 ---
 
@@ -679,9 +865,10 @@ and offsets, so the same placement logic applies.
   and which tilings it supports), `Dataset` (read one), `write` (write one),
   `list_datasets`, plus the municipality name suggestion.
 - `kvterrain/process.py` — **stage two**. The whole post-fetch sequence —
-  rasterise, repair, snap, resolve levels, river surface, carve, pyramid, water
-  id, polylines, pack — with staged progress and per-stage timings. This is
-  `core.run_export`'s old second half, unmoved and unchanged in behaviour.
+  rasterise, repair, snap, resolve levels, river surface, trace rivers and
+  enforce the downhill bed, carve, pyramid, water id, polylines, depression
+  hierarchy, audit, pack — with staged progress and per-stage timings. It began
+  as `core.run_export`'s second half.
 - `kvterrain/exports.py` — the only module that opens a finished export from the
   OUTSIDE: reassembles a pyramid level from an atlas by computed byte offset,
   unpacks it, and holds the three checks (`check_atlas`, `check_water`,
@@ -707,14 +894,29 @@ and offsets, so the same placement logic applies.
   (lakes = `hoyde`, rivers = the levelled channel ground) and packs `surface.atlas`.
 - `kvterrain/waterid.py` — per-pixel class + authored lake identity, packed into
   `water_id.atlas`.
-- `kvterrain/rivernet.py` — the polyline network: connectivity, junctions,
-  validation, `rivers.bin` / `lakes.json` / `junctions.json`.
+- `kvterrain/rivernet.py` — the polyline network: tracing (densify, clip, order,
+  lake spans, links) and sampling as two passes, junctions, validation,
+  `rivers.bin` / `lakes.json` / `junctions.json`.
+- `kvterrain/riverbed.py` — the downhill-only river bed: running minimums over
+  the traced network, spread over each channel, and the burn along each
+  polyline's sample path.
+- `kvterrain/hierarchy.py` — the depression hierarchy (Numba Priority-Flood),
+  the label pyramid, `hierarchy.bin` and `labels.atlas`.
+- `kvterrain/wateraudit.py` — lakes matched to nodes, river walks, unexplained
+  depressions; `water_audit.json`.
 - `kvterrain/preview.py` — hillshade, hypsometric, depth, signed-delta and water
   ramps; the dataset thumbnail. Presentation only, numpy + Pillow, no matplotlib.
 - `kvterrain/cli.py` — `fetch`, `datasets`, `process`, `build`, `validate`,
-  `validate-atlas`, `validate-water`, `describe-services`. The three `validate*`
+  `validate-atlas`, `validate-water`, `validate-hierarchy`, `describe-services`. The three `validate*`
   commands print reports that `exports.py` produces, so the CLI and the UI check
   exactly the same things.
+
+**Tests**
+
+- `tests/` — pytest: synthetic hierarchy worlds with known answers, the hierarchy
+  against brute force on random fields full of ties, the downhill bed (including
+  a river through a pit), atlas and file round trips, and a small end-to-end
+  export read back through every check.
 
 **The UI**
 
@@ -742,13 +944,16 @@ and offsets, so the same placement logic applies.
   slope every lake deeper than four texels from its bank is at `--lake-max-depth`.
   If you want small lakes shallower, lower that; `--lake-min-depth` is only the
   floor for bodies too small to ramp at all.
-- **River surfaces are not forced to descend.** A river's level is the uncarved
-  ground under its centreline, measured, never fitted (see `channel_level`), so DTM
-  noise can make it step UP going downstream. `rivers.bin` reports this rather
-  than fixing it: on the Lierne export 10.5% of open-channel vertex steps rise, in
-  65 395 of 87 126 segments, worst 4.8 m (`water_vector.validation.descent_*` in
-  the manifest). Enforcing descent is left to the runtime's running minimum when
-  it burns the polylines.
+- **River descent is enforced on the terrain, and `rivers.bin` still reports
+  rises.** With `--downhill-river-bed` (the default) the bed and level never rise
+  along a polyline's own samples (see [The carves](#the-carves)). The
+  `water_vector.validation.descent_*` numbers sample `z` BILINEARLY, which also
+  reads the banks beside a narrow trench, so they do not reach zero: on Lierne
+  open-channel rises went from 10.5 % to 4.5 %, and the worst from 4.8 m to 14.1 m
+  where a deepened trench sits beside its bank. With `--no-downhill-river-bed` the
+  level is the measured ground under the centreline and DTM noise makes it step
+  up, as before. The downhill bed also cuts through anything a mapped channel
+  crosses — a road embankment included.
 - **Confluences get no special treatment, and need none for the surface.** Every
   river sample takes the level of the NEAREST centreline sample across all
   centrelines, so tributaries meeting a trunk share one level field rather than

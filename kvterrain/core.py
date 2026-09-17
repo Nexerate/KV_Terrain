@@ -309,6 +309,8 @@ class PackResult:
     terrain_leaf: object = None     # np.ndarray | None
     water_surface: object = None    # np.ndarray | None — m.o.h., NaN off-water
     stage_seconds: dict = None      # {stage key -> seconds}, filled by process
+    hierarchy: object = None        # hierarchy.Hierarchy | None
+    water_audit: object = None      # dict (water_audit.json) | None
 
 
 def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int, int, int]:
@@ -329,7 +331,7 @@ def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int
 # GridPlan) so a consumer can recompute every offset from the manifest header  #
 # alone — no per-tile offset table is written or needed.                        #
 #                                                                              #
-#   tileBytes           = tile_samples * tile_samples * 2                       #
+#   tileBytes           = tile_samples * tile_samples * bytesPerSample          #
 #   tilesCount(l)       = tilesX(l) * tilesY(l)                                 #
 #   levelByteBase(L)    = tileBytes * Σ_{l=0}^{L-1} tilesCount(l)               #
 #   tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes    #
@@ -351,17 +353,26 @@ def tiles_at_level(leaf_tiles_x: int, leaf_tiles_y: int, level: int) -> tuple[in
             max(1, int(leaf_tiles_y) // (2 ** level)))
 
 
-def atlas_tile_bytes(tile_samples: int) -> int:
-    return int(tile_samples) * int(tile_samples) * 2
+# Every atlas this tool wrote before labels.atlas is 2 bytes per sample, and the
+# default below keeps all of them — and every existing caller — exactly as it was.
+# labels.atlas is the first 4-byte atlas: a label tile sits at the same TILE INDEX
+# as its height twin, but not at the same byte offset. The manifest records each
+# atlas's bytes per sample under `atlas.bytes_per_sample`.
+DEFAULT_BYTES_PER_SAMPLE = 2
+
+
+def atlas_tile_bytes(tile_samples: int, bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE) -> int:
+    return int(tile_samples) * int(tile_samples) * int(bytes_per_sample)
 
 
 def atlas_level_byte_bases(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> list[int]:
     """Byte offset at which each level begins (prefix sum over tile counts).
     Length == num_levels; every value is a Python int (unbounded, so no int32
     overflow — the runtime side must use a 64-bit type)."""
-    tb = atlas_tile_bytes(tile_samples)
+    tb = atlas_tile_bytes(tile_samples, bytes_per_sample)
     bases: list[int] = []
     acc = 0
     for lvl in range(int(num_levels)):
@@ -373,10 +384,11 @@ def atlas_level_byte_bases(
 
 def atlas_total_bytes(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> int:
     """Exact size a dense atlas file must have. The export self-check asserts the
     written file matches this; a mismatch means the grid wasn't dense (ragged)."""
-    tb = atlas_tile_bytes(tile_samples)
+    tb = atlas_tile_bytes(tile_samples, bytes_per_sample)
     total = 0
     for lvl in range(int(num_levels)):
         tx, ty = tiles_at_level(leaf_tiles_x, leaf_tiles_y, lvl)
@@ -387,12 +399,41 @@ def atlas_total_bytes(
 def atlas_tile_offset(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
     level: int, x: int, y: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> int:
     """Byte offset of tile (x, y) at `level` inside a dense atlas."""
     tx, _ = tiles_at_level(leaf_tiles_x, leaf_tiles_y, level)
     base = atlas_level_byte_bases(
-        leaf_tiles_x, leaf_tiles_y, num_levels, tile_samples)[level]
-    return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples)
+        leaf_tiles_x, leaf_tiles_y, num_levels, tile_samples, bytes_per_sample)[level]
+    return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples, bytes_per_sample)
+
+
+def resolve_height_range(
+    leaf: np.ndarray,
+    height_min: Optional[float] = None,
+    height_max: Optional[float] = None,
+) -> tuple[float, float]:
+    """The global [height_min, height_max] packing range for a finished leaf.
+
+    Split out of `export_tiles` because the depression hierarchy must be built on
+    the heights AS PACKED, which means knowing this range before the atlas is
+    written. Both call this, so they cannot disagree about it."""
+    finite = leaf[np.isfinite(leaf)]
+    if height_min is None:
+        height_min = float(finite.min()) if finite.size else 0.0
+    if height_max is None:
+        height_max = float(finite.max()) if finite.size else 1.0
+    if height_max <= height_min:
+        height_max = height_min + 1.0
+    return height_min, height_max
+
+
+def pack_leaf_codes(leaf: np.ndarray, height_min: float, height_max: float,
+                    nodata_fill_m: float = 0.0) -> np.ndarray:
+    """The whole leaf level as the u16 codes `export_tiles` writes, sample for
+    sample: same nodata fill, same `pack_r16`. What the runtime reads."""
+    filled = np.where(np.isfinite(leaf), leaf, np.float32(nodata_fill_m))
+    return pack_r16(filled, height_min, height_max)
 
 
 def pack_r16(value_m: np.ndarray, hmin: float, hmax: float) -> np.ndarray:
@@ -418,14 +459,7 @@ def export_tiles(
     TC = plan.tile_cells
     TS = TC + 1
 
-    leaf = levels[0]
-    finite = leaf[np.isfinite(leaf)]
-    if height_min is None:
-        height_min = float(finite.min()) if finite.size else 0.0
-    if height_max is None:
-        height_max = float(finite.max()) if finite.size else 1.0
-    if height_max <= height_min:
-        height_max = height_min + 1.0
+    height_min, height_max = resolve_height_range(levels[0], height_min, height_max)
 
     os.makedirs(out_dir, exist_ok=True)
     tiles_written = 0
@@ -484,6 +518,9 @@ def export_tiles(
             "height_file": atlas_name,
             "tile_bytes": atlas_tile_bytes(TS),
             "height_bytes": expect,
+            # Per atlas file. Every atlas before labels.atlas is 2; readers must
+            # use this, not tile_bytes, for any atlas they did not already know.
+            "bytes_per_sample": {atlas_name: DEFAULT_BYTES_PER_SAMPLE},
         },
     }
 

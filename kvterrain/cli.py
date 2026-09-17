@@ -72,6 +72,12 @@ def _water_opts(a) -> dict:
         "emit_geojson": a.emit_geojson,
         "estimate_lake_levels": a.estimate_lake_levels,
         "lake_perimeter_cap": a.lake_perimeter_cap,
+        "lake_level_max_above_shore_m": (a.lake_level_max_above_shore
+                                         if a.correct_lake_levels else None),
+        "downhill_river_bed": a.downhill_river_bed,
+        "lake_edge_is_shore": a.lake_edge_is_shore,
+        "lake_shore_8_connected": a.lake_shore_8_connected,
+        "hierarchy": a.hierarchy,
     }
     if a.river_vertex_stride is not None:
         opts["river_vertex_stride_m"] = a.river_vertex_stride
@@ -258,6 +264,11 @@ def _report_export(a, res, want_water: bool) -> None:
                   f"those capped at the surrounding terrain, max drop "
                   f"{ll.get('levels_cap_max_drop_m', 0.0):.2f} m), "
                   f"{ll['levels_unresolved']} unresolved (left uncarved)")
+            if ll.get("levels_corrected"):
+                print(f"    corrected: {ll['levels_corrected']} published levels stood "
+                      f"more than {ll['correction']['max_above_shore_m']:g} m above "
+                      f"their shore and were replaced by the DTM estimate (max drop "
+                      f"{ll['levels_corrected_max_drop_m']:.1f} m)")
         wid = res.manifest.get("water_id", {})
         if wid:
             print(f"  + {wid['atlas_file']} (u16 class + lake id; "
@@ -289,8 +300,8 @@ def _report_export(a, res, want_water: bool) -> None:
 
 
 def _print_water_report(rep: dict) -> None:
-    """Validation is advisory: the tool reports and never corrects."""
-    print("\n  water network validation (advisory — nothing was corrected):")
+    """Validation is advisory: these numbers are reported, never used to correct."""
+    print("\n  water network validation (advisory; bilinear z, reads the banks too):")
     print(f"    descent      : {rep['descent_rising_vertices']} of "
           f"{rep['descent_vertices_checked']} vertices rise downstream "
           f"({rep['descent_rising_pct']:.2f}%), worst "
@@ -343,7 +354,7 @@ def cmd_validate_atlas(a):
             print(f"[{entry['kind']}] {entry['error']}")
             continue
         print(f"[{entry['kind']}] {entry['file']}: {entry['bytes']} bytes, expected "
-              f"{rep['expected_bytes']} -> "
+              f"{entry['expected_bytes']} ({entry['bytes_per_sample']} bytes/sample) -> "
               f"{'OK' if entry['size_ok'] else 'MISMATCH (grid not dense!)'}")
         if not entry["size_ok"]:
             continue
@@ -405,6 +416,36 @@ def cmd_validate_water(a):
     if rep.get("validation"):
         _print_water_report(rep["validation"])
 
+    print("\nRESULT:", "PASS" if rep["ok"] else "FAIL")
+    sys.exit(0 if rep["ok"] else 1)
+
+
+def cmd_validate_hierarchy(a):
+    """
+    Check hierarchy.bin and labels.atlas against the manifest and heights.atlas:
+    tree structure, stored codes, saddle placement, label counts, and every
+    coarse label level recomputed from the one below. The checking is in
+    `exports.check_hierarchy`.
+    """
+    from . import exports as kvexports
+
+    rep = kvexports.check_hierarchy(kvexports.load(a.out))
+    if rep.get("skipped"):
+        print(rep["skipped"])
+        sys.exit(1)
+    st = rep.get("stats") or {}
+    if st:
+        print(f"[hierarchy] {st['nodes']} nodes, {st['leaves']} leaves, "
+              f"{st['minor']} minor, {st['with_lake']} matched to a lake, "
+              f"{st['spilling_off_map']} spilling off the map")
+    summ = rep.get("audit_summary")
+    if summ:
+        print(f"[audit] lakes {summ.get('lakes_by_status')}; rivers "
+              f"{summ.get('river_findings_by_status')} of "
+              f"{summ.get('river_segments_walked')} walked; "
+              f"{summ.get('unexplained_depressions')} unexplained depressions")
+    for err in rep["errors"]:
+        print(f"    ERROR: {err}")
     print("\nRESULT:", "PASS" if rep["ok"] else "FAIL")
     sys.exit(0 if rep["ok"] else 1)
 
@@ -536,6 +577,41 @@ def _add_process_args(p):
                         "just outside the polygon, so a lake NVE gives no 'hoyde' "
                         "for cannot end up standing above the terrain around it "
                         "(default: on). A published hoyde is never capped.")
+    p.add_argument("--correct-lake-levels", action=argparse.BooleanOptionalAction,
+                   default=True, dest="correct_lake_levels",
+                   help="replace a published NVE lake level that stands more than "
+                        "--lake-level-max-above-shore above the 90th percentile of "
+                        "the land ringing the lake with the DTM estimate "
+                        "(default: on). The raw value stays in lakes.json as "
+                        "hoyde_moh.")
+    p.add_argument("--lake-level-max-above-shore", type=float, default=2.0,
+                   dest="lake_level_max_above_shore",
+                   help="metres a published lake level may stand above the 90th "
+                        "percentile of its shore ring before it counts as wrong "
+                        "(default: 2)")
+    p.add_argument("--downhill-river-bed", action=argparse.BooleanOptionalAction,
+                   default=True, dest="downhill_river_bed",
+                   help="enforce, before carving, that no river bed or water level "
+                        "rises downstream: a running minimum over the densified "
+                        "polylines, carried across links and through lakes "
+                        "(default: on). This changes heights.atlas.")
+    p.add_argument("--lake-edge-is-shore", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_edge_is_shore",
+                   help="treat the map edge as shore when carving a lake the "
+                        "export boundary cuts through, so the bed ramps back up to "
+                        "the waterline there and the lake does not drain off the "
+                        "map in the depression hierarchy (default: on)")
+    p.add_argument("--lake-shore-8-connected", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_shore_8_connected",
+                   help="put every lake sample with a dry neighbour, diagonal ones "
+                        "included, on the waterline, so the 8-connected hierarchy "
+                        "cannot drain a lake through a corner of its shore "
+                        "(default: on)")
+    p.add_argument("--hierarchy", action=argparse.BooleanOptionalAction,
+                   default=True, dest="hierarchy",
+                   help="build the depression hierarchy and the water audit: "
+                        "labels.atlas, hierarchy.bin, water_audit.json "
+                        "(default: on)")
     p.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
                    help="also write rivers.geojson (debug sidecar for QGIS; "
                         "rivers.bin is the runtime format)")
@@ -633,6 +709,12 @@ def main(argv=None):
                              "water_id.atlas against the manifest")
     vw.add_argument("--out", required=True)
     vw.set_defaults(func=cmd_validate_water)
+
+    vh = sub.add_parser("validate-hierarchy",
+                        help="check hierarchy.bin / labels.atlas against the "
+                             "manifest and heights.atlas")
+    vh.add_argument("--out", required=True)
+    vh.set_defaults(func=cmd_validate_hierarchy)
 
     a = p.parse_args(argv)
     a.func(a)

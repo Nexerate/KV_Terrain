@@ -77,6 +77,11 @@ def summarise_run(*, manifest: dict, tile_cells: int, include_water: bool,
         "river_bank_tolerance_m": wo.get("river_bank_tolerance_m"),
         "river_vertex_stride_m": wo.get("river_vertex_stride_m"),
         "ocean_level_m": wo.get("ocean_level_m"),
+        "lake_level_max_above_shore_m": wo.get("lake_level_max_above_shore_m"),
+        "lakes_corrected": ll.get("levels_corrected"),
+        "downhill_river_bed": wo.get("downhill_river_bed"),
+        "lake_edge_is_shore": wo.get("lake_edge_is_shore"),
+        "hierarchy": wo.get("hierarchy"),
         # ---- outcomes ------------------------------------------------------ #
         # Settings alone tell you what you did. These tell you whether it worked.
         "tiles": manifest.get("num_levels") and atlas.get("height_bytes")
@@ -94,6 +99,20 @@ def summarise_run(*, manifest: dict, tile_cells: int, include_water: bool,
         "river_segments": (wv.get("rivers") or {}).get("segments"),
         "flowdir_disagreement_pct": val.get("flowdir_disagreement_pct"),
         "descent_rising_pct": val.get("descent_rising_pct"),
+        "bed_pixel_rising_pct": ((wm.get("river_bathymetry") or {})
+                                 .get("downhill_bed") or {}).get("pixel_rising_pct"),
+        "hierarchy_leaves": (manifest.get("hierarchy") or {}).get("leaf_count"),
+        "hierarchy_nodes": (manifest.get("hierarchy") or {}).get("node_count"),
+        "audit_lakes_ok": (((manifest.get("water_audit") or {}).get("summary") or {})
+                           .get("lakes_by_status") or {}).get("ok"),
+        "audit_lakes_held_by_outflow": (((manifest.get("water_audit") or {})
+                                         .get("summary") or {}).get("lakes_by_status")
+                                        or {}).get("held_by_outflow"),
+        "audit_lakes_above_spill": (((manifest.get("water_audit") or {})
+                                     .get("summary") or {}).get("lakes_by_status")
+                                    or {}).get("level_above_spill"),
+        "audit_river_pits": (((manifest.get("water_audit") or {}).get("summary") or {})
+                             .get("river_findings_by_status") or {}).get("pit"),
         "stage_seconds": stage_seconds or {},
     }
 
@@ -144,4 +163,7 @@ DISPLAY_COLUMNS = (
     "river_width_scale", "river_depth_scale", "river_bank_tolerance_m",
     "lakes", "lakes_unresolved", "lakes_estimated",
     "flowdir_disagreement_pct", "height_min_m", "height_max_m",
+    "downhill_river_bed", "hierarchy", "bed_pixel_rising_pct",
+    "lakes_corrected", "audit_lakes_ok", "audit_lakes_held_by_outflow",
+    "audit_lakes_above_spill", "audit_river_pits",
 )

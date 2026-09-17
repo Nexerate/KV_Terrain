@@ -10,10 +10,16 @@ is where lake carving, river rasterisation, level estimation, the water surface,
 the class/identity raster, the polyline network and the R16 packing happen, and
 it is the part you iterate on.
 
-The output format is UNCHANGED and is not ours to change — `manifest.json`,
-`heights.atlas`, `surface.atlas`, `water_id.atlas`, `rivers.bin`, `lakes.json`,
-`junctions.json`, byte for byte as before the split. The intermediate dataset
-format is ours; this one belongs to the engine that consumes it.
+The export is a contract with the engine that consumes it. Its FILE FORMATS are
+unchanged; its CONTENT changed deliberately with the first milestone of the water
+redesign (WATER_REDESIGN.md §0): the river bed is enforced downhill, lakes cut by
+the map edge ramp back up to their level there, and a published lake level the
+terrain contradicts is replaced, so `heights.atlas` (and what is carved from it)
+differs from earlier exports. Three new products sit beside the old ones:
+`labels.atlas`, `hierarchy.bin` and `water_audit.json`. With `downhill_river_bed`,
+`lake_edge_is_shore`, `lake_shore_8_connected` and `hierarchy` off and
+`lake_level_max_above_shore_m=None`, every pre-existing file is byte-identical to
+the export before the redesign.
 
 Order of operations
 -------------------
@@ -60,11 +66,14 @@ STAGES = (
     ("shore_snap",     "snapping shorelines to flat water", 0.06),
     ("lake_levels",    "resolving lake levels",             0.06),
     ("river_surface",  "levelling river channels",          0.12),
+    ("river_bed",      "tracing rivers & enforcing a downhill bed", 0.12),
     ("carve_rivers",   "carving river beds",                0.10),
     ("carve_lakes",    "carving lake beds",                 0.08),
     ("surface_pyramid", "building the water-surface pyramid", 0.06),
     ("water_id",       "classifying water & lake identity", 0.06),
-    ("river_network",  "building the river polyline network", 0.14),
+    ("river_network",  "sampling the river polyline network", 0.04),
+    ("hierarchy",      "building the depression hierarchy", 0.04),
+    ("water_audit",    "auditing water against the hierarchy", 0.05),
     ("pack",           "packing tiles & writing the atlas", 0.17),
 )
 
@@ -140,7 +149,7 @@ def run_process(
     the carves write in place, and the caller's array is very often a dataset's
     read-only memory map that must survive to be processed again.
     """
-    from . import water, bathymetry, watersurface, waterid, rivernet
+    from . import water, bathymetry, watersurface, waterid, rivernet, riverbed
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -167,6 +176,12 @@ def run_process(
     lake_slope = 0.0
     snap_report: dict = {}
     emit_geojson = False
+    hier = None
+    codes0 = None
+    audit = None
+    bed_report: dict = {"enabled": False}
+    build_hier = False
+    ocean_level_m = 0.0
 
     if include_water:
         opts = dict(water_opts or {})
@@ -198,7 +213,17 @@ def run_process(
         emit_geojson = bool(opts.pop("emit_geojson", False))
         estimate_lake_levels = bool(opts.pop("estimate_lake_levels", True))
         perimeter_cap = bool(opts.pop("lake_perimeter_cap", True))
+        # None switches the check off; the default is the owner's p90 + 2 m.
+        max_above_shore = opts.pop("lake_level_max_above_shore_m",
+                                   water.DEFAULT_LEVEL_MAX_ABOVE_SHORE_M)
+        max_above_shore = None if max_above_shore is None else float(max_above_shore)
         fill_lake_holes = bool(opts.pop("fill_lake_holes", True))
+        # The water redesign's first milestone. All three default ON; turning all
+        # three off reproduces the pre-redesign export byte for byte.
+        downhill_bed = bool(opts.pop("downhill_river_bed", True))
+        lake_edge_is_shore = bool(opts.pop("lake_edge_is_shore", True))
+        lake_shore_8 = bool(opts.pop("lake_shore_8_connected", True))
+        build_hier = bool(opts.pop("hierarchy", True))
 
         # Rasterise-only keys. `include_main_rivers` is a FETCH decision and is
         # meaningless here (the hovedelv layer is either in the dataset or it
@@ -250,7 +275,8 @@ def run_process(
         stages.begin("lake_levels")
         level_report = water.apply_estimated_levels(
             water_leaf, leaf_uncarved, enabled=estimate_lake_levels,
-            island=water_leaf.lake_island, perimeter_cap=perimeter_cap)
+            island=water_leaf.lake_island, perimeter_cap=perimeter_cap,
+            max_above_shore_m=max_above_shore)
         lake_surf = water_leaf.lake_surface_moh()
 
         # 2. THE RIVER WATER LEVEL, from the uncarved ground: the lowest ground
@@ -260,24 +286,62 @@ def run_process(
         #    this defines — otherwise the trench is cut wherever the rasterised
         #    buffer went, cliff faces included.
         stages.begin("river_surface")
-        river_surf = watersurface.river_surface_moh(
+        river_level = watersurface.river_surface_moh(
             plan, features, water_leaf, leaf_uncarved,
-            lake_surface=lake_surf,
             width_by_order=raster_opts.get("width_by_order"),
             width_scale=raster_opts.get("width_scale", 1.0),
             bank_tolerance_m=bank_tol_m)
+        lake_tie = watersurface.lake_tie_in(water_leaf, lake_surf)
+        # The level as it was before any downhill enforcement. The carve's bank
+        # taper measures against THIS, so lowering a level cannot switch the
+        # carve off under it.
+        river_surf_measured = watersurface.apply_lake_tie_in(river_level, lake_tie)
+
+        # 2a. TRACE the polylines now (densify, clip, order, lake spans, links),
+        #     because the downhill bed needs the linked network before the carve.
+        #     `z` is still sampled at the end, from the carved bed; both stages
+        #     read this one traced network.
+        stages.begin("river_bed")
+        traced = rivernet.trace_river_network(
+            plan, features, water_leaf, leaf_uncarved,
+            vertex_stride_m=vertex_stride_m, progress=stages.within)
+        bed_target = None
+        river_surf = river_surf_measured
+        if downhill_bed:
+            # WATER_REDESIGN.md §4.1: running minimum over the densified bed and
+            # level profiles, carried across links and through lake spans, spread
+            # back over each channel. The lake tie-in (raise-only) is re-applied
+            # on top, exactly as river_surface_moh would have.
+            low_level, bed_target, bed_report = riverbed.downhill_river_bed(
+                plan, traced, water_leaf, leaf_uncarved, river_level,
+                depth_scale=depth_scale,
+                width_by_order=raster_opts.get("width_by_order"),
+                width_scale=raster_opts.get("width_scale", 1.0))
+            river_surf = watersurface.apply_lake_tie_in(low_level, lake_tie)
+            del low_level
+        del river_level, lake_tie
 
         # 2b. Carve the river channels. The water surface sits on the ground, so
         #     this trench is the entire water column — see carve_river_beds.
         stages.begin("carve_rivers")
         leaf = bathymetry.carve_river_beds(
             leaf, water_leaf.type, water_leaf.weight, plan.spacing_m,
-            level=river_surf,
+            level=river_surf_measured,
+            bed_target=bed_target,
             bank_tolerance_m=bank_tol_m,
             depth_scale=depth_scale,
             width_by_order=raster_opts.get("width_by_order"),
             width_scale=raster_opts.get("width_scale", 1.0),
         )
+
+        if downhill_bed:
+            # ...and along each polyline's own sample path, which the cross-section
+            # carve cannot reach where a stream rasterised to a gappy mask.
+            bed_report.update(riverbed.burn_downhill_paths(
+                plan, traced, water_leaf, leaf))
+        # Descent measured on the samples the polylines actually cross, with the
+        # enforcement on or off, so the two runs can be compared.
+        bed_report.update(riverbed.pixel_descent(plan, traced, leaf))
 
         # 2c. SNAPSHOT the river-carved but LAKE-uncarved bed, for the polylines.
         #     The lake carve writes a fabricated bowl (carve_depth_m under the
@@ -315,6 +379,8 @@ def run_process(
             min_depth_m=lake_min_depth_m,
             island=water_leaf.lake_island,
             estimate_missing=False,
+            edge_is_shore=lake_edge_is_shore,
+            shore_8_connected=lake_shore_8,
         )
 
         # 4. Unified water surface (lakes = authored level, rivers = the channel
@@ -342,7 +408,27 @@ def run_process(
             plan, features, water_leaf, leaf_bed_uncarved,
             water_surface=water_surface,
             vertex_stride_m=vertex_stride_m, depth_scale=depth_scale,
-            progress=stages.within)
+            traced=traced, progress=stages.within)
+        del leaf_uncarved, leaf_bed_uncarved, bed_target, river_surf_measured
+
+        # 7. THE DEPRESSION HIERARCHY, on the heights exactly as they will be
+        #    packed. Nothing below this point may touch `leaf`: the hierarchy
+        #    describes these codes and no others (WATER_REDESIGN.md §3).
+        if build_hier:
+            from . import hierarchy, wateraudit
+            stages.begin("hierarchy")
+            hmin_p, hmax_p = core.resolve_height_range(leaf, height_min, height_max)
+            codes0 = core.pack_leaf_codes(leaf, hmin_p, hmax_p, nodata_fill_m)
+            hier = hierarchy.build_hierarchy(
+                codes0, hmin_p, hmax_p, spacing_m=plan.spacing_m, ocean=ocean)
+
+            # 8. Match authored lakes to nodes and audit rivers and depressions.
+            #    Writes each matched lake into its node, so it runs before packing.
+            stages.begin("water_audit")
+            # The river surface as exported is what an outflow carries over a
+            # lake's spill: its depth there is the lake's outflow head.
+            audit = wateraudit.run_audit(plan, hier, codes0, water_leaf, river_net,
+                                         river_surface=water_surface)
 
         water_params = {
             "river_width_scale": raster_opts.get("width_scale", 1.0),
@@ -359,6 +445,11 @@ def run_process(
             "include_main_rivers": bool(getattr(features, "main_rivers", None)),
             "estimate_lake_levels": estimate_lake_levels,
             "lake_perimeter_cap": perimeter_cap,
+            "lake_level_max_above_shore_m": max_above_shore,
+            "downhill_river_bed": downhill_bed,
+            "lake_edge_is_shore": lake_edge_is_shore,
+            "lake_shore_8_connected": lake_shore_8,
+            "hierarchy": build_hier,
         }
 
     stages.begin("pack")
@@ -373,6 +464,37 @@ def run_process(
     res.coarse_level = levels[-1]
     res.terrain_leaf = leaf
     res.water_surface = water_surface
+    res.hierarchy = hier
+    res.water_audit = audit
+
+    if hier is not None:
+        from . import hierarchy, wateraudit
+        if (res.height_min, res.height_max) != (hier.height_min, hier.height_max):
+            raise RuntimeError("hierarchy was built on a different packing range "
+                               "than the atlas was written with")
+        # Label pyramid: each coarse level from the one below and THAT level's
+        # packed heights, i.e. exactly what heights.atlas holds there.
+        # One code grid per level (the last is never gathered from, but keeps
+        # the list aligned with the pyramid).
+        code_levels = [codes0] + [
+            core.pack_leaf_codes(levels[l], res.height_min, res.height_max,
+                                 nodata_fill_m)
+            for l in range(1, plan.num_levels)]
+        label_levels = hierarchy.build_label_pyramid(hier.labels, code_levels)
+        del code_levels
+        labels_info = hierarchy.export_labels_atlas(plan, label_levels, out_dir)
+        del label_levels
+        hier_info = hierarchy.write_hierarchy_bin(
+            hier, os.path.join(out_dir, hierarchy.HIERARCHY_FILE))
+        res.manifest["atlas"]["labels_file"] = labels_info["atlas_file"]
+        res.manifest["atlas"]["bytes_per_sample"][labels_info["atlas_file"]] = \
+            hierarchy.LABELS_BYTES_PER_SAMPLE
+        res.manifest["hierarchy"] = hierarchy.manifest_block(
+            hier, hier_file=hier_info, labels=labels_info,
+            minor_depth_m=hierarchy.DEFAULT_MINOR_DEPTH_M,
+            minor_area_m2=hierarchy.DEFAULT_MINOR_AREA_M2,
+            ocean_level_m=ocean_level_m)
+        res.manifest["water_audit"] = wateraudit.write_audit(audit, out_dir)
 
     if surface_levels is not None:
         from . import watersurface, waterid, rivernet
@@ -383,6 +505,7 @@ def run_process(
             plan, surface_levels, out_dir, res.height_min, res.height_max)
         # Name the surface atlas in the header so the runtime opens the second handle.
         res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
+        res.manifest["atlas"]["bytes_per_sample"][wsurf["atlas_file"]] = 2
         wsurf["lake_count"] = lake_count
         wsurf["lake_levels"] = level_report
         wsurf["lake_bathymetry"] = {
@@ -391,6 +514,8 @@ def run_process(
             "shore_slope_m_per_m": float(lake_slope),
             "shore_ramp_m": float(lake_ramp_m or (carve_depth_m / max(lake_slope, 1e-6))),
             "min_depth_m": float(lake_min_depth_m),
+            "edge_is_shore": bool(water_params.get("lake_edge_is_shore", False)),
+            "shore_8_connected": bool(water_params.get("lake_shore_8_connected", False)),
             "method": "linear_ramp_below_known_surface",
             "ramp_anchor": "waterline",
             "ramp_profile_m": "a STRAIGHT ramp: depth = carve_depth_m * clip((metres "
@@ -415,6 +540,7 @@ def run_process(
             "depth_scale": float(water_params.get("river_depth_scale", 1.0)),
             "method": "trench_under_the_channel_scaled_by_modelled_width",
             "bank_tolerance_m": float(water_params.get("river_bank_tolerance_m", 0.0)),
+            "downhill_bed": bed_report,
             "level": "the ground under the channel's own centreline, spread flat "
                      "across the samples that centreline seeded — so the water "
                      "surface is level ACROSS a channel and descends ALONG it",
@@ -434,6 +560,7 @@ def run_process(
 
         wid = waterid.export_water_id_tiles(plan, water_id_levels, out_dir)
         res.manifest["atlas"]["water_id_file"] = wid["atlas_file"]
+        res.manifest["atlas"]["bytes_per_sample"][wid["atlas_file"]] = 2
         res.manifest["water_id"] = wid
 
         res.manifest["water_vector"] = rivernet.export_river_network(
