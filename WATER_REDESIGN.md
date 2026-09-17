@@ -12,6 +12,42 @@
 
 ---
 
+## 0. Decisions and first milestone (owner, 2026-09-17)
+
+These are settled; the rest of the document is read in their light.
+
+1. **Heights may change.** The downhill-only river bed (§4.1) applies to every export by default,
+   so `heights.atlas` (and anything carved from it) is no longer byte-identical to earlier exports.
+   The current runtime keeps consuming the existing products; nothing is removed. When this lands,
+   update `readme.md`, whose "Two tools" section still promises the export is unchanged byte for
+   byte.
+2. **Labels are a 4-byte atlas.** Measured on the Lierne export (8193², 5 m): about **324 000 leaf
+   pits**, so roughly 650k hierarchy nodes. That does not fit u16. Generalise the `core.atlas_*`
+   helpers to take a bytes-per-sample parameter (default 2, so existing atlases are unaffected) and
+   write `labels.atlas` as little-endian u32. Offsets stay pure arithmetic from the header; the
+   manifest records each atlas's bytes per sample. A label tile is then NOT at the same byte offset
+   as its height twin, only at the same tile index.
+3. **Numba** for Priority-Flood and the hierarchy. Our own implementation; no C++ toolchain and no
+   third-party licence question. Add it to `requirements.txt`.
+4. **First milestone = hierarchy + audit.** In scope:
+   - §4.1 downhill-only river bed, integrated in `process.py`.
+   - §4.2 Priority-Flood depression hierarchy on the final carved heights: node table and per-cell
+     labels.
+   - Coarse label levels by a simple, deterministic rule: the label of the **lowest** child in the
+     same corner-anchored 3×3 gather `waterid` uses (ties by lowest label). Revisit only when the
+     runtime needs something else.
+   - §4.4 matching authored lakes to nodes, and the audit as `water_audit.json` plus a Process page
+     panel. River corridor checks may use steepest descent on the heights directly, since the flow
+     direction atlas is not in this milestone.
+   - Export `labels.atlas` and `hierarchy.bin` (node table only), with manifest descriptors and a
+     `validate-*` check in `exports.py`, following the existing pattern.
+   - §6 synthetic tests and the hierarchy-vs-brute-force test.
+
+   Out of scope for now: flow-direction atlas and flat resolve (§4.3), hypsometry (§4.5), discharge
+   and width (§4.6), `rivers.bin` v2, and embankment treatment (§7).
+
+---
+
 ## 1. Context in one paragraph
 
 The runtime is moving from "solve hydrology for the whole world at runtime from rasters, then
@@ -132,16 +168,11 @@ needs the same idea as its root: seed Priority-Flood from edge cells at or below
 explicitly how **inland depressions cropped by the export boundary** are treated; the runtime
 already has a recorded defect where a boundary-cropped lake cannot fill.
 
-**Scale.** 40 km at 5 m spacing is roughly 8193² ≈ 67M cells. Pure Python with `heapq` is not
-viable. Options, in order of preference:
-
-1. Wrap Barnes' open-source C++ implementation (DepressionHierarchy / Fill-Spill-Merge) with
-   pybind11. Check its licence first.
-2. RichDEM's Python bindings for Priority-Flood and flow accumulation, with the hierarchy built on
-   top.
-3. A Numba implementation.
-
-Offline minutes are acceptable; tens of minutes on a laptop are probably not.
+**Scale.** 40 km at 5 m spacing is roughly 8193² ≈ 67M cells, with about 324k leaf pits on Lierne.
+Pure Python with `heapq` is not viable; the implementation is **Numba** (§0.3). Barnes' papers and
+reference code are the algorithmic reference, not a dependency. Offline minutes are acceptable; tens
+of minutes on a laptop are probably not. Note the carved heights are packed to ~1.5 cm steps; build
+the hierarchy on the float heights before packing, not on the atlas.
 
 **Noise pits.** The hierarchy will contain enormous numbers of tiny depressions. Keep them all in
 the tree (the runtime walk needs their spill points to escape pits) but do not compute hypsometry
@@ -214,7 +245,7 @@ Elvenett has no width or discharge; today width is a heuristic on Strahler order
 
 | File | Contents |
 |---|---|
-| `labels.atlas` | u32 leaf node id per sample; coarse levels store the covering ancestor |
+| `labels.atlas` | u32 leaf node id per sample (4 bytes/sample atlas, §0.2); coarse levels take the lowest child's label |
 | `flowdir.atlas` | u8 D8 direction per sample, flats resolved |
 | `hierarchy.bin` | Node table (§4.2) + hypsometry blob (§4.5) |
 | `rivers.bin` v2 | v1 + per-segment `Q`, width, `node_id`; bed profile monotone |
@@ -253,7 +284,6 @@ agree.
   export in hand.
 - **Bridges** in DTM vs DOM. DTM should already remove them; verify on a real export.
 - **Regulated lakes** whose authored level sits below the DTM's flown surface or above the spill.
-- **Hierarchy library choice** (§4.2) and its licence.
 - **Hypsometry threshold:** which nodes get curves.
 - **Transition:** how long both old and new products are exported side by side.
 - **Lake polygons:** export NVE geometry as optional GeoJSON for debugging and matching, or not.
