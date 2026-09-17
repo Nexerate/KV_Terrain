@@ -1,16 +1,23 @@
 # kvterrain — Kartverket height (+ NVE water) → Unity quad-tree terrain
 
 A standalone offline tool that takes a rectangle drawn on a map of Norway,
-fetches Kartverket elevation data, and builds a **quad-tree pyramid of R16 height
-tiles** plus a `manifest.json` for a Unity terrain system. It never talks to
-Unity — it only produces the data files your engine will consume later.
+fetches Kartverket elevation data, and builds a **quad-tree pyramid of 16-bit
+height tiles**, packed into one dense `heights.atlas`, plus a `manifest.json` for
+a Unity terrain system. It never talks to Unity — it only produces the data files
+your engine will consume later.
 
-It can **optionally** also fetch NVE's national river network and lake database
-and write, beside every height tile, two companion tiles pixel-for-pixel aligned
-with it: a **`.water` mask** (where water is, how big, which way it flows) and a
-**`.wsurf` water-surface tile** (the water's elevation in metres above sea level).
-Together those let a downstream hydraulic sim compute depth directly as
-`depth = max(0, water_surface − terrain)` — no rim reconstruction, no seed-fill.
+It also fetches NVE's national river network and lake database (on by default,
+`--no-water` to skip) and writes two more atlases, tile-for-tile and
+sample-for-sample aligned with the heights: **`surface.atlas`** (the water's
+elevation in metres above sea level) and **`water_id.atlas`** (water class plus
+authored lake identity). Beside them go the river network as polylines
+(`rivers.bin`), per-lake records (`lakes.json`) and river/lake junctions
+(`junctions.json`). Depth is `max(0, water_surface − terrain)` — no rim
+reconstruction, no seed-fill.
+
+> **Planned, not implemented:** a redesign of the water exports around a
+> depression hierarchy is described in [`WATER_REDESIGN.md`](WATER_REDESIGN.md).
+> Everything in this readme describes the tool as it runs today.
 
 Height data © Kartverket, licensed **CC BY 4.0**. Water data © **NVE** (Elvenett /
 Innsjødatabase). Attribute "© Kartverket" and "© NVE" in anything you ship.
@@ -59,32 +66,47 @@ does both stages in one pass for when you genuinely only want the region once.
 
 ```
 out/
-  manifest.json
-  L0/  x_y.r16     ← height leaves (finest), 129×129 samples each
-  L0/  x_y.water   ← water mask for the SAME tile          (only if --water)
-  L0/  x_y.wsurf   ← water surface (moh) for the SAME tile (only if --water)
-  L1/  x_y.r16     ← 2× coarser, half as many tiles per axis
-  L1/  x_y.water
-  L1/  x_y.wsurf
-  ...
-  L{n-1}/ 0_0.r16  ← single root tile (coarsest), if region is square
-  L{n-1}/ 0_0.water
-  L{n-1}/ 0_0.wsurf
+  manifest.json     header: lattice, pyramid, packing range, atlas names, water metadata
+  heights.atlas     carved terrain, every tile of every level, one dense blob
+  surface.atlas     water surface (moh), same layout            (water only)
+  water_id.atlas    water class + authored lake id, same layout (water only)
+  rivers.bin        river network polylines                     (water only)
+  lakes.json        one record per authored lake                (water only)
+  junctions.json    where rivers enter and leave lakes          (water only)
 ```
 
-All three tile types share one lattice, one row order (**north → south**), and one
-shared-edge guarantee, so sample `(i,j)` is the exact same world point in
-`x_y.r16`, `x_y.water`, and `x_y.wsurf`.
+### The dense atlas format (`dense_v1`)
 
-- **`.r16`** — raw, headerless, little-endian **uint16**, `tile_samples ×
-tile_samples` (default **129×129**). Heights are packed against one **global**
-  `[height_min_m, height_max_m]` range in the manifest, so every tile at every
-  level shares one vertical scale and blends cleanly.
-- **`.water`** — raw, headerless array, one **5-byte little-endian record per
-  sample** (`type, weight, flow, lake_id`). See [Water](#water-rivers--lakes).
-- **`.wsurf`** — raw, headerless, little-endian **uint16**, packed against the
-  **same** `[height_min_m, height_max_m]` range as `.r16`, with **65535 reserved
-  as a "no water" sentinel**. See [Water surface](#water-surface-the-wsurf-tile).
+Each `.atlas` file is **every tile of every pyramid level concatenated**, with no
+header and no offset table: the offsets follow from `manifest.json` alone. The
+helpers in `kvterrain/core.py` (`tiles_at_level`, `atlas_tile_offset`, …) ARE the
+format contract, and the runtime must match them exactly.
+
+```
+tile_samples        = tile_cells + 1                       (default 129)
+tileBytes           = tile_samples * tile_samples * 2
+tilesX(L), tilesY(L) = max(1, leaf_tiles >> L)
+levelByteBase(L)    = tileBytes * Σ_{l<L} tilesX(l) * tilesY(l)
+tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes
+```
+
+Levels ascend (L0 finest first); tiles within a level are row-major. All three
+atlases use **2 bytes per sample**, so a tile sits at the **identical byte offset**
+in each of them: three file handles, one offset computation. Offsets exceed 32
+bits on real exports, so use 64-bit arithmetic. Every atlas's size is checked
+against `atlas_total_bytes` when it is written.
+
+- **`heights.atlas`** — little-endian **uint16**, `tile_samples²` per tile, rows
+  **north → south**. Packed against one **global** `[height_min_m,
+  height_max_m]` range from the manifest, so every tile at every level shares one
+  vertical scale. These are the **carved** heights (see [The carves](#the-carves)).
+- **`surface.atlas`** — little-endian **uint16** on the **same** range, mapped to
+  `[0, 65534]`, with **65535 = no water**. See [Water surface](#water-surface-surfaceatlas).
+- **`water_id.atlas`** — little-endian **uint16** code per sample. See
+  [Water class and lake identity](#water-class-and-lake-identity-water_idatlas).
+
+All atlases share one lattice, one row order and one shared-edge guarantee, so
+sample `(i,j)` of tile `(L,x,y)` is the same world point in every one of them.
 
 ### The conventions that matter
 
@@ -118,7 +140,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Two pages in the left nav.
+Three pages in the left nav.
 
 **Fetch.** Draw a rectangle with the toolbar (top-left of the map). A **dashed
 orange outline** appears around it: that is the area actually fetched, which is
@@ -364,9 +386,10 @@ check the live Swagger page and adjust `ost`/`nord`/`koordsys` in
 
 ## Water (rivers & lakes)
 
-With `--water` (or the UI toggle) the tool fetches two NVE datasets for the same
-rectangle, in the same UTM zone, and rasterises them onto the **identical**
-corner-centered sample grid as the height tiles:
+Unless `--no-water` is given, the tool fetches two NVE datasets for the same
+rectangle, in the same UTM zone, stores them raw in the dataset, and at process
+time rasterises them onto the **identical** corner-centered sample grid as the
+heights:
 
 - **Rivers** — NVE **Elvenett (ELVIS)**, the national river-network database: a
   connected set of polylines _with defined flow direction_. Two layers are read:
@@ -376,41 +399,74 @@ corner-centered sample grid as the height tiles:
   a **`hoyde`** attribute: the lake's **surface elevation in metres above sea
   level**. This is the authoritative water level and is used directly.
 
-### The `.water` mask
+Water products:
 
-One packed **5-byte little-endian record** per grid point, row-major
-**north→south** (same as the height tile):
+| File | What it is |
+| --- | --- |
+| `surface.atlas` | water surface elevation per sample, lakes and rivers in one field |
+| `water_id.atlas` | water class (dry / river / ocean / lake) plus authored lake identity per sample |
+| `rivers.bin` | the river network as densified polylines with links, bed and surface per vertex |
+| `lakes.json` | one record per authored lake: NVE ids, name, area, level and its provenance, bbox |
+| `junctions.json` | points where a river segment enters (`Inflow`) or leaves (`Outflow`) a lake |
 
-| bytes | field     | meaning                                                                                                      |
-| :---: | --------- | ------------------------------------------------------------------------------------------------------------ |
-|   0   | `type`    | `0` land · `1` river · `2` lake                                                                              |
-|   1   | `weight`  | river **stream order** (relative size). `0` unless `type==river`.                                            |
-|   2   | `flow`    | river **flow bearing**, `degrees = flow * 360 / 256` (0° = north, clockwise). Valid only when `type==river`. |
-|  3–4  | `lake_id` | uint16 **local** index into `manifest.water.lake_table`. `0` unless `type==lake`.                            |
+The manifest describes them under `water_surface` (encoding, sources, width
+model, lake levels, carve parameters), `water_id` (encoding) and `water_vector`
+(the polyline products and their validation report).
 
-The mask says _where_ water is, _how big / which way_ a river flows, and _which
-lake_ a sample belongs to. It does **not** carry the water level — that's the
-`.wsurf` tile.
+### Water class and lake identity (`water_id.atlas`)
 
-### Water surface (the `.wsurf` tile)
+One little-endian **uint16** code per sample, same layout as the height atlas:
 
-Every water pixel — lake or river — carries its **surface elevation (moh)**, packed
-as uint16 on the **same** `[height_min_m, height_max_m]` range as the height tile,
-with **65535 = no water**. The runtime reads one field for all water:
+| code | meaning |
+| :---: | --- |
+| `0` | dry |
+| `1` | river |
+| `2` | ocean |
+| `3–15` | reserved |
+| `16 + n` | lake with local id `n` — the `lake_id` in `lakes.json` |
+
+Class and identity share one channel because the lake id already encodes "is
+lake", and 2 bytes per sample keeps the atlas on the same offsets as the other
+two. **Ocean** is flood-filled inward from the map edges at `--ocean-level`, not
+thresholded, so inland ground below sea level (including carved lake bowls) is
+never labelled sea. Precedence at any overlap is lake > river > ocean > dry.
+Coarse levels are **categorical**, never averaged: the same precedence over the
+3×3 children, and among lakes the id held by the most children.
+
+`lakes.json` emits no polygon geometry; `water_id.atlas` is the geometry
+reference (`water_id == 16 + lake_id`).
+
+### Water surface (`surface.atlas`)
+
+Every water sample — lake or river — carries its **surface elevation (moh)**,
+packed as uint16 on the **same** `[height_min_m, height_max_m]` range as the
+height atlas, with **65535 = no water**. The runtime reads one field for all
+water:
 
 ```python
-import numpy as np
-code = np.fromfile("out/L0/3_2.wsurf", dtype="<u2").reshape(129, 129)  # row 0 = north
-hmin, hmax = manifest["height_min_m"], manifest["height_max_m"]
+import json, numpy as np
+from kvterrain import core
+
+m = json.load(open("out/manifest.json"))
+TS, (ltx, lty), n = m["tile_samples"], m["leaf_tiles"], m["num_levels"]
+off = core.atlas_tile_offset(ltx, lty, n, TS, level=0, x=3, y=2)
+
+def tile(name):
+    return np.fromfile(f"out/{name}", dtype="<u2", count=TS * TS,
+                       offset=off).reshape(TS, TS)          # row 0 = north
+
+hmin, hmax = m["height_min_m"], m["height_max_m"]
+code = tile(m["atlas"]["surface_file"])
 is_water = code != 65535
 surface_moh = hmin + (code / 65534.0) * (hmax - hmin)     # where is_water
-# depth = max(0, surface_moh - terrain_moh), sampling .r16 at the same (row,col)
+terrain_moh = hmin + (tile(m["atlas"]["height_file"]) / 65535.0) * (hmax - hmin)
+depth = np.where(is_water, np.maximum(0, surface_moh - terrain_moh), 0)
 ```
 
 Where the surface comes from:
 
 - **Lakes:** the lake's resolved level, stamped on every one of its pixels (flat),
-  and stored per lake in `manifest.water.lake_table[id].level_m`.
+  and stored per lake in `lakes.json` as `authored_level_m`.
   **NVE `hoyde` is used exactly as published** wherever it exists — it is the
   lake's authored level, and the DTM gets no vote on it. (It is worth being
   explicit: the DTM is one flight's snapshot of where the water was that day, so on
@@ -507,7 +563,7 @@ behaviour.
   segment's bearing comes from its vertex order — no dependence on attribute names.
 - **River width & depth are modelled.** ELVIS has no width or discharge, so channel
   width (pixels seeded) and carve depth are heuristics keyed on Strahler order
-  (`manifest.water.width_model`, scaled by `--river-width-scale`). A river's
+  (`manifest.water_surface.width_model`, scaled by `--river-width-scale`). A river's
   rendered depth is a modeled constant; its surface _is_ the real terrain.
 - **Depth is carved, never raised.** Both water types put the surface on the ground
   and cut the bed beneath it. Raising a surface above the terrain instead — which
@@ -518,21 +574,26 @@ behaviour.
   rule that gives each _sample_ its own surface height paints water onto terrain —
   the same artefact whether the surface floats above the ground or sits on it, and
   most visible where the ground is steepest.
-- **Priority is lake > river > land** at any overlap, at every level.
-- **Two different pyramids.** The `.water` mask uses a **categorical** downsample
-  (highest-priority feature in the 3×3 neighbourhood wins, so thin rivers survive
-  to the coarsest level). The `.wsurf` surface uses a **water-only** downsample: a
+- **Priority is lake > river > ocean > dry** at any overlap, at every level.
+- **Two different pyramids.** `water_id.atlas` uses a **categorical** downsample
+  (highest-priority class in the 3×3 neighbourhood wins, so thin rivers survive
+  to the coarsest level). `surface.atlas` uses a **water-only** downsample: a
   parent is water if **any** child is, and its surface is the **min over water
   children** (the conservative spill level). This is what keeps thin rivers and
   small lakes visible at the coarse fallback resolution instead of averaging into
   their banks.
-- **Same shared-edge guarantee.** All three tile types are sliced from one
-  assembled array, so adjacent edges are bit-identical and mutually aligned.
+- **Rivers are also kept as polylines.** Rasterising a river destroys its flow
+  direction, its connectivity and its links to lakes, so `rivers.bin` keeps them:
+  densified vertices with bed `z` and surface `level`, upstream/downstream links
+  and lake spans. `level` is read verbatim from the surface raster, so the two
+  agree by construction.
+- **Same shared-edge guarantee.** All atlases are sliced from one assembled array
+  per product, so adjacent edges are bit-identical and mutually aligned.
 
-`manifest.water` records the mask encoding, width model, attribution, and the
-`lake_table` (`local_id → {lopenr, navn, area_m2, hoyde_moh, level_m, level_source}`).
-`manifest.water_surface` records the `.wsurf` encoding, the `65535` sentinel, and
-the runtime depth formula.
+`manifest.water_surface` records the surface encoding, the `65535` sentinel, the
+runtime depth formula, the width model, attribution and the lake level and carve
+reports. `manifest.water_id` records the class/identity encoding.
+`manifest.water_vector` names the polyline products and carries their validation.
 
 ### Water source & limits
 
@@ -559,8 +620,10 @@ the runtime depth formula.
 
 ## Unity import notes
 
-**Height (`.r16`)** is exactly the raw 16-bit format Unity's terrain RAW import
-expects:
+The atlases are for a runtime that reads tiles by byte offset, not for Unity's
+terrain importer. A single tile is nonetheless exactly the raw 16-bit layout
+Unity's terrain RAW import expects, so one can be cut out with
+`core.atlas_tile_offset` and imported by hand:
 
 - **Bit depth:** 16-bit. **Byte order:** Windows / little-endian.
 - **Resolution:** `tile_samples` (129 by default).
@@ -569,26 +632,29 @@ expects:
 - **Vertical scale:** map packed `[0,65535]` → `[height_min_m, height_max_m]`. In a
   `TerrainData`, set height `size.y = height_max_m − height_min_m` and offset the
   object by `height_min_m`.
-- **Horizontal scale:** a tile covers `tile_cells × spacing_m` metres at its level;
-  `spacing_m` doubles each level up. Per-tile placement is in
-  `manifest.levels[L].tiles[k].bbox_utm`.
+- **Horizontal placement:** there is no per-tile table. Tile `(x, y)` at level `L`
+  covers `tile_cells × leaf_spacing_m × 2^L` metres per side, measured from
+  `origin_utm` (the south-west corner): `x` counts east and `y` counts **north**,
+  so `y = 0` is the southernmost row of tiles even though samples inside a tile run
+  north → south (see `north_up_tile_slice` in `kvterrain/core.py`).
 
 Because tiles share edges, neighbouring patches line up seamlessly at matching
 levels (or morph CDLOD-style at the shared edge).
 
-**Water (`.water` + `.wsurf`)** are data for your hydraulic sim, not Unity terrain
-layers. They share the height tile's grid, row order and `bbox_utm`, so the same
-flip/placement logic applies.
+**Water** (`surface.atlas`, `water_id.atlas`) is data for the runtime water
+system, not Unity terrain layers. It shares the height atlas's layout, row order
+and offsets, so the same placement logic applies.
 
-- The `.water` mask is categorical + directional — sample it **nearest-neighbour**,
-  never bilinear.
-- The `.wsurf` surface is a scalar height field — it can be filtered like height,
-  but **do not let filtering blend the `65535` sentinel** into real water. Gate on
-  the mask `type` (or a separate is-water bit) first, then read `.wsurf`.
-- Runtime depth for any water pixel is `max(0, surface_moh − terrain_moh)`. If your
-  engine applies a vertical scale to terrain height (e.g. 1:5 compression), apply
-  the **identical** scale to the unpacked surface before subtracting — `.wsurf` is
-  packed in the same moh space as `.r16` precisely so the two are comparable.
+- `water_id.atlas` is categorical — sample it **nearest-neighbour**, never
+  bilinear.
+- `surface.atlas` is a scalar height field — it can be filtered like height, but
+  **do not let filtering blend the `65535` sentinel** into real water. Gate on the
+  sentinel (or on `water_id != 0`) first.
+- Runtime depth for any water sample is `max(0, surface_moh − terrain_moh)`. If
+  your engine applies a vertical scale to terrain height (e.g. 1:5 compression),
+  apply the **identical** scale to the unpacked surface before subtracting — the
+  surface is packed in the same moh space as the heights precisely so the two are
+  comparable.
 - `hoyde` is a reference level and the DTM is a single-day capture, so a lake's
   waterline won't trace the DTM contour to the centimetre — expect a thin shore
   ring that may read slightly wet or dry. `max(0, …)` handles it; it's data, not a
@@ -652,7 +718,7 @@ flip/placement logic applies.
 
 **The UI**
 
-- `app.py` — the router: one Streamlit process, two pages.
+- `app.py` — the router: one Streamlit process, three pages.
 - `ui/fetch_page.py` — draw a rectangle, fetch it, store it.
 - `ui/process_page.py` — pick a dataset, tune, run, look at what it did.
 - `ui/exports_page.py` — open a finished export, preview it from its own bytes,
@@ -693,296 +759,5 @@ flip/placement logic applies.
 - The sandbox these files were built in cannot reach `hoydedata.no` or
   `kart.nve.no`; both live fetch paths are wired and unit-validated against
   synthetic data, but run the first real fetch from a machine with internet access.
-  Use `validate` for height, and eyeball the first `.water`/`.wsurf` build (or the
+  Use `validate` for height, `validate-water` for the water products, and eyeball the first build (or the
   UI preview) to confirm the NVE layer/field names still match.
-
-<!-- # kvterrain — Kartverket height (+ NVE water) → Unity quad-tree terrain
-
-A standalone offline tool that takes a rectangle drawn on a map of Norway,
-fetches Kartverket elevation data, and builds a **quad-tree pyramid of R16 height
-tiles** plus a `manifest.json` for a Unity terrain system. It never talks to
-Unity — it only produces the data files your engine will consume later.
-
-It can **optionally** also fetch NVE's national river network and lake database
-and write a companion **`.water` mask tile** beside every height tile, pixel-for-
-pixel aligned, so a downstream hydraulic simulation can seed water only where
-rivers and lakes actually are instead of from every terrain pixel.
-
-Height data © Kartverket, licensed **CC BY 4.0**. Water data © **NVE** (Elvenett /
-Innsjødatabase). Attribute "© Kartverket" and "© NVE" in anything you ship.
-
----
-
-## What it produces
-
-```
-out/
-  manifest.json
-  L0/  x_y.r16     ← height leaves (finest), 129×129 samples each
-  L0/  x_y.water   ← water mask for the SAME tile (only if --water)
-  L1/  x_y.r16     ← 2× coarser, half as many tiles per axis
-  L1/  x_y.water
-  ...
-  L{n-1}/ 0_0.r16  ← single root tile (coarsest), if region is square
-  L{n-1}/ 0_0.water
-```
-
-Each `.r16` is **raw, headerless, little-endian uint16**, `tile_samples ×
-tile_samples` (default **129×129**), rows ordered **north → south**, columns
-west → east. Heights are packed against one **global** `[height_min_m,
-height_max_m]` range recorded in the manifest, so every tile at every level
-shares one vertical scale and blends cleanly.
-
-Each `.water` tile (when enabled) is a **raw, headerless array of the same
-`tile_samples × tile_samples` grid**, one **5-byte little-endian record per
-sample** — see [Water masks](#water-masks-rivers--lakes) below. Same row order,
-same lattice, same shared-edge guarantee as the height tile it sits next to, so
-sample `(i,j)` in `x_y.water` is the exact world point as sample `(i,j)` in
-`x_y.r16`.
-
-### The conventions that matter
-
-- **Corner-centered / "pixel-is-a-point".** A tile of `tile_cells` cells carries
-  `tile_cells + 1` samples. Sample `(i,j)` _is_ the height at a fixed world
-  point. Adjacent tiles **share their boundary samples** — the right column of
-  one tile is bit-identical to the left column of the next — so a meshed terrain
-  has no cracks. This matches a system where a 128×128-quad patch uses a 129×129
-  height texture.
-- **One assembled array, then sliced.** The whole region is fetched into a single
-  continuous sample grid; tiles are cut out of it. Shared edges are identical by
-  construction, not by trusting the server to return the same value twice.
-- **Centered `[1 2 1]/4` decimation for parents**, _not_ a 2×2 box average. For
-  corner-centered data the kernel center sits on the retained even vertex, so a
-  parent sample lands exactly on the world point of child sample `2i`. (A box
-  average is correct only for cell-centered data and would drift half a texel per
-  level, breaking LOD edge registration.) Interior parent samples are exact; the
-  outermost row/column of the whole region is an edge-clamp approximation because
-  it has no neighbour — extend your rectangle slightly if you need the rim exact.
-- **Single UTM zone** (EUREF89 / EPSG:25832 / 25833 / 25835, picked by longitude
-  unless overridden). Fine for city- or mountain-range-sized areas where the
-  deviation across the region is negligible.
-
----
-
-## Install & run
-
-```bash
-pip install -r requirements.txt
-
-# UI
-streamlit run app.py
-
-# or headless
-python -m kvterrain.cli build --bbox 8.30 61.28 8.55 61.40 \
-    --spacing 5 --out ./out --source DTM
-
-# height + water masks (rivers & lakes)
-python -m kvterrain.cli build --bbox 8.30 61.28 8.55 61.40 \
-    --spacing 5 --out ./out --source DTM --water --river-width-scale 1.5
-
-# offline synthetic dry-run of the whole thing (no network)
-python -m kvterrain.cli build --bbox 8.30 61.28 8.55 61.40 --spacing 5 \
-    --out ./out --demo --water
-```
-
-Draw a rectangle with the toolbar (top-left of the map). The sidebar previews the
-snapped grid, number of tiles, pyramid depth and fetch-request count before you
-commit — plus, if **Fetch rivers & lakes** is on, the extra `.water` tile budget.
-**Demo mode** builds from a synthetic surface (and a synthetic river + lake) with
-no network, so you can verify the pipeline and the Unity/sim import end-to-end
-before fetching real data.
-
-Water flags: `--water` turns it on; `--river-width-scale` multiplies modelled
-channel widths (how many pixels each river seeds); `--no-main-rivers` skips the
-`hovedelv` size-upgrade pass.
-
-### Validate against ground truth
-
-```bash
-python -m kvterrain.cli validate --out ./out --n 12
-```
-
-Spot-checks packed leaf heights against Kartverket's open point API
-(`ws.geonorge.no/hoydedata/v1/punkt`). (The point API's parameter names are not
-fully documented statically; if the call errors, check the live Swagger page and
-adjust `ost`/`nord`/`koordsys` in `cli.py`.)
-
----
-
-## Source & limits
-
-- Primary fetch: **ArcGIS ImageServer `exportImage`** at
-  `https://hoydedata.no/arcgis/rest/services/{DTM,DOM}/ImageServer`, requesting
-  `format=tiff, pixelType=F32` — true 32-bit float heights. The request bbox is
-  offset by half a texel so pixel centers land on the sample grid (this is what
-  makes the output corner-centered).
-- **Per-request cap is 15000 px/side**; the tool tiles fetches at ≤4096 by
-  default and stitches them seamlessly.
-- **DTM1 / DOM1 are 1 m** national coverage — don't set `--spacing` below ~1 m or
-  you're just paying to interpolate. 5 m is a sensible default for terrain.
-- No API key; open data. Be polite with concurrency.
-
----
-
-## Water masks (rivers & lakes)
-
-With `--water` (or the UI toggle) the tool fetches two NVE datasets for the same
-rectangle, in the same UTM zone, and rasterises them onto the **identical**
-corner-centered sample grid as the height tiles:
-
-- **Rivers** — NVE **Elvenett (ELVIS)**, the national river-network database. It's
-  a connected set of polylines _with defined flow direction_. The tool reads two
-  layers: `elvenett` (every stream) and `hovedelv` (main rivers, used to upgrade
-  size).
-- **Lakes** — NVE **Innsjødatabase** (~243k lakes; those > 2500 m² carry a unique
-  national number).
-
-Each `.water` sample is a packed **5-byte little-endian record**, one per grid
-point, row-major **north→south** (same as the height tile):
-
-| bytes | field     | meaning                                                                                                      |
-| :---: | --------- | ------------------------------------------------------------------------------------------------------------ |
-|   0   | `type`    | `0` land · `1` river · `2` lake                                                                              |
-|   1   | `weight`  | river **stream order** (relative size, larger = bigger). `0` unless `type==river`.                           |
-|   2   | `flow`    | river **flow bearing**, `degrees = flow * 360 / 256` (0° = north, clockwise). Valid only when `type==river`. |
-|  3–4  | `lake_id` | uint16 **local** index into `manifest.water.lake_table`. `0` unless `type==lake`.                            |
-
-Read one in Python (or mirror the struct in your engine):
-
-```python
-import numpy as np
-WATER = np.dtype([("type","u1"),("weight","u1"),("flow","u1"),("lake_id","<u2")])
-tile = np.fromfile("out/L0/3_2.water", dtype=WATER).reshape(129, 129)  # row 0 = north
-rivers = tile["type"] == 1
-seeds  = np.argwhere(rivers)                 # (row,col) seed points, not every pixel
-bearing_deg = tile["flow"][rivers] * 360/256 # bootstrap the velocity field
-size        = tile["weight"][rivers]         # meter/volume scaling per seed
-lake_cells  = tile["type"] == 2
-```
-
-Design decisions worth knowing:
-
-- **Seeds, not depth.** The mask says _where_ water is and _how big / which way_
-  a river flows — it carries **no depth or surface elevation** (you said the sim
-  works in depth and derives its own). Use `type∈{river,lake}` samples as seed
-  points; use `weight` to scale a seed's initial volume and `flow` to prime
-  velocity. `lake_id` lets you group a lake's samples as one body without a
-  flood-fill.
-- **Flow direction comes from geometry, not an attribute.** ELVIS polylines are
-  digitised downstream, so each segment's bearing is taken from its vertex order.
-  This avoids depending on attribute names that NVE may rename.
-- **River width is modelled.** ELVIS has no width, so each centerline is buffered
-  to a plausible full width by stream order (`manifest.water.width_model`), scaled
-  by `--river-width-scale`, before rasterising — bigger rivers seed proportionally
-  more pixels. Order-1 streams are still forced to ≥1 sample wide so they never
-  disappear between texels.
-- **Priority is lake > river > land** at any overlap, at every level.
-- **Categorical pyramid.** Coarser levels can't `[1 2 1]`-average a class id, so
-  each parent sample takes the **highest-priority feature in the 3×3 neighbourhood
-  centered on its retained vertex** (largest river wins, carrying its own flow).
-  Same corner-centered registration as height, but thin rivers survive to the
-  coarsest level instead of averaging away.
-- **Same shared-edge guarantee.** Water tiles are sliced from one assembled array
-  exactly like height, so adjacent `.water` edges are bit-identical and aligned
-  with the `.r16` tiles.
-
-`manifest.water` records the full encoding, the width model, attribution, and the
-`lake_table` (`local_id → {lopenr, navn, area_m2}`).
-
-### Water source & limits
-
-- Fetch: **ArcGIS REST `/query?f=geojson`** on
-  `kart.nve.no/enterprise/rest/services/Elvenett1` (layers `2` elvenett, `1`
-  hovedelv) and `.../Innsjodatabase2` (layer `5`). NVE migrated all their map
-  services to this cloud host in Dec 2025 — the old `nve.geodataonline.no`
-  no longer resolves at all (not a firewall/DNS-config issue, the domain was
-  retired; see NVE's [migration notice](https://www.nve.no/kart/nytt-om-gis-api/nye-url-er-for-alle-nve-s-karttjenester/)).
-  If the endpoints move again, browse `kart.nve.no/enterprise/rest/services`
-  (or NVE's "Nytt om GIS API" page) for the current base and update the
-  `RIVER_SERVICE` / `LAKE_SERVICE` constants at the top of `kvterrain/water.py`.
-  The server reprojects to the plan's UTM zone via `outSR`; results are paged
-  at up to 2000 features (the service's current `MaxRecordCount`).
-- Attribute field names (stream order, lake number/name/area) are **not
-  contractually stable**. Every attribute read is optional with a graceful
-  fallback (main/minor size split, geometry-derived flow); the candidate names
-  live in constants at the top of `kvterrain/water.py` — adjust there if a query
-  returns empty attributes.
-- No API key; open data. Be polite with concurrency.
-
----
-
-## Unity import notes
-
-The `.r16` files are exactly the raw 16-bit format Unity's terrain RAW import and
-most heightmap importers expect:
-
-- **Bit depth:** 16-bit. **Byte order:** Windows / little-endian.
-- **Resolution:** `tile_samples` (129 by default).
-- **Flip:** rows are written **north→south**. Unity's RAW import has a
-  vertical-flip toggle; set it so north ends up where you expect (depends on your
-  scene orientation). The manifest records `"row_order": "north_to_south"` so you
-  can flip in code instead if you load the bytes yourself.
-- **Vertical scale:** map packed `[0,65535]` → `[height_min_m, height_max_m]`
-  from the manifest. In a Unity `TerrainData`, set the terrain's height `size.y`
-  to `height_max_m - height_min_m` and offset the terrain object by
-  `height_min_m` so absolute elevations are correct.
-- **Horizontal scale:** a tile covers `tile_cells × spacing_m` metres at its
-  level; `spacing_m` doubles each level up. Per-tile world placement is in
-  `manifest.levels[L].tiles[k].bbox_utm`.
-
-Because tiles share edges, neighbouring terrain patches line up with no seam as
-long as you load matching levels (or morph between levels CDLOD-style at the
-shared edge).
-
-The `.water` tile is **not** a Unity terrain layer — it's data for your hydraulic
-sim / terrain system to consume however it likes (seed list, texture upload,
-etc.). It shares the height tile's grid, row order (`north_to_south`) and per-tile
-`bbox_utm`, so the same flip/placement logic applies. Since it's categorical +
-directional, don't bilinearly filter it: sample it nearest-neighbour.
-
----
-
-## Files
-
-- `kvterrain/core.py` — headless height engine (plan, fetch, assemble, pyramid,
-  slice, pack) + the shared `north_up_tile_slice` used by both tile packers. No
-  UI or Unity dependencies; unit-testable offline.
-- `kvterrain/water.py` — water engine (fetch NVE rivers/lakes, rasterise onto the
-  height grid, categorical winner-take-all pyramid, pack `.water` tiles). Pulls in
-  rasterio/shapely; imported lazily so height-only builds don't need them.
-- `kvterrain/cli.py` — `build` (with `--water`) and `validate` commands.
-- `app.py` — Streamlit draw-a-rectangle UI (height + optional water preview).
-- `test_pipeline.py` — offline height validation (alignment, interior-exact
-  decimation, bit-identical shared edges, single-root collapse).
-- `test_water.py` — offline water validation (corner-centered rasterisation,
-  feature placement, bearing round-trip, categorical pyramid keeps thin rivers,
-  bit-identical `.water` edges, record round-trip, `run_export` integration).
-
-## Known caveats
-
-- The 15000 px cap is confirmed for the hoydedata.no ImageServer; the
-  `wcs.geonorge.no` WCS does not publish its own numeric cap. The tool uses
-  `exportImage`, which also sidesteps ArcGIS WCS half-pixel quirks.
-- Region **outer rim** decimation is an edge-clamp approximation (interior is
-  exact). Extend the rectangle slightly if you need the rim exact.
-- Non-square regions produce a small **forest** of root tiles rather than one
-  root; the pyramid stops when the smaller axis reaches a single tile.
-- **Water attribute names** on the NVE services are treated as best-effort. If a
-  build reports 0 lakes/rivers or all rivers come out the same size, the layer's
-  field names likely changed — check the live REST layer and update the candidate
-  lists in `kvterrain/water.py`. Flow direction and geometry don't depend on
-  attributes and will still be correct.
-- **Modelled river width** is a heuristic, not surveyed width. Tune
-  `--river-width-scale` / the `width_by_order` table to taste; it only affects how
-  many pixels a river seeds, never `weight`/`flow`.
-- `hovedelv` is a slightly generalised geometry; where it deviates from the
-  detailed `elvenett` line by more than the buffer you can get a faint double
-  line. `--no-main-rivers` avoids it at the cost of the main/minor size signal.
-- The sandbox these files were built in cannot reach `hoydedata.no` or
-  `kart.nve.no`; both live fetch paths are wired and unit-validated
-  against synthetic data (`test_pipeline.py`, `test_water.py`), but run the first
-  real fetch from a machine with internet access. Use `validate` to confirm height
-  values/alignment, and eyeball the first `.water` build (or the UI preview) to
-  confirm the NVE layer/field names still match. If a water fetch ever fails with
-  a DNS error again, check whether NVE has moved services once more before
-  assuming it's your network — see the endpoint note above. -->
