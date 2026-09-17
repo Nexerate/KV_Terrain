@@ -736,15 +736,28 @@ and offsets, so the same placement logic applies.
   layer's field names likely changed — check the live REST layer and update the
   candidate lists in `kvterrain/water.py`.
 - **Modelled river width & depth** are heuristics, not surveyed values. Tune
-  `--river-width-scale` / the `width_by_order` table; width only affects how many
-  pixels a river seeds (and, now, how wide the channel trench feathers).
+  `--river-width-scale` / the `width_by_order` table; width decides how many
+  pixels a river seeds, how wide its level is flattened, and how wide the trench feathers.
 - **Lake depth follows distance from shore**, not lake size: at the default 1:1
   slope every lake deeper than four texels from its bank is at `--lake-max-depth`.
   If you want small lakes shallower, lower that; `--lake-min-depth` is only the
   floor for bodies too small to ramp at all.
-- **River confluences** are not cross-segment reconciled: each channel segment is
-  internally monotone and lake junctions are pinned, but two tributaries meeting
-  can differ slightly in surface until a full segment graph is added.
+- **River surfaces are not forced to descend.** A river's level is the uncarved
+  ground under its centreline, measured, never fitted (see `channel_level`), so DTM
+  noise can make it step UP going downstream. `rivers.bin` reports this rather
+  than fixing it: on the Lierne export 10.5% of open-channel vertex steps rise, in
+  65 395 of 87 126 segments, worst 4.8 m (`water_vector.validation.descent_*` in
+  the manifest). Enforcing descent is left to the runtime's running minimum when
+  it burns the polylines.
+- **Confluences get no special treatment, and need none for the surface.** Every
+  river sample takes the level of the NEAREST centreline sample across all
+  centrelines, so tributaries meeting a trunk share one level field rather than
+  per-segment surfaces that could disagree. The segment graph in `rivers.bin`
+  (upstream/downstream links, the highest-order candidate taken as the trunk) is
+  built but not used to shape the surface.
+- **Lake junctions are raised, not pinned.** A river sample touching a lake is
+  lifted to the lake's level where the lake stands higher and otherwise keeps its
+  own level, so a channel arriving over a bank stays wet up to the shoreline.
 - **Coarse rivers fade.** A ~5 m channel in a coarse cell has its bed averaged with
   its banks, so `surface − coarse_terrain` shrinks and distant thin rivers render
   faint even though the surface field keeps the cell marked as water. Carving the
@@ -756,8 +769,6 @@ and offsets, so the same placement logic applies.
   because it widens the trench to a whole coarse cell and pops as you approach.
 - `hovedelv` is slightly generalised; where it deviates from `elvenett` you can get
   a faint double line. `--no-main-rivers` avoids it at the cost of the size signal.
-- The sandbox these files were built in cannot reach `hoydedata.no` or
-  `kart.nve.no`; both live fetch paths are wired and unit-validated against
-  synthetic data, but run the first real fetch from a machine with internet access.
-  Use `validate` for height, `validate-water` for the water products, and eyeball the first build (or the
-  UI preview) to confirm the NVE layer/field names still match.
+- The NVE layer ids and attribute names can change without notice. After any
+  fetch that looks wrong, run `validate` for height and `validate-water` for the
+  water products, and use `describe-services` to check the live layers and fields.
