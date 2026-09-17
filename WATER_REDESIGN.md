@@ -171,8 +171,10 @@ already has a recorded defect where a boundary-cropped lake cannot fill.
 **Scale.** 40 km at 5 m spacing is roughly 8193² ≈ 67M cells, with about 324k leaf pits on Lierne.
 Pure Python with `heapq` is not viable; the implementation is **Numba** (§0.3). Barnes' papers and
 reference code are the algorithmic reference, not a dependency. Offline minutes are acceptable; tens
-of minutes on a laptop are probably not. Note the carved heights are packed to ~1.5 cm steps; build
-the hierarchy on the float heights before packing, not on the atlas.
+of minutes on a laptop are probably not. Note the carved heights are packed to u16 steps (~1.5 cm on
+Lierne). Build the hierarchy on the heights **as packed** (quantise, then dequantise), because
+that is what the runtime reads and §3's ordering rule requires it. Quantisation creates flats, so
+tie-breaking in the priority queue must be deterministic (e.g. by elevation, then cell index).
 
 **Noise pits.** The hierarchy will contain enormous numbers of tiny depressions. Keep them all in
 the tree (the runtime walk needs their spill points to escape pits) but do not compute hypsometry
