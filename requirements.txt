@@ -10,3 +10,7 @@ shapely>=2.0
 streamlit>=1.33
 folium>=0.16
 streamlit-folium>=0.20
+# UI extras used directly by ui/ (both ship with streamlit, pinned here because
+# this project imports them itself rather than only through streamlit)
+pandas>=2.0
+pillow>=10.0

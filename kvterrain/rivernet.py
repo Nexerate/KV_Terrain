@@ -61,7 +61,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -326,6 +326,7 @@ def build_river_network(
     vertex_stride_m: Optional[float] = None,
     depth_by_order: Optional[dict] = None,
     depth_scale: float = 1.0,
+    progress: Optional[Callable[[float, str], None]] = None,
 ) -> RiverNetwork:
     """
     Turn the elvenett polylines into the serialisable network: densified, Z-sampled,
@@ -362,12 +363,24 @@ def build_river_network(
     lake_hoyde = {lid: wg.lake_level(info)
                   for lid, info in (wg.lake_table or {}).items()}
 
+    ws = None if water_surface is None else np.asarray(water_surface)
+
     segments: list = []
     clip = {"features": 0, "clipped": 0, "split": 0,
             "vertices_in": 0, "vertices_dropped": 0, "features_dropped": 0}
     span_stats = {"raw": 0, "merged": 0, "dropped": 0, "kept": 0}
 
-    for seg in feats.rivers:
+    # A national-scale crop is tens of thousands of features and this loop is the
+    # longest single thing the pipeline does, so it says where it is. A bar that
+    # cannot tell "working" from "hung" is the reason a slow run reads as a crash.
+    n_features = len(feats.rivers)
+    tick = max(1, n_features // 200)
+
+    for i_feat, seg in enumerate(feats.rivers):
+        if progress and i_feat % tick == 0:
+            progress(i_feat / max(n_features, 1),
+                     f"{i_feat:,}/{n_features:,} features, "
+                     f"{len(segments):,} segments")
         if seg.xy.shape[0] < 2:
             continue
 
@@ -431,8 +444,16 @@ def build_river_network(
             # take ITS value verbatim. The raster is the display authority; this makes
             # the two products identical instead of independently derived, and it picks
             # up the adjacent-to-lake pinning that bed+raise cannot know about.
-            if water_surface is not None:
-                ras = np.asarray(water_surface, dtype=np.float64)[ri, ci]
+            if ws is not None:
+                # INDEX FIRST, convert after. `np.asarray(ws, dtype=np.float64)`
+                # here would rebuild the ENTIRE surface grid as float64 — 537 MB
+                # on an 8193² export — allocate it, convert it, read a few hundred
+                # values out of it, and throw it away. Once per segment. On Lierne
+                # (87k segments) that one conversion was 90% of the whole
+                # post-processing run: 1075 s of the 1185 s total. Selecting the
+                # vertices first and converting those is identical arithmetic on
+                # a few hundred elements instead of 67 million.
+                ras = ws[ri, ci].astype(np.float64)
                 take = np.isfinite(ras)
                 level[take] = ras[take]
 
@@ -453,6 +474,8 @@ def build_river_network(
                 lake_spans=spans,
             ))
 
+    if progress:
+        progress(1.0, f"linking {len(segments):,} segments")
     _link_segments(segments, tol_m=ENDPOINT_TOL_CELLS * plan.spacing_m)
     junctions = _detect_junctions(segments, wg)
     lakes = build_lake_records(plan, wg)

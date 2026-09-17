@@ -303,6 +303,12 @@ class PackResult:
     river_net: object = None        # rivernet.RiverNetwork | None
     water_id_leaf: object = None    # np.ndarray | None
     coarse_level: object = None     # np.ndarray | None — root of the height pyramid
+    # The finished leaf bed (all carves applied) and the unified water surface,
+    # so a UI can show `depth = surface - terrain` — the quantity the runtime
+    # actually renders, and the only honest way to see what a carve setting did.
+    terrain_leaf: object = None     # np.ndarray | None
+    water_surface: object = None    # np.ndarray | None — m.o.h., NaN off-water
+    stage_seconds: dict = None      # {stage key -> seconds}, filled by process
 
 
 def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int, int, int]:
@@ -502,6 +508,21 @@ def run_export(
     include_water: bool = False,
     water_opts: Optional[dict] = None,
 ) -> PackResult:
+    """
+    One-shot fetch + process: the original single-pass build, kept intact.
+
+    The tool is now split in two — `kvterrain.fetch` writes a dataset,
+    `kvterrain.process` turns one into an export — because refetching twenty
+    square kilometres of LiDAR to retune a lake carve was the dominant cost of
+    working on this pipeline. This function is the two of them back to back with
+    nothing stored in between, for callers that genuinely want one pass (`cli
+    build`, and anything that was calling it before the split).
+
+    Prefer `fetch.run_fetch` + `process.process_dataset` when you expect to
+    process the same region more than once.
+    """
+    from . import process as _process
+
     if fetcher is None:
         fetcher = lambda u, e, sx, sy, nx, ny, sp: export_image_fetch(
             u, e, sx, sy, nx, ny, sp, source_kind=source_kind)
@@ -511,296 +532,41 @@ def run_export(
     leaf = assemble_region(plan, fetcher, server_url,
                            max_fetch_px=max_fetch_px, progress=progress)
 
-    surface_levels = None
-    water_id_levels = None
-    water_leaf = None
-    river_net = None
-    water_params: dict = {}
-    lake_count = 0
-    carve_depth_m = 0.0
-    lake_ramp_m = 0.0
-    lake_min_depth_m = 0.0
-    lake_slope = 0.0
-    snap_report: dict = {}
-    emit_geojson = False
-
+    features = None
     if include_water:
-        from . import water, bathymetry, watersurface, waterid, rivernet
-        opts = dict(water_opts or {})
-        features = opts.pop("features", None)
-        fetcher_water = opts.pop("fetcher", None)
-        # Lake carve: deepen inward toward a maximum REAL depth over a long ramp,
-        # so how deep a lake gets is decided by how big it is.
-        carve_depth_m = float(opts.pop("lake_max_depth_m", bathymetry.DEFAULT_CARVE_DEPTH_M))
-        lake_slope = float(opts.pop("lake_shore_slope", bathymetry.DEFAULT_SHORE_SLOPE))
-        lake_ramp_m = float(opts.pop("lake_ramp_radius_m", 0.0))
-        if "lake_bevel_px" in opts:        # legacy alias -> ramp width in metres
-            lake_ramp_m = max(1.0, float(opts.pop("lake_bevel_px"))) * plan.spacing_m
-        lake_min_depth_m = float(opts.pop("lake_min_depth_m", bathymetry.DEFAULT_MIN_DEPTH_M))
-        lake_snap_px = int(opts.pop("lake_snap_px", water.DEFAULT_LAKE_SNAP_PX))
-        depth_scale = float(opts.pop("river_depth_scale", 1.0))
-        bank_tol_m = float(opts.pop("river_bank_tolerance_m",
-                                    bathymetry.DEFAULT_BANK_TOLERANCE_M))
-        ocean_level_m = float(opts.pop("ocean_level_m", waterid.DEFAULT_OCEAN_LEVEL_M))
-        vertex_stride_m = float(opts.pop("river_vertex_stride_m", plan.spacing_m))
-        emit_geojson = bool(opts.pop("emit_geojson", False))
-        estimate_lake_levels = bool(opts.pop("estimate_lake_levels", True))
-        perimeter_cap = bool(opts.pop("lake_perimeter_cap", True))
-        fill_lake_holes = bool(opts.pop("fill_lake_holes", True))
-
-        # Pop the rasterise-only keys so they never leak into fetch_water_features
-        # (which doesn't accept them). What remains in `opts` is fetch kwargs only.
-        raster_opts = {}
-        for k in ("width_by_order", "width_scale", "all_touched_rivers"):
-            if k in opts:
-                raster_opts[k] = opts.pop(k)
-
+        from . import water as _water
+        wopts = dict(water_opts or {})
+        # `features` (pre-built) and `fetcher` (a WaterFetcher) are the two ways a
+        # caller can supply water without the network — the demo path uses the
+        # second. Everything else in the dict is a process-stage setting and is
+        # passed straight through; `include_main_rivers` is READ here (it decides
+        # whether the hovedelv layer is queried) but left in place, because
+        # `run_process` records it and drops it.
+        features = wopts.pop("features", None)
+        water_fetcher = wopts.pop("fetcher", None)
         if features is None:
-            if fetcher_water is not None:
-                features = fetcher_water(plan)
+            if water_fetcher is not None:
+                features = water_fetcher(plan)
             else:
-                features = water.fetch_water_features(plan, progress=progress, **opts)
+                features = _water.fetch_water_features(
+                    plan, progress=progress,
+                    include_main_rivers=bool(wopts.get("include_main_rivers", True)))
+        water_opts = wopts
 
-        water_leaf = water.rasterize_water(
-            plan, features, fill_lake_holes=fill_lake_holes, **raster_opts)
-        lake_count = len(water_leaf.lake_table)
+    # `run_process` reports a fraction; this function's callers were written
+    # against the (done, total, msg) fetch callback, so keep that contract.
+    def _proc_progress(frac: float, label: str) -> None:
+        if progress:
+            progress(int(round(frac * 1000)), 1000, label)
 
-        # 1. VOID REPAIR, before anything reads the bed. Kartverket returns a void
-        #    lake interior as a finite 0/sentinel rather than NaN, so an isfinite
-        #    test misses it entirely. Left in place it becomes the export's
-        #    height_min and the shore ring keeps a fake pit right at the waterline.
-        #    The carve below hides interior voids as a side effect but cannot reach
-        #    the ring outside the polygon, and does nothing for lakes with neither
-        #    an NVE hoyde nor a usable shoreline. See bathymetry's module docstring.
-        leaf = bathymetry.fill_lake_surface(leaf, water_leaf.type)
-
-        # 1a2. SNAP each lake to its own flat water surface in the DTM. The NVE
-        #      outline and the LiDAR block are independent products, so a one- or
-        #      two-texel ring of the lake's own water plane falls outside the
-        #      polygon and would render as a raised rim tracing the true shoreline
-        #      just outside the water. See snap_lakes_to_flat_water.
-        snap_report = water.snap_lakes_to_flat_water(
-            water_leaf, leaf, max_px=lake_snap_px)
-
-        # 1b. SNAPSHOT the repaired bed before ANY carve. Two consumers need it:
-        #     the lake level estimator (which must read the LiDAR water surface,
-        #     not a bowl we dug) and the river water level, whose whole model is
-        #     "the water sits at the lowest ground the channel has here".
-        leaf_uncarved = leaf.copy()
-
-        # 1c. RESOLVE EVERY LAKE'S LEVEL, once, before anything reads one. NVE
-        #     `hoyde` VERBATIM where NVE publishes one — it is the authored level
-        #     and the DTM does not get a vote on it. Only for a lake without one is
-        #     a level read off the (now repaired, still uncarved) DTM inside the
-        #     polygon, and that estimate is capped by the ground ringing the lake.
-        #     Everything downstream — the carve, the surface raster, the river
-        #     tie-in, lakes.json — goes through WaterGrid.lake_level, so they cannot
-        #     drift apart.
-        level_report = water.apply_estimated_levels(
-            water_leaf, leaf_uncarved, enabled=estimate_lake_levels,
-            island=water_leaf.lake_island, perimeter_cap=perimeter_cap)
-        lake_surf = water_leaf.lake_surface_moh()
-
-        # 2. THE RIVER WATER LEVEL, from the uncarved ground: the lowest ground
-        #    across each channel, levelled over that channel's own width, then
-        #    raised (never lowered) to a lake's surface where the two meet. This
-        #    has to come BEFORE the carve, because the carve stops at the waterline
-        #    this defines — otherwise the trench is cut wherever the rasterised
-        #    buffer went, cliff faces included.
-        river_surf = watersurface.river_surface_moh(
-            plan, features, water_leaf, leaf_uncarved,
-            lake_surface=lake_surf,
-            width_by_order=raster_opts.get("width_by_order"),
-            width_scale=raster_opts.get("width_scale", 1.0),
-            bank_tolerance_m=bank_tol_m)
-
-        # 2b. Carve the river channels. The water surface sits on the ground, so
-        #     this trench is the entire water column — see carve_river_beds.
-        leaf = bathymetry.carve_river_beds(
-            leaf, water_leaf.type, water_leaf.weight, plan.spacing_m,
-            level=river_surf,
-            bank_tolerance_m=bank_tol_m,
-            depth_scale=depth_scale,
-            width_by_order=raster_opts.get("width_by_order"),
-            width_scale=raster_opts.get("width_scale", 1.0),
-        )
-
-        # 2c. SNAPSHOT the river-carved but LAKE-uncarved bed, for the polylines.
-        #     The lake carve writes a fabricated bowl (carve_depth_m under the
-        #     authored surface) inside every lake polygon. That bowl is a display
-        #     device — it exists so the water plane does not z-fight the
-        #     LiDAR-flattened lake surface — and it is NOT terrain. The runtime
-        #     burns polyline `z` straight into bedConditioned, so a `z` sampled
-        #     from the carved array cuts the solver's routing grid to a fabricated
-        #     depth at exactly the points where a channel hands off to a lake
-        #     basin. The river trench, by contrast, IS the channel the burn is
-        #     trying to open, so `z` is sampled after it. Sampling this array does
-        #     not weaken the polyline/raster agreement, because `level` is read
-        #     verbatim out of `water_surface` (see build_river_network) rather than
-        #     recomputed from `z`.
-        leaf_bed_uncarved = leaf.copy()
-
-        # 3. Carve the lake bowls so the water plane does not z-fight the
-        #    LiDAR-flattened lake surface. Safe for the solver only because the lake
-        #    level is authored and pinned — see carve_lake_beds.
-        #
-        #    `estimate_missing` is tied to the SAME switch that governs the surface
-        #    raster. It must never be true while the raster is empty: the carve's
-        #    private shore-estimate fallback is exactly how lakes without an NVE
-        #    hoyde ended up as 20 m dry pits. Either both know a level, or neither
-        #    touches the lake.
-        leaf = bathymetry.carve_lake_beds(
-            leaf,
-            water_leaf.type,
-            plan.spacing_m,
-            surface_moh=lake_surf,
-            carve_depth_m=carve_depth_m,
-            shore_slope=lake_slope,
-            ramp_m=lake_ramp_m or None,
-            min_depth_m=lake_min_depth_m,
-            island=water_leaf.lake_island,
-            estimate_missing=False,
-        )
-
-        # 4. Unified water surface (lakes = authored level, rivers = the channel
-        #    level from step 2), then its water-only pyramid.
-        water_surface = watersurface.combine_water_surface(lake_surf, river_surf)
-        surface_levels = watersurface.build_surface_pyramid(water_surface, plan.num_levels)
-
-        # 5. Class + authored lake identity. Ocean is flood-filled inward from the
-        #    map edges, not thresholded, so inland sub-sea-level ground (including
-        #    the bowls just carved) is never mislabelled sea.
-        ocean = waterid.ocean_mask_from_edges(
-            leaf, ocean_level_m,
-            exclude=(water_leaf.type != water.TYPE_LAND))
-        water_id_leaf = waterid.build_water_id(water_leaf, ocean)
-        water_id_levels = waterid.build_water_id_pyramid(water_id_leaf, plan.num_levels)
-
-        # 6. The polylines. `z` is sampled from the river-carved, lake-UNCARVED bed
-        #    (step 2b) because the runtime burns it; `level` is read verbatim from
-        #    `water_surface`, so polyline level still equals the raster surface
-        #    pixel-for-pixel.
-        river_net = rivernet.build_river_network(
-            plan, features, water_leaf, leaf_bed_uncarved,
-            water_surface=water_surface,
-            vertex_stride_m=vertex_stride_m, depth_scale=depth_scale)
-
-        water_params = {
-            "river_width_scale": raster_opts.get("width_scale", 1.0),
-            "river_depth_scale": depth_scale,
-            "river_bank_tolerance_m": bank_tol_m,
-            "river_vertex_stride_m": vertex_stride_m,
-            "lake_carve_depth_m": carve_depth_m,
-            "lake_shore_slope": lake_slope,
-            "lake_shore_ramp_m": lake_ramp_m or (carve_depth_m / max(lake_slope, 1e-6)),
-            "lake_min_depth_m": lake_min_depth_m,
-            "lake_snap_px": lake_snap_px,
-            "lake_holes_filled": fill_lake_holes,
-            "ocean_level_m": ocean_level_m,
-            "include_main_rivers": opts.get("include_main_rivers", True),
-            "estimate_lake_levels": estimate_lake_levels,
-            "lake_perimeter_cap": perimeter_cap,
-        }
-
-    levels = build_pyramid(leaf, plan.num_levels)
-    res = export_tiles(plan, levels, out_dir,
-                       nodata_fill_m=nodata_fill_m,
-                       height_min=height_min, height_max=height_max,
-                       source_kind=source_kind)
-    res.water_grid = water_leaf
-    res.river_net = river_net
-    res.water_id_leaf = water_id_levels[0] if water_id_levels else None
-    res.coarse_level = levels[-1]
-
-    if surface_levels is not None:
-        import os
-        from . import watersurface, waterid, rivernet
-
-        # The surface atlas packs on the SAME [height_min, height_max] as the height atlas,
-        # so it can only be written now that export_tiles has finalised that range.
-        wsurf = watersurface.export_surface_tiles(
-            plan, surface_levels, out_dir, res.height_min, res.height_max)
-        # Name the surface atlas in the header so the runtime opens the second handle.
-        res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
-        wsurf["lake_count"] = lake_count
-        wsurf["lake_levels"] = level_report
-        wsurf["lake_bathymetry"] = {
-            "enabled": True,
-            "carve_depth_m": float(carve_depth_m),
-            "shore_slope_m_per_m": float(lake_slope),
-            "shore_ramp_m": float(lake_ramp_m or (carve_depth_m / max(lake_slope, 1e-6))),
-            "min_depth_m": float(lake_min_depth_m),
-            "method": "linear_ramp_below_known_surface",
-            "ramp_anchor": "waterline",
-            "ramp_profile_m": "a STRAIGHT ramp: depth = carve_depth_m * clip((metres "
-                              "from the waterline) / shore_ramp_m, 0, 1), flat from "
-                              "there inward. shore_ramp_m = carve_depth_m / "
-                              "shore_slope_m_per_m, so at slope 1.0 a 20 m bed takes "
-                              "20 m of shore. A body too small to reach carve_depth_m "
-                              "has its profile scaled up just far enough to reach "
-                              "min_depth_m at its deepest sample",
-            "shoreline_snap": snap_report,
-            "islands": ("lake polygon holes are rasterised as lake so the surface "
-                        "runs through them, but their DTM height is left alone and "
-                        "they act as shore for the ramp; depth = max(0, level - "
-                        "terrain) hides them"),
-            "rationale": "LiDAR returns the lake SURFACE as terrain height, so "
-                         "without a carve the water plane and the terrain are "
-                         "coincident. Safe for the solver: ramped, never breaks "
-                         "the rim, and the lake level is authored and pinned.",
-        }
-        wsurf["river_bathymetry"] = {
-            "enabled": True,
-            "depth_scale": float(water_params.get("river_depth_scale", 1.0)),
-            "method": "trench_under_the_channel_scaled_by_modelled_width",
-            "bank_tolerance_m": float(water_params.get("river_bank_tolerance_m", 0.0)),
-            "level": "the ground under the channel's own centreline, spread flat "
-                     "across the samples that centreline seeded — so the water "
-                     "surface is level ACROSS a channel and descends ALONG it",
-            "profile": "depth = depth_by_order(order) * smoothstep(distance from "
-                       "bank / modelled channel half-width), cut in full while the "
-                       "sample is within bank_tolerance_m of the water level and "
-                       "tapering to nothing at twice that; a one-sample channel "
-                       "takes full depth as a step",
-            "rationale": "the river water surface is the uncarved ground under the "
-                         "channel, so the trench is the entire water column. Carving "
-                         "down rather than raising the surface keeps a river in its "
-                         "landscape instead of on top of it; levelling across the "
-                         "channel and stopping the carve at the waterline keeps it "
-                         "off the cliffs beside it.",
-        }
-        res.manifest["water_surface"] = wsurf
-
-        wid = waterid.export_water_id_tiles(plan, water_id_levels, out_dir)
-        res.manifest["atlas"]["water_id_file"] = wid["atlas_file"]
-        res.manifest["water_id"] = wid
-
-        res.manifest["water_vector"] = rivernet.export_river_network(
-            river_net, plan, out_dir, emit_geojson=emit_geojson)
-
-        res.manifest["generator"] = rivernet.generator_metadata(plan, {
-            "source_kind": source_kind,
-            "nodata_fill_m": nodata_fill_m,
-            "height_min_m": res.height_min,
-            "height_max_m": res.height_max,
-            "tile_cells": plan.tile_cells,
-            "water": water_params,
-        })
-
-        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-            json.dump(res.manifest, f, indent=2)
-    else:
-        import os
-        from . import rivernet
-        res.manifest["generator"] = rivernet.generator_metadata(plan, {
-            "source_kind": source_kind,
-            "nodata_fill_m": nodata_fill_m,
-            "height_min_m": res.height_min,
-            "height_max_m": res.height_max,
-            "tile_cells": plan.tile_cells,
-            "water": None,
-        })
-        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-            json.dump(res.manifest, f, indent=2)
-
-    return res
+    return _process.run_process(
+        plan, leaf, out_dir,
+        features=features,
+        source_kind=source_kind,
+        nodata_fill_m=nodata_fill_m,
+        height_min=height_min,
+        height_max=height_max,
+        include_water=include_water,
+        water_opts=water_opts,
+        progress=_proc_progress,
+    )

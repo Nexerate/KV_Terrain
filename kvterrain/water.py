@@ -944,24 +944,57 @@ def describe_water_services(*, session=None) -> list:
     return out
 
 
+# The three layer queries a water fetch makes, in order. Named so a caller can
+# size a progress bar before the first byte arrives.
+WATER_LAYER_LABELS = ("rivers", "main-rivers", "lakes")
+
+
+def fetch_water_geojson(
+    plan: core.GridPlan, *, include_main_rivers: bool = True,
+    session=None, progress: Optional[Callable[[int, int, str], None]] = None,
+    on_layer: Optional[Callable[[int, int, str], None]] = None,
+) -> tuple[list, list, list]:
+    """
+    Live fetch of the three NVE layers intersecting the plan bbox, returned RAW:
+    `(elvenett, hovedelv, lakes)` as GeoJSON feature lists, already reprojected by
+    the server into the plan's CRS.
+
+    Raw rather than parsed because this is what `kvterrain.dataset` freezes on
+    disk. Attribute resolution (`features_from_geojson`) is deliberately left for
+    process time — it is fuzzy matching against field names NVE does not
+    guarantee, and keeping the raw features means a better field map applies to
+    datasets already fetched.
+
+    `on_layer(i, n, label)` fires immediately BEFORE each layer query, so a UI can
+    move its bar to the right third before a slow query starts rather than after.
+    """
+    import requests
+    sess = session or requests.Session()
+    bbox = plan.bbox_utm
+
+    layers = [(RIVER_SERVICE, RIVER_LAYER_ALL, "rivers")]
+    if include_main_rivers:
+        layers.append((RIVER_SERVICE, RIVER_LAYER_MAIN, "main-rivers"))
+    layers.append((LAKE_SERVICE, LAKE_LAYER, "lakes"))
+
+    got: dict = {}
+    for i, (service, layer, label) in enumerate(layers):
+        if on_layer:
+            on_layer(i, len(layers), label)
+        got[label] = _arcgis_query_geojson(service, layer, plan.epsg, bbox,
+                                           session=sess, progress=progress,
+                                           label=label)
+    return got.get("rivers", []), got.get("main-rivers", []), got.get("lakes", [])
+
+
 def fetch_water_features(
     plan: core.GridPlan, *, include_main_rivers: bool = True,
     session=None, progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> WaterFeatures:
     """Live fetch of rivers + lakes intersecting the plan bbox, in the plan CRS."""
-    import requests
-    sess = session or requests.Session()
-    bbox = plan.bbox_utm
-
-    river_all = _arcgis_query_geojson(RIVER_SERVICE, RIVER_LAYER_ALL, plan.epsg, bbox,
-                                      session=sess, progress=progress, label="rivers")
-    river_main = []
-    if include_main_rivers:
-        river_main = _arcgis_query_geojson(RIVER_SERVICE, RIVER_LAYER_MAIN, plan.epsg,
-                                           bbox, session=sess, progress=progress,
-                                           label="main-rivers")
-    lakes = _arcgis_query_geojson(LAKE_SERVICE, LAKE_LAYER, plan.epsg, bbox,
-                                  session=sess, progress=progress, label="lakes")
+    river_all, river_main, lakes = fetch_water_geojson(
+        plan, include_main_rivers=include_main_rivers, session=session,
+        progress=progress)
     return features_from_geojson(river_all, river_main, lakes)
 
 
@@ -1254,3 +1287,69 @@ def synthetic_water_features(plan: core.GridPlan) -> WaterFeatures:
         main_rivers=[main],
         lakes=[lake],
     )
+
+# --------------------------------------------------------------------------- #
+# Serialise back to raw GeoJSON                                                #
+# --------------------------------------------------------------------------- #
+
+def features_to_geojson(feats: "WaterFeatures") -> tuple[list, list, list]:
+    """
+    Inverse of `features_from_geojson`: typed features -> the three raw GeoJSON
+    feature lists (elvenett, hovedelv, lakes) a live fetch would have returned.
+
+    This exists so `kvterrain.dataset` can store a SYNTHETIC water fetch in the
+    same raw form as a real one. Demo datasets then travel the identical
+    raw-GeoJSON -> `features_from_geojson` -> rasterise path as live ones, which
+    is the whole point of an offline dry run — a demo that skipped the parse
+    would not exercise the code most likely to break when NVE renames a field.
+
+    Properties are written under the FIRST candidate spelling for each logical
+    field, so `resolve_fields` matches them exactly. Area is emitted in m² under
+    a key that does not end in `km2`, so the unit heuristic reads it correctly.
+    """
+    def _river_feature(seg: "RiverSeg", idx: int, identity: bool) -> dict:
+        props = {RIVER_ORDER_FIELDS[0]: int(seg.order)}
+        if identity:
+            for key, cands in (("strekn_lnr", RIVER_STREKN_FIELDS),
+                               ("elvid", RIVER_ELVID_FIELDS),
+                               ("vassdragsnr", RIVER_VASSDRAG_FIELDS),
+                               ("vatnlnr", RIVER_VATNLNR_FIELDS),
+                               ("vnrnfelt", RIVER_CATCHMENT_FIELDS)):
+                val = getattr(seg, key)
+                if val is not None:
+                    props[cands[0]] = val
+        return {
+            "type": "Feature",
+            "properties": props,
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[float(x), float(y)]
+                                for x, y in np.asarray(seg.xy, dtype=np.float64)],
+            },
+        }
+
+    rivers = [_river_feature(s, i, True) for i, s in enumerate(feats.rivers)]
+    main = [_river_feature(s, i, False) for i, s in enumerate(feats.main_rivers)]
+
+    lakes = []
+    for lp in feats.lakes:
+        props = {}
+        if lp.lopenr is not None:
+            props[LAKE_ID_FIELDS[0]] = int(lp.lopenr)
+        if lp.navn is not None:
+            props[LAKE_NAME_FIELDS[0]] = str(lp.navn)
+        if lp.area_m2 is not None:
+            props["areal"] = float(lp.area_m2)          # m², no km2 suffix
+        if lp.hoyde_moh is not None:
+            props[LAKE_HOYDE_FIELDS[0]] = float(lp.hoyde_moh)
+        lakes.append({
+            "type": "Feature",
+            "properties": props,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[float(x), float(y)]
+                                 for x, y in np.asarray(r, dtype=np.float64)]
+                                for r in lp.rings],
+            },
+        })
+    return rivers, main, lakes
