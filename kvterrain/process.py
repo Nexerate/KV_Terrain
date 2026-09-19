@@ -308,39 +308,51 @@ def run_process(
         bed_target = None
         shaped_profiles = None
         river_surf = river_surf_measured
-        if downhill_bed:
-            # Shape the densified profile against dry banks, carry it through the
-            # graph, and make confluences and lake inlets accordant. The same
-            # shaped vertices drive the raster, the carve target and rivers.bin.
-            low_level, bed_target, bed_report, shaped_profiles = riverbed.downhill_river_bed(
-                plan, traced, water_leaf, leaf_uncarved, river_level,
+
+        # 2b. Shape and carve together.  The bank is a bilinear read just outside
+        #     the runtime stamp, so its four corners can include river pixels that
+        #     this very carve lowers.  One pre-carve ceiling therefore cannot
+        #     guarantee the post-carve bank invariant.  Re-evaluate against the
+        #     resulting terrain and rebuild from the same uncarved snapshot; a
+        #     bounded correction pass closes that feedback without accumulating
+        #     carve depth.
+        stages.begin("carve_rivers")
+        bank_ground = leaf_uncarved
+        passes = riverbed.BANK_PROFILE_PASSES if downhill_bed else 1
+        for bank_pass in range(passes):
+            if downhill_bed:
+                low_level, bed_target, bed_report, shaped_profiles = riverbed.downhill_river_bed(
+                    plan, traced, water_leaf, leaf_uncarved, river_level,
+                    depth_scale=depth_scale,
+                    width_by_order=raster_opts.get("width_by_order"),
+                    width_scale=raster_opts.get("width_scale", 1.0),
+                    bank_ground=bank_ground,
+                    starting_profiles=(shaped_profiles if bank_pass else None),
+                    return_profiles=True)
+                river_surf = watersurface.apply_lake_tie_in(low_level, lake_tie)
+                del low_level
+
+            leaf = bathymetry.carve_river_beds(
+                leaf_uncarved, water_leaf.type, water_leaf.weight, plan.spacing_m,
+                level=river_surf_measured,
+                bed_target=bed_target,
+                surface_target=river_surf if downhill_bed else None,
+                bank_tolerance_m=bank_tol_m,
                 depth_scale=depth_scale,
                 width_by_order=raster_opts.get("width_by_order"),
                 width_scale=raster_opts.get("width_scale", 1.0),
-                return_profiles=True)
-            river_surf = watersurface.apply_lake_tie_in(low_level, lake_tie)
-            del low_level
+            )
+
+            if downhill_bed:
+                # ...and along each polyline's own sample path, which the
+                # cross-section carve cannot reach where a stream rasterised to
+                # a gappy mask.  Its dry samples also participate in the next
+                # pass's bank ceiling.
+                bed_report.update(riverbed.burn_downhill_paths(
+                    plan, traced, water_leaf, leaf))
+                bank_ground = leaf
+                bed_report["bank_profile_passes"] = int(passes)
         del river_level, lake_tie
-
-        # 2b. Carve the river channels. The water surface sits on the ground, so
-        #     this trench is the entire water column — see carve_river_beds.
-        stages.begin("carve_rivers")
-        leaf = bathymetry.carve_river_beds(
-            leaf, water_leaf.type, water_leaf.weight, plan.spacing_m,
-            level=river_surf_measured,
-            bed_target=bed_target,
-            surface_target=river_surf if downhill_bed else None,
-            bank_tolerance_m=bank_tol_m,
-            depth_scale=depth_scale,
-            width_by_order=raster_opts.get("width_by_order"),
-            width_scale=raster_opts.get("width_scale", 1.0),
-        )
-
-        if downhill_bed:
-            # ...and along each polyline's own sample path, which the cross-section
-            # carve cannot reach where a stream rasterised to a gappy mask.
-            bed_report.update(riverbed.burn_downhill_paths(
-                plan, traced, water_leaf, leaf))
         # Descent measured on the samples the polylines actually cross, with the
         # enforcement on or off, so the two runs can be compared.
         bed_report.update(riverbed.pixel_descent(plan, traced, leaf))

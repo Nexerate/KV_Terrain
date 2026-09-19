@@ -120,6 +120,7 @@ def _topological_order(segments: list) -> tuple[list, int]:
 CONFLUENCE_MAX_GRADE = 0.30
 GRADE_TAPER_VERTICES = 4
 MASK_EDGE_DIAGONAL_CELLS = 0.70711
+BANK_PROFILE_PASSES = 2
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
@@ -205,7 +206,12 @@ def _bank_ceiling(plan: core.GridPlan, xy: np.ndarray, ground: np.ndarray,
     strip_edge = (max(float(half_width_m), 0.5 * spacing) +
                   MASK_EDGE_DIAGONAL_CELLS * spacing)
     for side in (-1.0, 1.0):
-        for reach in (strip_edge, strip_edge + spacing):
+        # The runtime-profile check reads the first dry mesh vertex half a sample
+        # beyond the stamp.  Include that exact position, not just the two points
+        # bracketing it: a bilinear surface can dip between them when one of its
+        # corners belongs to the carved strip.
+        for reach in (strip_edge, strip_edge + 0.5 * spacing,
+                      strip_edge + spacing):
             q = np.asarray(xy, dtype=np.float64) + normal * (side * reach)
             h, ok = _dry_bilinear(plan, ground, water_type, q)
             ceiling[ok] = np.minimum(ceiling[ok], h[ok])
@@ -320,12 +326,18 @@ def downhill_profiles(
     width_by_order: Optional[dict] = None,
     width_scale: float = 1.0,
     confluence_grade: float = CONFLUENCE_MAX_GRADE,
+    bank_ground: Optional[np.ndarray] = None,
+    starting_profiles: Optional[dict] = None,
 ) -> dict:
     """
     Per-segment (level, bed, level_downhill, bed_downhill), float64, keyed by
     seg_id, plus the count of segments that sat in a link cycle.
     """
     depth_by_order = depth_by_order or kvbathy.DEFAULT_RIVER_DEPTH_BY_ORDER
+    bank_ground = ground if bank_ground is None else np.asarray(bank_ground)
+    if bank_ground.shape != ground.shape:
+        raise ValueError(
+            f"bank_ground {bank_ground.shape} != ground {ground.shape}")
     segs = traced.segments
     by_id = {s.seg_id: s for s in segs}
     order, n_cyclic = _topological_order(segs)
@@ -343,7 +355,7 @@ def downhill_profiles(
         bed = g - depth
         half_w = _segment_half_width(s.order, plan.spacing_m, width_by_order, width_scale)
         half_widths[sid] = half_w
-        ceiling = (_bank_ceiling(plan, s.xy, ground, wg.type, half_w)
+        ceiling = (_bank_ceiling(plan, s.xy, bank_ground, wg.type, half_w)
                    if wg is not None else np.full(g.shape, np.inf, dtype=np.float64))
         ceilings[sid] = ceiling
 
@@ -353,8 +365,19 @@ def downhill_profiles(
             if u in out:          # an upstream still unplaced sits in a cycle
                 seed_l = min(seed_l, out[u][2][-1])
                 seed_old = min(seed_old, legacy[u][-1])
-        radius = min(6, max(2, int(np.ceil(half_w / max(plan.spacing_m, 1e-9)))))
-        lm = _shape_profile(lvl, ceiling, radius, seed_l)
+        if starting_profiles is None:
+            radius = min(6, max(2, int(np.ceil(
+                half_w / max(plan.spacing_m, 1e-9)))))
+            lm = _shape_profile(lvl, ceiling, radius, seed_l)
+        else:
+            # A post-carve bank pass starts with the already accepted profile.
+            # Only new dry-bank information may lower it.  Shape that correction
+            # once so a newly discovered low bank starts the descent upstream
+            # instead of turning the entire downstream reach into a staircase.
+            previous = np.asarray(starting_profiles[sid][2], dtype=np.float64)
+            radius = min(6, max(2, int(np.ceil(
+                half_w / max(plan.spacing_m, 1e-9)))))
+            lm = _shape_profile(previous, ceiling, radius, seed_l)
         # The old exporter profile, retained only to report how much this change
         # lowers levels relative to the previous running-minimum implementation.
         old = np.fmin.accumulate(np.concatenate([[seed_old], lvl]))[1:]
@@ -465,6 +488,8 @@ def downhill_river_bed(
     depth_scale: float = 1.0,
     width_by_order: Optional[dict] = None,
     width_scale: float = 1.0,
+    bank_ground: Optional[np.ndarray] = None,
+    starting_profiles: Optional[dict] = None,
     return_profiles: bool = False,
 ) -> tuple:
     """
@@ -479,7 +504,8 @@ def downhill_river_bed(
     prof = downhill_profiles(
         plan, traced, ground, wg=wg, depth_by_order=depth_by_order,
         depth_scale=depth_scale, width_by_order=width_by_order,
-        width_scale=width_scale)
+        width_scale=width_scale, bank_ground=bank_ground,
+        starting_profiles=starting_profiles)
     profiles = prof["profiles"]
 
     SY, SX = plan.samples_y, plan.samples_x

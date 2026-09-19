@@ -173,6 +173,22 @@ def test_bank_ceiling_starts_beyond_the_carved_strip():
     assert np.allclose(ceiling, expected)
 
 
+def test_bank_ceiling_reads_the_measurements_half_sample_position():
+    plan, ground, wg = world()
+    ground = np.full_like(ground, 100.0)
+    s = seg(0, range(4, 24))
+    edge = 0.5 * plan.spacing_m + riverbed.MASK_EDGE_DIAGONAL_CELLS * plan.spacing_m
+    normal = riverbed._vertex_normals(s.xy)
+    midpoint = s.xy + normal * (edge + 0.5 * plan.spacing_m)
+    row, col = rivernet.world_to_grid(plan, midpoint[:, 0], midpoint[:, 1])
+    rr = np.rint(row).astype(int)
+    ground[rr, np.rint(col).astype(int)] = 90.0
+    ceiling = riverbed._bank_ceiling(plan, s.xy, ground, wg.type, 2.5)
+    measured, ok = riverbed._dry_bilinear(plan, ground, wg.type, midpoint)
+    assert ok.all()
+    assert np.all(ceiling <= measured + 1e-12)
+
+
 def test_confluence_tail_is_accordant_and_bounded_by_max_grade():
     plan, ground, wg = world()
     ground = np.full_like(ground, 91.0)
