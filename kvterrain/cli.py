@@ -591,9 +591,9 @@ def _add_process_args(p):
                         "(default: 2)")
     p.add_argument("--downhill-river-bed", action=argparse.BooleanOptionalAction,
                    default=True, dest="downhill_river_bed",
-                   help="enforce, before carving, that no river bed or water level "
-                        "rises downstream: a running minimum over the densified "
-                        "polylines, carried across links and through lakes "
+                   help="shape each densified river profile below its dry banks, "
+                        "smooth the downstream running minimum, and tie "
+                        "confluences/lake inlets before carving the matching bed "
                         "(default: on). This changes heights.atlas.")
     p.add_argument("--lake-edge-is-shore", action=argparse.BooleanOptionalAction,
                    default=True, dest="lake_edge_is_shore",

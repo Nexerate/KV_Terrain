@@ -12,18 +12,16 @@ Terrain edits stay valid automatically: the surface is a property of the water,
 the depth is re-derived from whatever terrain is current.
 
 Lakes get their authoritative NVE `hoyde` (see water.WaterGrid.lake_surface_moh).
-Rivers have NO elevation in Elvenett (2D polylines), so their surface is derived
-here from the leaf DTM under each channel's CENTRELINE:
+Rivers have NO elevation in Elvenett (2D polylines), so an initial surface is
+derived here from the leaf DTM under each channel's CENTRELINE:
 
     surface(x) = ground under the nearest centreline sample   # see channel_level
 
-i.e. a river's water surface is level across its channel and descends along it,
-sitting on the ground rather than above it, and the water column comes from the
-trench `bathymetry.carve_river_beds` cuts beneath. A river pixel adjacent to a lake
-is RAISED to that lake's surface where the lake stands higher, so the two agree at
-a flooded inlet/outlet — but never lowered to it, which used to clip the last
-texels of every channel to zero depth and leave a dry gap between each river and
-the lake it runs into.
+`riverbed.downhill_river_bed` then replaces that raster with the spread of a
+bank-capped, downstream-only, symmetrically smoothed vertex profile, accordant at
+confluences and graded onto lakes. The water column comes from the matching trench
+`bathymetry.carve_river_beds` cuts beneath. The raise-only lake tie-in remains as a
+raster guard after the vertex-level inlet grade.
 
 Up to 0.5.0 this added a raise by Strahler order instead — `bed + 1.5..11 m` — and
 carved nothing. That guaranteed a water column, but it built it upward: the water
@@ -39,10 +37,9 @@ sampled bed (isotonic regression / PAVA) and widened it to the buffer; that meth
 spiked wherever the chord between sparse vertices crossed a bank. `river_surface_moh`
 documents the failure in full. Do not reintroduce it here.
 
-The polyline products in `rivernet` apply this SAME rule at densified vertices, so
-the raster and the polylines agree by construction rather than by coincidence. The
-raster remains authoritative for display; the polylines exist for the runtime burn,
-which needs the connectivity and ordering that rasterisation destroys.
+The shaped densified vertices are authoritative: their levels are spread into the
+raster and passed directly to `rivernet`, so both products share one source. The
+polylines retain connectivity and ordering that rasterisation destroys.
 
 Coarse levels use a WATER-ONLY downsample (a parent cell is water if ANY child is;
 its surface is the min over water children -- the conservative spill level), so the
@@ -472,11 +469,11 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
                    "no rim scan, no rain-fill, valid across terrain edits.",
         "lake_surface": "authoritative NVE hoyde, or a level read off the LiDAR water "
                         "surface inside the polygon (metres above sea level)",
-        "river_surface": "the UNCARVED leaf-DTM ground height under the channel — the river "
-                         "surface sits ON the terrain, and the water column comes from the "
-                         "trench carved beneath it (see river_carve_depth_by_order_m); "
-                         "raised to the lake surface, never lowered to it, where a river "
-                         "meets a lake.",
+        "river_surface": "a bank-capped, downstream-only profile derived from the UNCARVED "
+                         "leaf DTM along each centreline, smoothed with a symmetric box mean "
+                         "and spread flat across the channel. Confluences are accordant and "
+                         "inlets grade onto their lake; the bed is carved beneath the same "
+                         "profile (see river_carve_depth_by_order_m).",
         "river_carve_depth_by_order_m": {
             str(k): v for k, v in kvbathy.DEFAULT_RIVER_DEPTH_BY_ORDER.items()},
         "tiles_written": tiles_written,

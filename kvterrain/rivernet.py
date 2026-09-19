@@ -12,11 +12,11 @@ The runtime burn needs all four, so this module keeps them.
 WHERE THE Z COMES FROM
 ----------------------
 Elvenett polylines are 2D. There is no Z in the source to "keep" — it has to be
-constructed, and this module constructs it exactly the way the raster already
-does, because that is the behaviour that visibly works:
+constructed. The bed comes from the carved terrain; the surface comes from the
+profile that drove that carve:
 
     z(v)     = carved leaf DTM sampled beneath vertex v   <- the BED
-    level(v) = z(v) + carve_depth_for_order(order)        <- the water SURFACE
+    level(v) = shaped centreline profile                  <- the water SURFACE
 
 Two values per vertex, deliberately, because they have different consumers:
 
@@ -24,23 +24,23 @@ Two values per vertex, deliberately, because they have different consumers:
     and it is what the burn runs its running-minimum over. Burning against the
     surface instead would cut ~1-11 m too shallow and leave the DEM dams in place.
   * `level` is the authored water surface, and it is what a river pins to when it
-    is not disturbed. It is read VERBATIM out of the raster surface field when one
-    is supplied, so the polyline and the raster cannot drift apart; the
-    `z + carve_depth` form above is the fallback, and it reconstructs the same
-    number because the surface a river is given IS the ground the trench was cut
-    from.
+    is not disturbed. `riverbed` caps the raw centreline ground at dry banks,
+    makes it downstream-only, smooths its staircase and ties it to confluences
+    and lakes. The raster is spread from those same values. Reading a nearest
+    raster pixel back here would lose that sub-pixel profile and can introduce
+    rises, so the shaped array is passed directly. `z + carve_depth` remains the
+    compatibility fallback when shaping is disabled.
 
-This is the same per-pixel rule as `watersurface.river_surface_moh`, applied at
-vertices. It is NOT a fitted profile. An earlier revision rasterised the centreline,
+This is NOT a fitted profile. An earlier revision rasterised the centreline,
 fitted a monotone-descending profile (PAVA) and widened it back out; wherever the
 chord between two sparse Elvenett vertices cut across a bank, the fit pooled the
 surface metres above the bed and the widen smeared that inflated value onto lower
 neighbours, so the runtime read depth >> 0 and the river spiked.
 
-The defence here is DENSIFICATION, not fitting. Vertices are resampled to the leaf
-spacing before Z is sampled, so the polyline follows the real channel instead of
-cutting chords across it. This module REPORTS non-monotonic descent and never
-corrects `z`; descent is enforced on the terrain before the carve, by
+The defence here is DENSIFICATION plus bank-safe profile shaping, not fitting.
+Vertices are resampled to the leaf spacing before Z is sampled, so the polyline
+follows the real channel instead of cutting chords across it. This module REPORTS
+non-monotonic descent and never corrects `z`; descent is enforced on the terrain before the carve, by
 `riverbed` (the downhill-only bed), and `z` is sampled from that carved bed. The
 numbers here sample bilinearly, so they also read the banks beside a trench and
 do not reach zero even when the channel's own samples never rise.
@@ -455,6 +455,7 @@ def build_river_network(
     depth_by_order: Optional[dict] = None,
     depth_scale: float = 1.0,
     traced: Optional[TracedNetwork] = None,
+    shaped_profiles: Optional[dict] = None,
     progress: Optional[Callable[[float, str], None]] = None,
 ) -> RiverNetwork:
     """
@@ -467,15 +468,14 @@ def build_river_network(
     `height_leaf` must be the LEAF DTM the surface raster was built against, so the
     polyline `z` (the bed) matches the bed the raster used.
 
-    `water_surface` is the COMBINED raster surface field. When supplied, each
-    vertex's `level` is read straight out of it, which makes polyline/raster
-    agreement exact rather than merely close. Recomputing `bed + raise`
-    independently is not good enough: the raster applies rules the recomputation
-    would miss — most importantly it pins river pixels ADJACENT to a lake to that
-    lake's surface, so a vertex near an inlet would otherwise carry `bed + raise`
-    while the raster carried the lake's `hoyde`. On steep inlet banks that is a
-    100 m+ disagreement on the handful of vertices that matter most, since they
-    are precisely where the burn hands off to the lake basin.
+    `shaped_profiles`, when supplied, is the per-segment output of
+    `riverbed.downhill_profiles`. It is the authority for open-channel `level`:
+    the raster was spread FROM these vertices, so reading a nearest raster pixel
+    back would reintroduce the sub-pixel disagreement that shaping removed.
+    Authored lake spans are still pinned to their lake level.
+
+    `water_surface` remains the compatibility source when no shaped profile is
+    supplied. In that path each vertex reads the combined raster verbatim.
 
     Without `water_surface` the function falls back to `bed + carve depth` plus
     lake-span pinning, which is correct in the interior and wrong only at those
@@ -516,6 +516,15 @@ def build_river_network(
         # wherever the raster actually carries a surface at this vertex.
         level = z + depth_for_order(s.order, depth_by_order, depth_scale)
 
+        if shaped_profiles is not None and s.seg_id in shaped_profiles:
+            shaped = np.asarray(shaped_profiles[s.seg_id][2], dtype=np.float64)
+            if shaped.shape != level.shape:
+                raise ValueError(
+                    f"shaped profile for segment {s.seg_id} has {shaped.shape}, "
+                    f"expected {level.shape}")
+            take = np.isfinite(shaped)
+            level[take] = shaped[take]
+
         # Inside a lake, the authored lake surface wins over bed+raise: the lake's
         # NVE `hoyde` is real data and the raise is a synthetic constant, so a
         # through-line must not disagree with the pool it crosses.
@@ -524,11 +533,10 @@ def build_river_network(
             if h is not None and np.isfinite(h):
                 level[a:b + 1] = float(h)
 
-        # Then, wherever the raster actually carries water at this vertex's pixel,
-        # take ITS value verbatim. The raster is the display authority; this makes
-        # the two products identical instead of independently derived, and it picks
-        # up the adjacent-to-lake pinning that bed+raise cannot know about.
-        if ws is not None:
+        # Compatibility path without shaped profiles: wherever the raster carries
+        # water at this vertex's pixel, take its value verbatim, including the old
+        # adjacent-to-lake tie-in.
+        if ws is not None and shaped_profiles is None:
             # INDEX FIRST, convert after. `np.asarray(ws, dtype=np.float64)`
             # here would rebuild the ENTIRE surface grid as float64 — 537 MB
             # on an 8193² export — allocate it, convert it, read a few hundred
@@ -987,9 +995,10 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
         "vertex_fields": ["x_rel_origin_m", "y_rel_origin_m", "z_bed_m", "level_surface_m"],
         "vertex_order": "upstream_to_downstream",
         "note": ("z is the sampled DTM BED — the floor of the carved channel — burn "
-                 "against this. level is the water SURFACE (the ground above that "
-                 "channel, or the lake's authored level inside a lake span) — pin "
-                 "to this. Loaded once, resident; not streamed."),
+                 "against this. level is the shaped water SURFACE: capped at dry "
+                 "banks, downstream-only, smoothed, accordant at confluences and "
+                 "graded onto lakes (authored lake level inside a span) — pin to "
+                 "this. Loaded once, resident; not streamed."),
     }
 
 

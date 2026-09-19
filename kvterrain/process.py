@@ -306,17 +306,18 @@ def run_process(
             plan, features, water_leaf, leaf_uncarved,
             vertex_stride_m=vertex_stride_m, progress=stages.within)
         bed_target = None
+        shaped_profiles = None
         river_surf = river_surf_measured
         if downhill_bed:
-            # WATER_REDESIGN.md §4.1: running minimum over the densified bed and
-            # level profiles, carried across links and through lake spans, spread
-            # back over each channel. The lake tie-in (raise-only) is re-applied
-            # on top, exactly as river_surface_moh would have.
-            low_level, bed_target, bed_report = riverbed.downhill_river_bed(
+            # Shape the densified profile against dry banks, carry it through the
+            # graph, and make confluences and lake inlets accordant. The same
+            # shaped vertices drive the raster, the carve target and rivers.bin.
+            low_level, bed_target, bed_report, shaped_profiles = riverbed.downhill_river_bed(
                 plan, traced, water_leaf, leaf_uncarved, river_level,
                 depth_scale=depth_scale,
                 width_by_order=raster_opts.get("width_by_order"),
-                width_scale=raster_opts.get("width_scale", 1.0))
+                width_scale=raster_opts.get("width_scale", 1.0),
+                return_profiles=True)
             river_surf = watersurface.apply_lake_tie_in(low_level, lake_tie)
             del low_level
         del river_level, lake_tie
@@ -328,6 +329,7 @@ def run_process(
             leaf, water_leaf.type, water_leaf.weight, plan.spacing_m,
             level=river_surf_measured,
             bed_target=bed_target,
+            surface_target=river_surf if downhill_bed else None,
             bank_tolerance_m=bank_tol_m,
             depth_scale=depth_scale,
             width_by_order=raster_opts.get("width_by_order"),
@@ -400,16 +402,17 @@ def run_process(
         water_id_levels = waterid.build_water_id_pyramid(water_id_leaf, plan.num_levels)
 
         # 6. The polylines. `z` is sampled from the river-carved, lake-UNCARVED bed
-        #    (step 2b) because the runtime burns it; `level` is read verbatim from
-        #    `water_surface`, so polyline level still equals the raster surface
-        #    pixel-for-pixel.
+        #    (step 2b) because the runtime burns it; open-channel `level` comes
+        #    directly from the shaped vertices that were spread into the raster,
+        #    avoiding a lossy nearest-pixel readback. Lake spans stay authored.
         stages.begin("river_network")
         river_net = rivernet.build_river_network(
             plan, features, water_leaf, leaf_bed_uncarved,
             water_surface=water_surface,
+            shaped_profiles=shaped_profiles,
             vertex_stride_m=vertex_stride_m, depth_scale=depth_scale,
             traced=traced, progress=stages.within)
-        del leaf_uncarved, leaf_bed_uncarved, bed_target, river_surf_measured
+        del leaf_uncarved, leaf_bed_uncarved, bed_target, river_surf_measured, shaped_profiles
 
         # 7. THE DEPRESSION HIERARCHY, on the heights exactly as they will be
         #    packed. Nothing below this point may touch `leaf`: the hierarchy
@@ -541,20 +544,19 @@ def run_process(
             "method": "trench_under_the_channel_scaled_by_modelled_width",
             "bank_tolerance_m": float(water_params.get("river_bank_tolerance_m", 0.0)),
             "downhill_bed": bed_report,
-            "level": "the ground under the channel's own centreline, spread flat "
-                     "across the samples that centreline seeded — so the water "
-                     "surface is level ACROSS a channel and descends ALONG it",
+            "level": "the uncarved centreline ground capped at the lowest dry bank, "
+                     "made downstream-only and smoothed by a symmetric box mean; "
+                     "accordant at confluences and graded onto authored lake levels, "
+                     "then spread flat across the channel",
             "profile": "depth = depth_by_order(order) * smoothstep(distance from "
                        "bank / modelled channel half-width), cut in full while the "
                        "sample is within bank_tolerance_m of the water level and "
                        "tapering to nothing at twice that; a one-sample channel "
                        "takes full depth as a step",
-            "rationale": "the river water surface is the uncarved ground under the "
-                         "channel, so the trench is the entire water column. Carving "
-                         "down rather than raising the surface keeps a river in its "
-                         "landscape instead of on top of it; levelling across the "
-                         "channel and stopping the carve at the waterline keeps it "
-                         "off the cliffs beside it.",
+            "rationale": "the bank ceiling prevents a water sheet sloping off a low "
+                         "channel edge; symmetric smoothing removes running-minimum "
+                         "stairs without fitting or raising; the bed target follows "
+                         "every lowering so the shaped surface still fills its trench.",
         }
         res.manifest["water_surface"] = wsurf
 

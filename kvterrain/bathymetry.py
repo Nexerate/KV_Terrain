@@ -843,6 +843,7 @@ def carve_river_beds(
     width_by_order: dict | None = None,
     width_scale: float = 1.0,
     bed_target: np.ndarray | None = None,
+    surface_target: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Cut a trench under every river pixel: deepest along the channel's middle,
@@ -900,6 +901,12 @@ def carve_river_beds(
     still left alone, and no sample is ever cut below it. The taper keeps measuring
     against `level` as passed, which must be the ORIGINAL channel level, not the
     lowered one, or lowering the level would switch the carve off.
+
+    `surface_target` is that shaped level raster. After the weighted trench pull,
+    any river sample still standing above it is lowered to the waterline. This is
+    the dry-band guard: a bank cap can move the surface down by more than the old
+    bank tolerance, but ground inside the rasterised channel must still be cut to
+    the new rim rather than left as an empty strip inside the water width.
 
     `order` is the per-pixel stream order (`WaterGrid.weight`). Returns a copy.
     """
@@ -976,4 +983,8 @@ def carve_river_beds(
         sel = is_river & np.isfinite(tgt) & (h0 > tgt)
         pulled = h0[sel] - (h0[sel] - tgt[sel]) * weight[sel]
         out[sel] = np.minimum(out[sel], pulled).astype(out.dtype)
+    if surface_target is not None:
+        surf = np.asarray(surface_target, dtype=np.float32)
+        sel = is_river & np.isfinite(surf) & (out > surf)
+        out[sel] = surf[sel].astype(out.dtype)
     return out

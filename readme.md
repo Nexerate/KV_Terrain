@@ -575,13 +575,20 @@ and leaves the water surface where the ground is:
   to nothing at twice that, so terrain that will never hold water — a bank, a cliff
   face the buffer lapped onto — is left alone rather than notched.
 
-- **Downhill-only river bed** (`--downhill-river-bed`, on by default). Before the
-  river carve, each densified polyline's bed and water level are replaced by
-  their running minimum going downstream, separately (so a bigger stream order
-  downstream cannot raise the surface), carried across `downstream` links and
-  straight through lake spans. The lowered level becomes the river surface; the
-  carve pulls each channel sample toward the lowered bed with its usual
-  cross-section and bank taper, never below it. At 5 m spacing a 2–3 m stream
+- **Bank-capped downhill river profile** (`--downhill-river-bed`, on by default).
+  Before the river carve, each densified centreline samples the lowest dry bank
+  at the runtime-visible carved-strip edge and one texel beyond. That edge is
+  `max(modelled half-width, half a texel) + 0.70711 texel`, matching the runtime
+  stamp rather than reading inside the strip the exporter lowers. Its raw ground is capped there,
+  made downstream-only across graph links, and smoothed with a symmetric box
+  mean whose half-window is the channel half-width (clamped to 2–6 vertices).
+  Capping and a second running minimum after the mean ensure the ordinary profile
+  never rises or leaves its banks. A downstream-first pass makes confluences accordant
+  and grades lake inlets at no more than 0.3 m/m; a below-lake inlet gets bounded
+  backwater under a downstream-running bank cap. If a low bank makes the lake
+  level unreachable without an uphill step, the final open vertex remains below
+  the lake. The bed target is always `surface − depth`, so every surface lowering
+  carries its trench with it. At 5 m spacing a 2–3 m stream
   rasterises to a gappy mask, so a second pass then walks every polyline's own
   8-connected sample path and lowers it to the running minimum of the carved bed
   (lake samples carry the minimum but are left to the lake carve). An outlet
@@ -770,8 +777,11 @@ and 878 depressions.
 - **Rivers are also kept as polylines.** Rasterising a river destroys its flow
   direction, its connectivity and its links to lakes, so `rivers.bin` keeps them:
   densified vertices with bed `z` and surface `level`, upstream/downstream links
-  and lake spans. `level` is read verbatim from the surface raster, so the two
-  agree by construction.
+  and lake spans. `level` is a shaped centreline profile: capped at the lowest dry
+  bank, downstream-only, smoothed with a symmetric box mean, accordant at
+  confluences and graded onto lake levels. The raster is spread from those same
+  vertices, so the two share one source rather than quantising the profile through
+  a nearest-pixel readback.
 - **Same shared-edge guarantee.** All atlases are sliced from one assembled array
   per product, so adjacent edges are bit-identical and mutually aligned.
 
@@ -890,15 +900,16 @@ and offsets, so the same placement logic applies.
   LiDAR interior capped by a perimeter scan) and carves both beds: lakes deepening
   inward on a straight shore ramp, rivers as a trench under the channel that stops
   at the waterline.
-- `kvterrain/watersurface.py` — computes the unified per-pixel water surface
-  (lakes = `hoyde`, rivers = the levelled channel ground) and packs `surface.atlas`.
+- `kvterrain/watersurface.py` — computes the initial channel-level raster and the
+  unified per-pixel water surface (lakes = `hoyde`, rivers = the shaped profile)
+  and packs `surface.atlas`.
 - `kvterrain/waterid.py` — per-pixel class + authored lake identity, packed into
   `water_id.atlas`.
 - `kvterrain/rivernet.py` — the polyline network: tracing (densify, clip, order,
   lake spans, links) and sampling as two passes, junctions, validation,
   `rivers.bin` / `lakes.json` / `junctions.json`.
-- `kvterrain/riverbed.py` — the downhill-only river bed: running minimums over
-  the traced network, spread over each channel, and the burn along each
+- `kvterrain/riverbed.py` — bank ceilings, symmetric profile smoothing,
+  confluence/lake tie-ins, raster spread and the downhill burn along each
   polyline's sample path.
 - `kvterrain/hierarchy.py` — the depression hierarchy (Numba Priority-Flood),
   the label pyramid, `hierarchy.bin` and `labels.atlas`.
@@ -944,9 +955,9 @@ and offsets, so the same placement logic applies.
   slope every lake deeper than four texels from its bank is at `--lake-max-depth`.
   If you want small lakes shallower, lower that; `--lake-min-depth` is only the
   floor for bodies too small to ramp at all.
-- **River descent is enforced on the terrain, and `rivers.bin` still reports
-  rises.** With `--downhill-river-bed` (the default) the bed and level never rise
-  along a polyline's own samples (see [The carves](#the-carves)). The
+- **River descent is enforced on the terrain and in `rivers.bin`.** With
+  `--downhill-river-bed` (the default) the bed and shaped surface are carried in
+  downstream order along the graph (see [The carves](#the-carves)). The
   `water_vector.validation.descent_*` numbers sample `z` BILINEARLY, which also
   reads the banks beside a narrow trench, so they do not reach zero: on Lierne
   open-channel rises went from 10.5 % to 4.5 %, and the worst from 4.8 m to 14.1 m
@@ -954,15 +965,17 @@ and offsets, so the same placement logic applies.
   level is the measured ground under the centreline and DTM noise makes it step
   up, as before. The downhill bed also cuts through anything a mapped channel
   crosses — a road embankment included.
-- **Confluences get no special treatment, and need none for the surface.** Every
-  river sample takes the level of the NEAREST centreline sample across all
-  centrelines, so tributaries meeting a trunk share one level field rather than
-  per-segment surfaces that could disagree. The segment graph in `rivers.bin`
-  (upstream/downstream links, the highest-order candidate taken as the trunk) is
-  built but not used to shape the surface.
-- **Lake junctions are raised, not pinned.** A river sample touching a lake is
-  lifted to the lake's level where the lake stands higher and otherwise keeps its
-  own level, so a channel arriving over a bank stays wet up to the shoreline.
+- **Confluences are accordant.** In a downstream-first pass, each tributary tail
+  takes the main stem's level while the two channel widths touch, then approaches
+  it at no more than a 0.3 grade. This prevents the nearest-centreline Voronoi
+  boundary from drawing a level edge between the two surfaces.
+- **Lake inlets are graded onto the lake.** A high inlet is lowered onto the
+  authored lake level at the same maximum grade. A river arriving below the lake
+  gets a contiguous backwater tail, capped at a downstream-running minimum of
+  its dry-bank ceilings so the raised tail itself cannot rise. Where a low bank
+  makes all three constraints incompatible, staying below the bank and never
+  rising win over reaching the lake level. The older raise-only raster tie-in
+  remains as a guard, while lake spans themselves carry the authored lake level.
 - **Coarse rivers fade.** A ~5 m channel in a coarse cell has its bed averaged with
   its banks, so `surface − coarse_terrain` shrinks and distant thin rivers render
   faint even though the surface field keeps the cell marked as water. Carving the
