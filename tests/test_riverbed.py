@@ -251,6 +251,28 @@ def test_gentle_drop_ramp_is_backward_tapered_and_depth_bounded():
     assert large[2] - large[3] > 1.75
 
 
+def test_fall_ramp_does_not_cross_lake_spans():
+    xy = np.stack([np.arange(7) * 5.0, np.zeros(7)], axis=1)
+    raw = np.array([10.0, 10.0, 8.0, 8.0, 8.0, 6.0, 6.0])
+    surface = raw.copy()
+    riverbed._soften_gentle_drops(
+        surface, raw, np.full(7, np.inf), xy, [(3, 3, 1)], 1.5, 5.0)
+    assert surface[3] == raw[3]
+
+
+def test_flat_tilt_is_downstream_only_and_depth_bounded():
+    surface = np.array([10.0, 10.0, 10.0, 8.0, 8.0, 8.0])
+    before = surface.copy()
+    n = riverbed._tilt_flat_runs(
+        surface, before, np.full(6, np.inf), [], 1.5,
+        np.full(6, -np.inf))
+    assert n == 2
+    assert np.all(-np.diff(surface[:3]) > 0.01)
+    assert np.allclose(surface[3:], before[3:])
+    assert np.all(np.diff(surface) <= 0.0)
+    assert np.max(before - surface) <= 1.5
+
+
 def test_lake_inlet_is_graded_down_and_lake_expands_into_low_mouth():
     plan, ground, wg = world()
     wg.lake_table = {1: {"level_m": 91.0}}

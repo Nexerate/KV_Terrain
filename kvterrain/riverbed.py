@@ -125,6 +125,7 @@ BANK_EXCESS_CORRECTION_M = 0.5
 GENTLE_FALL_MAX_GRADE = 0.30
 GENTLE_FALL_CONTEXT_VERTICES = 2
 FALL_WHITE_SLOPE = 0.35
+SUNK_GUARD_M = 10.0
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
@@ -323,6 +324,7 @@ def _soften_gentle_drops(surface: np.ndarray, raw: np.ndarray,
                          ceiling: np.ndarray, xy: np.ndarray,
                          lake_spans: list, max_lowering_m: float,
                          stride_m: float, *,
+                         safety_floor: Optional[np.ndarray] = None,
                          max_grade: float = GENTLE_FALL_MAX_GRADE,
                          ground_max_grade: float = FALL_WHITE_SLOPE,
                          context_vertices: int = GENTLE_FALL_CONTEXT_VERTICES,
@@ -361,12 +363,17 @@ def _soften_gentle_drops(surface: np.ndarray, raw: np.ndarray,
             raw[first:last + 1] - float(max_lowering_m))
         bank_floor = np.maximum.accumulate(
             np.where(np.isfinite(local_ceiling),
-                     local_ceiling - 10.0, -np.inf)[::-1])[::-1]
+                     local_ceiling - SUNK_GUARD_M, -np.inf)[::-1])[::-1]
         floor = np.maximum(
             original - float(max_lowering_m),
             np.minimum(original, raw_floor))
         floor = np.maximum(
             floor, np.minimum(original, bank_floor))
+        if safety_floor is not None:
+            safe = np.maximum.accumulate(
+                np.asarray(safety_floor[first:last + 1], dtype=np.float64)[::-1]
+            )[::-1]
+            floor = np.maximum(floor, np.minimum(original, safe))
         original_falls = np.flatnonzero(
             original[:-1] - original[1:] > threshold) + first
         for k in original_falls[::-1]:
@@ -406,6 +413,65 @@ def _soften_gentle_drops(surface: np.ndarray, raw: np.ndarray,
     return report
 
 
+def _tilt_flat_runs(surface: np.ndarray, raw: np.ndarray, ceiling: np.ndarray,
+                    lake_spans: list, max_lowering_m: float,
+                    safety_floor: np.ndarray,
+                    min_step_m: float = 0.011) -> int:
+    """Give newly bank-capped plateaus a tiny downstream fall, within safeguards."""
+    n = int(surface.size)
+    if n < 2:
+        return 0
+    open_vertex = np.ones(n, dtype=bool)
+    for a, b, _lid in lake_spans:
+        open_vertex[max(int(a), 0):min(int(b) + 1, n)] = False
+    padded = np.concatenate([[False], open_vertex, [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    changed = 0
+    for first, stop in zip(edges[0::2], edges[1::2]):
+        first, last = int(first), int(stop) - 1
+        if last <= first:
+            continue
+        original = surface[first:last + 1].copy()
+        local_ceiling = ceiling[first:last + 1]
+        raw_floor = np.minimum.accumulate(
+            raw[first:last + 1] - float(max_lowering_m))
+        bank_floor = np.maximum.accumulate(
+            np.where(np.isfinite(local_ceiling),
+                     local_ceiling - SUNK_GUARD_M, -np.inf)[::-1])[::-1]
+        trench_floor = np.maximum.accumulate(
+            np.asarray(safety_floor[first:last + 1], dtype=np.float64)[::-1]
+        )[::-1]
+        floor = np.maximum(original - float(max_lowering_m),
+                           np.minimum(original, raw_floor))
+        floor = np.maximum(floor, np.minimum(original, bank_floor))
+        floor = np.maximum(floor, np.minimum(original, trench_floor))
+        target = original.copy()
+        flat = original[:-1] - original[1:] < 0.01
+        q = 0
+        while q < flat.size:
+            if not flat[q]:
+                q += 1
+                continue
+            a = q
+            while q < flat.size and flat[q]:
+                q += 1
+            # A plateau that reaches the segment/lake boundary is load-bearing:
+            # tilting it would make the final vertex disagree with its junction
+            # or backwater.  Internal plateaus can lean into the following drop.
+            if q >= flat.size:
+                continue
+            candidate = target.copy()
+            for j in range(a + 1, q + 1):
+                wanted = candidate[j - 1] - float(min_step_m)
+                if candidate[j] > wanted + 1e-12:
+                    candidate[j] = max(wanted, floor[j])
+            if not np.any(np.diff(candidate) > 1e-12):
+                target = candidate
+        changed += int(np.count_nonzero(target < original - 1e-9))
+        surface[first:last + 1] = target
+    return changed
+
+
 def downhill_profiles(
     plan: core.GridPlan,
     traced: "rivernet.TracedNetwork",
@@ -436,8 +502,14 @@ def downhill_profiles(
 
     out: dict = {}
     ceilings: dict = {}
+    safety_floors: dict = {}
     half_widths: dict = {}
     legacy: dict = {}
+    if wg is not None:
+        from scipy.ndimage import maximum_filter
+        high_ground = maximum_filter(np.asarray(ground), size=5)
+    else:
+        high_ground = None
     for sid in order:
         s = by_id[sid]
         row, col = rivernet.world_to_grid(plan, s.xy[:, 0], s.xy[:, 1])
@@ -450,6 +522,10 @@ def downhill_profiles(
         ceiling = (_bank_ceiling(plan, s.xy, bank_ground, wg.type, half_w)
                    if wg is not None else np.full(g.shape, np.inf, dtype=np.float64))
         ceilings[sid] = ceiling
+        safety_floors[sid] = (
+            rivernet._fill_nan_1d(rivernet._bilinear(high_ground, row, col))
+            + depth - 50.0 if high_ground is not None
+            else np.full(g.shape, -np.inf, dtype=np.float64))
 
         seed_l = np.inf
         seed_old = np.inf
@@ -470,9 +546,16 @@ def downhill_profiles(
             radius = min(6, max(2, int(np.ceil(
                 half_w / max(plan.spacing_m, 1e-9)))))
             raw_floor = np.minimum.accumulate(lvl - depth)
+            bank_floor = np.maximum.accumulate(
+                np.where(np.isfinite(ceiling),
+                         ceiling - SUNK_GUARD_M, -np.inf)[::-1])[::-1]
+            trench_floor = np.maximum.accumulate(
+                safety_floors[sid][::-1])[::-1]
             floor = np.maximum(
                 previous - depth,
                 np.minimum(previous, raw_floor))
+            floor = np.maximum(floor, np.minimum(previous, bank_floor))
+            floor = np.maximum(floor, np.minimum(previous, trench_floor))
             floor = np.minimum(floor, float(seed_l))
             needs_correction = previous > ceiling + BANK_EXCESS_CORRECTION_M
             bounded_ceiling = np.where(
@@ -550,7 +633,8 @@ def downhill_profiles(
                     backwater_at_start[uid] = float(main_level)
 
         fall_report = {"candidates": 0, "ramped": 0,
-                       "ground_step": 0, "bank_step": 0}
+                       "ground_step": 0, "bank_step": 0,
+                       "flat_vertices_tilted": 0}
         fall_by_order: dict[int, dict] = {}
         if soften_gentle_drops:
             for sid in order:
@@ -559,14 +643,95 @@ def downhill_profiles(
                 s = by_id[sid]
                 depth = kvbathy.depth_for_order(
                     s.order, depth_by_order, depth_scale)
+                tilted = 0
+                if sid not in backwater_at_start and not s.lake_spans:
+                    tilted = _tilt_flat_runs(
+                        out[sid][2], out[sid][0], ceilings[sid], s.lake_spans,
+                        depth, safety_floors[sid])
                 rep = _soften_gentle_drops(
                     out[sid][2], out[sid][0], ceilings[sid], s.xy,
-                    s.lake_spans, depth, plan.spacing_m)
+                    s.lake_spans, depth, plan.spacing_m,
+                    safety_floor=safety_floors[sid])
                 dst = fall_by_order.setdefault(
                     int(s.order), {k: 0 for k in fall_report})
                 for key, value in rep.items():
                     fall_report[key] += int(value)
                     dst[key] += int(value)
+                fall_report["flat_vertices_tilted"] += tilted
+                dst["flat_vertices_tilted"] += tilted
+
+        # The fall ramps run after the ordinary confluence pass and can move one
+        # approach without moving its neighbour.  Re-close only gentle
+        # tributary tails; an approach that already contains a fall-white step is
+        # a real hanging-valley case and is deliberately left alone.
+        confluence_repair = {"candidates": 0, "repaired": 0,
+                             "steep_kept": 0}
+        if soften_gentle_drops:
+            threshold = FALL_WHITE_SLOPE * float(plan.spacing_m)
+            for sid in reversed(order):
+                if sid not in out:
+                    continue
+                s = by_id[sid]
+                main_level = float(out[sid][2][0])
+                if not np.isfinite(main_level):
+                    continue
+                for uid in s.upstream:
+                    if uid not in out:
+                        continue
+                    if uid in backwater_at_start:
+                        # The lake surface is authoritative on this propagated
+                        # tail; lowering it here would reopen the inlet step.
+                        continue
+                    u = by_id[uid]
+                    ulm = out[uid][2]
+                    first = 0
+                    for _a, b, _lid in u.lake_spans:
+                        if b < u.n - 1:
+                            first = max(first, b + 1)
+                    tail = max(first, u.n - 30)
+                    if u.n - tail < 2 or float(np.max(ulm[tail:])) <= main_level + 0.5:
+                        continue
+                    confluence_repair["candidates"] += 1
+                    if np.any(ulm[tail:-1] - ulm[tail + 1:] > threshold):
+                        confluence_repair["steep_kept"] += 1
+                        continue
+                    before = ulm.copy()
+                    touch = half_widths[sid] + half_widths[uid] + plan.spacing_m
+                    depth = kvbathy.depth_for_order(
+                        u.order, depth_by_order, depth_scale)
+                    dynamic_taper = max(
+                        GRADE_TAPER_VERTICES,
+                        int(np.ceil(depth / max(
+                            confluence_grade * plan.spacing_m, 1e-9))))
+                    _grade_tail(
+                        ulm, ceilings[uid], u.xy, first, u.n - 1,
+                        main_level, touch, confluence_grade, depth,
+                        taper_vertices=dynamic_taper)
+                    if np.any(ulm < before - 1e-9):
+                        confluence_repair["repaired"] += 1
+
+            # A local confluence repair must not undo the lake backwater that
+            # made an inlet level with its lake. Restore only the contiguous low
+            # mouth; this is the same final authority rule as the earlier pass.
+            for sid in order:
+                if sid not in out:
+                    continue
+                s = by_id[sid]
+                lm = out[sid][2]
+                for a, _b, lid in s.lake_spans:
+                    if a <= 0:
+                        continue
+                    lake_level = _lake_level(wg, lid)
+                    if lake_level is None or lm[a - 1] >= lake_level - 1e-9:
+                        continue
+                    first = 0
+                    for _pa, pb, _plid in s.lake_spans:
+                        if pb < a:
+                            first = max(first, pb + 1)
+                    k = a - 1
+                    while k >= first and lm[k] < lake_level - 1e-9:
+                        k -= 1
+                    lm[k + 1:a] = float(lake_level)
 
         # Tie-ins and fall ramps changed surfaces after the first bed calculation.
         for sid, values in out.items():
@@ -597,6 +762,7 @@ def downhill_profiles(
         "confluence_max_grade": float(confluence_grade),
         "gentle_fall_ramp": fall_report if wg is not None else {},
         "gentle_fall_ramp_by_order": fall_by_order if wg is not None else {},
+        "local_confluence_repair": confluence_repair if wg is not None else {},
     }
 
 
@@ -671,6 +837,7 @@ def downhill_river_bed(
         "confluence_max_grade": prof["confluence_max_grade"],
         "gentle_fall_ramp": prof["gentle_fall_ramp"],
         "gentle_fall_ramp_by_order": prof["gentle_fall_ramp_by_order"],
+        "local_confluence_repair": prof["local_confluence_repair"],
     }
     for key, drops in (("level", level_drops), ("bed", bed_drops)):
         d = np.concatenate(drops) if drops else np.zeros(0)
@@ -709,6 +876,13 @@ def downhill_river_bed(
     near = is_river & (dist <= half_w + plan.spacing_m)
     spread_l = src_l[ind[0], ind[1]]
     spread_b = src_b[ind[0], ind[1]]
+    # A shaped target must not create a new >50 m trench against the uncarved
+    # two-sample neighbourhood.  The ordinary cross-section carve remains
+    # untouched; this only bounds the additional profile-driven pull.
+    from scipy.ndimage import maximum_filter
+    spread_b = np.maximum(
+        spread_b,
+        maximum_filter(np.asarray(ground), size=5).astype(np.float32) - 49.0)
 
     orders = np.asarray(wg.weight, dtype=np.int32)
     depth_px = np.zeros((SY, SX), dtype=np.float32)
