@@ -194,7 +194,8 @@ class RiverSeg:
     vatnlnr: Optional[int] = None       # lake serial, when the segment touches one
     vnrnfelt: Optional[str] = None      # parent catchment's vassdragsnr
     part_index: int = 0                 # part number within a MultiLineString
-    feature_index: int = -1             # index of the parent GeoJSON feature
+    feature_index: int = -1             # index of the parent GeoJSON feature in the
+                                        # RAW layer (before repeated copies are dropped)
 
 
 @dataclass
@@ -542,6 +543,63 @@ def _iter_polygon_rings(geom: dict):
             yield poly
 
 
+# NVE's Elvenett layers hold the same stream several times: on Lierne 16 669 of the
+# 20 437 elvenett geometries come back FIVE times, each copy its own `objectid` with
+# identical coordinates and attributes, differing only in `statusdatofra`
+# (2022-08-12, 2024-03-11, and three at 2024-11-14; in 399 groups also in a name
+# hierarchy, a catchment area or `vassdragsnr`). No field marks one copy current
+# (`skaarsversjon` and `tilinnsyn` are the same on all), so the layer is a stack of
+# loads rather than a versioned table. Every copy used to become its own river
+# segment: rivers.bin carried 87 126 segments for 20 437 streams, and the runtime
+# drew each one five times. hovedelv has the same pattern (56 features, 25 distinct).
+VERSION_DATE_FIELD = "statusdatofra"
+VERSION_ID_FIELD = "objectid"
+
+
+def dedupe_feature_versions(feats: list, label: str = "") -> list:
+    """
+    One (raw index, feature) per distinct geometry, keeping the copy with the
+    latest `statusdatofra` (then the highest `objectid`) and placing it where the
+    geometry FIRST occurred, so the surviving order follows the source order.
+
+    Keyed on the exact coordinates, which are what every downstream step reads:
+    two records with the same coordinates would rasterise, link and carve
+    identically, so dropping one cannot change the terrain, only stop repeating it.
+    """
+    import json as _json
+
+    def rank(f):
+        p = f.get("properties") or {}
+        d, o = p.get(VERSION_DATE_FIELD), p.get(VERSION_ID_FIELD)
+        try:
+            d = float(d) if d is not None else float("-inf")
+        except (TypeError, ValueError):
+            d = float("-inf")
+        try:
+            o = float(o) if o is not None else float("-inf")
+        except (TypeError, ValueError):
+            o = float("-inf")
+        return (d, o)
+
+    slot: dict = {}          # geometry key -> index into `kept`
+    kept: list = []          # [raw_index, feature]
+    for i, f in enumerate(feats or []):
+        key = _json.dumps((f.get("geometry") or {}).get("coordinates"),
+                          separators=(",", ":"))
+        j = slot.get(key)
+        if j is None:
+            slot[key] = len(kept)
+            kept.append([i, f])
+        elif rank(f) > rank(kept[j][1]):
+            kept[j] = [i, f]
+    dropped = len(feats or []) - len(kept)
+    if dropped:
+        print(f"[kvterrain.water] {label}: {len(feats)} records, {len(kept)} distinct "
+              f"geometries; dropped {dropped} repeated copies (kept the latest "
+              f"{VERSION_DATE_FIELD})")
+    return [(i, f) for i, f in kept]
+
+
 def features_from_geojson(
     river_all: list, river_main: list, lakes: list,
     *, order_fields=RIVER_ORDER_FIELDS,
@@ -586,7 +644,7 @@ def features_from_geojson(
                 note=None if keep_identity else HOVEDELV_NO_ORDER)
         f_order = fmap.get("order")
 
-        for fi, f in enumerate(feats or []):
+        for fi, f in dedupe_feature_versions(feats, label):
             props = f.get("properties", {}) or {}
             ov = props.get(f_order) if f_order else None
             try:

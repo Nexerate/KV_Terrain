@@ -99,3 +99,21 @@ def test_shore_is_watertight_diagonally():
     assert old[4, 4] < 49.0                    # diagonal to dry ground, carved ~2 m
     assert new[4, 4] == 50.0
     assert new[8, 8] == old[8, 8]              # the interior is unchanged
+
+
+def test_repeated_nve_records_become_one_segment():
+    def feat(oid, date, coords, order=1):
+        return {"type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": coords},
+                "properties": {"objectid": oid, "statusdatofra": date,
+                               "strekninglnr": "7", "elveordenstrahler": order}}
+    a = [[0.0, 0.0], [10.0, 0.0]]
+    b = [[10.0, 0.0], [20.0, 5.0]]
+    raw = [feat(1, 100, a), feat(2, 100, b), feat(3, 300, a, order=2),
+           feat(4, 200, a), feat(5, 300, a, order=3)]
+    wf = water.features_from_geojson(raw, [], [])
+    assert len(wf.rivers) == 2
+    first = wf.rivers[0]
+    assert first.feature_index == 4 and first.order == 3      # latest, then highest id
+    assert np.array_equal(first.xy, np.asarray(a))             # at a's first position
+    assert wf.rivers[1].feature_index == 1
