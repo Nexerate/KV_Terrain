@@ -584,10 +584,11 @@ and leaves the water surface where the ground is:
   mean whose half-window is the channel half-width (clamped to 2–6 vertices).
   Capping and a second running minimum after the mean ensure the ordinary profile
   never rises or leaves its banks. A downstream-first pass makes confluences accordant
-  and grades lake inlets at no more than 0.3 m/m; a below-lake inlet gets bounded
-  backwater under a downstream-running bank cap. If a low bank makes the lake
-  level unreachable without an uphill step, the final open vertex remains below
-  the lake. The bed target is always `surface − depth`, so every surface lowering
+  and grades lake inlets at no more than 0.3 m/m. At a below-lake inlet the lake
+  expands as a flat backwater upstream, across segment links, until it meets a
+  river point already at or above lake level. The lake is authoritative there,
+  so the flooded mouth may be deeper than the ordinary bank cap allows. The bed
+  target is always `surface − depth`, so every surface lowering
   carries its trench with it. At 5 m spacing a 2–3 m stream
   rasterises to a gappy mask, so a second pass then walks every polyline's own
   8-connected sample path and lowers it to the running minimum of the carved bed
@@ -971,11 +972,12 @@ and offsets, so the same placement logic applies.
   boundary from drawing a level edge between the two surfaces.
 - **Lake inlets are graded onto the lake.** A high inlet is lowered onto the
   authored lake level at the same maximum grade. A river arriving below the lake
-  gets a contiguous backwater tail, capped at a downstream-running minimum of
-  its dry-bank ceilings so the raised tail itself cannot rise. Where a low bank
-  makes all three constraints incompatible, staying below the bank and never
-  rising win over reaching the lake level. The older raise-only raster tie-in
-  remains as a guard, while lake spans themselves carry the authored lake level.
+  becomes a flat extension of the lake upstream until the profile meets water at
+  or above lake level. That backwater propagates across segment links and may
+  stand above an ordinary bank sample: the lake is authoritative at its mouth,
+  and the existing lower river bed simply makes the flooded mouth deeper. The
+  older raise-only raster tie-in remains as a guard, while lake spans themselves
+  carry the authored lake level.
 - **Coarse rivers fade.** A ~5 m channel in a coarse cell has its bed averaged with
   its banks, so `surface − coarse_terrain` shrinks and distant thin rivers render
   faint even though the surface field keeps the cell marked as water. Carving the

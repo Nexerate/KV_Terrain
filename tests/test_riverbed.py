@@ -210,7 +210,7 @@ def test_steep_grade_stops_at_carve_depth_and_tapers_upstream():
     assert np.all(np.diff(surface) <= 1e-9)
 
 
-def test_lake_inlet_is_graded_down_and_backwater_respects_bank_ceiling():
+def test_lake_inlet_is_graded_down_and_lake_expands_into_low_mouth():
     plan, ground, wg = world()
     wg.lake_table = {1: {"level_m": 91.0}}
     s = seg(0, range(2, 23), lake_spans=[(15, 20, 1)])
@@ -221,18 +221,17 @@ def test_lake_inlet_is_graded_down_and_backwater_respects_bank_ceiling():
     depth = bathymetry.DEFAULT_RIVER_DEPTH_BY_ORDER[1]
     assert np.max(ungraded["profiles"][0][2] - level) <= depth + 1e-9
 
-    # A river below the lake is raised only as far as its lower dry bank.
+    # At an inlet the lake wins over a lower bank and expands into the mouth.
     ground2 = np.full_like(ground, 92.0)
     ground2[ROW, :] = 85.0
     wg.lake_table = {1: {"level_m": 95.0}}
     prof2 = riverbed.downhill_profiles(plan, traced([s]), ground2, wg=wg)
     level2 = prof2["profiles"][0][2]
-    ceiling2 = prof2["ceilings"][0]
-    assert level2[14] <= ceiling2[14]
-    assert level2[14] < 95.0
+    assert np.allclose(level2[:15], 95.0)
+    assert np.all(np.diff(level2) <= 1e-9)
 
 
-def test_backwater_never_rises_past_a_low_bank():
+def test_backwater_is_flat_even_past_a_low_bank():
     surface = np.array([89.0, 88.0, 87.0])
     ceiling = np.array([90.0, 94.0, 96.0])
     xy = np.stack([np.arange(3) * 5.0, np.zeros(3)], axis=1)
@@ -240,9 +239,21 @@ def test_backwater_never_rises_past_a_low_bank():
         surface, ceiling, xy, 0, 2, junction_level=95.0, touch_m=0.0,
         max_grade=riverbed.CONFLUENCE_MAX_GRADE, max_lowering_m=1.5,
         backwater=True)
-    assert np.allclose(surface, 90.0)
+    assert np.allclose(surface, 95.0)
     assert np.all(np.diff(surface) <= 1e-12)
-    assert np.all(surface <= ceiling)
+
+
+def test_lake_backwater_propagates_across_upstream_links():
+    plan, ground, wg = world()
+    ground = np.full_like(ground, 85.0)
+    wg.lake_table = {1: {"level_m": 95.0}}
+    upstream = seg(0, range(2, 9))
+    main = seg(1, range(8, 23), lake_spans=[(8, 14, 1)])
+    upstream.downstream, main.upstream = 1, [0]
+    prof = riverbed.downhill_profiles(
+        plan, traced([upstream, main]), ground, wg=wg)
+    assert np.allclose(prof["profiles"][1][2][:8], 95.0)
+    assert np.allclose(prof["profiles"][0][2], 95.0)
 
 
 def test_shaped_profile_is_written_directly_to_network_levels():
@@ -262,12 +273,26 @@ def test_shaped_profile_is_written_directly_to_network_levels():
     assert np.allclose(net.segments[0].level, shaped)
 
 
-def test_lowered_surface_cuts_any_dry_band_inside_the_channel():
+def test_lowered_surface_cuts_only_a_shallow_dry_band_inside_the_channel():
     plan, ground, wg = world()
     old_level = np.where(wg.type == water.TYPE_RIVER, 100.0, np.nan).astype(np.float32)
     new_level = np.where(wg.type == water.TYPE_RIVER, 90.0, np.nan).astype(np.float32)
-    target = np.where(wg.type == water.TYPE_RIVER, 88.5, np.nan).astype(np.float32)
+    terrain = np.full_like(ground, 100.0)
+    terrain[ROW, 2:6] = 91.0
     bed = bathymetry.carve_river_beds(
-        np.full_like(ground, 100.0), wg.type, wg.weight, plan.spacing_m,
-        level=old_level, bed_target=target, surface_target=new_level)
-    assert np.all(bed[wg.type == water.TYPE_RIVER] <= 90.0)
+        terrain, wg.type, wg.weight, plan.spacing_m,
+        level=old_level, surface_target=new_level)
+    assert np.all(bed[ROW, 2:6] <= 90.0)
+    assert np.all(bed[ROW, 6:33] > 90.0)
+
+
+def test_unmistakable_open_channel_uphill_run_is_reversed():
+    xy = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    oriented, changed = rivernet.orient_clear_uphill_run(
+        xy, np.array([100.0, 120.0, 130.0]), [])
+    assert changed
+    assert np.array_equal(oriented, xy[::-1])
+    assert not rivernet.orient_clear_uphill_run(
+        xy, np.array([100.0, 120.0, 130.0]), [(0, 2, 1)])[1]
+    assert not rivernet.orient_clear_uphill_run(
+        xy, np.array([100.0, 105.0, 110.0]), [])[1]

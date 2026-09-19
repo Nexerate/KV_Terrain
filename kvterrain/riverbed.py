@@ -43,10 +43,11 @@ A downstream-first pass then makes nearby confluences accordant and grades river
 tails onto lake levels. A grade may lower a profile by at most that river order's
 carve depth; beyond that it tapers back to the ungraded profile, preserving real
 hanging valleys instead of driving a shallow artificial ramp into a hillside.
-The one exception is a river arriving below a lake, whose contiguous tail is
-raised as backwater under a downstream-running bank cap. It never rises along
-the river or crosses its dry bank ceiling; when those constraints conflict with
-the lake level, the final open vertex remains below the lake.
+The one exception is a river arriving below a lake. The lake surface expands as
+a flat backwater through the contiguous low tail, across upstream segment links,
+until it meets a river point already at or above lake level. This may put the
+surface above a local bank sample, deliberately: at an inlet the lake is the
+authority, and a deeper flooded mouth is preferable to a hidden lake edge.
 
 Back on the grid, the per-vertex minimums are spread sideways over the channel
 exactly as `watersurface.channel_level` spreads the level: nearest source sample,
@@ -245,7 +246,7 @@ def _grade_tail(surface: np.ndarray, ceiling: np.ndarray, xy: np.ndarray,
                 first: int, last: int, junction_level: float, touch_m: float,
                 max_grade: float, max_lowering_m: float, *,
                 backwater: bool = False,
-                taper_vertices: int = GRADE_TAPER_VERTICES) -> None:
+                taper_vertices: int = GRADE_TAPER_VERTICES) -> bool:
     """Grade a tail locally, never lowering it by more than its carve depth.
 
     Starting at the junction, the grade is followed only until it would pull the
@@ -256,7 +257,7 @@ def _grade_tail(surface: np.ndarray, ceiling: np.ndarray, xy: np.ndarray,
     hillside.
     """
     if last < first or not np.isfinite(junction_level):
-        return
+        return False
     p = np.asarray(xy[first:last + 1], dtype=np.float64)
     if p.shape[0] == 1:
         along = np.zeros(1, dtype=np.float64)
@@ -294,19 +295,18 @@ def _grade_tail(surface: np.ndarray, ceiling: np.ndarray, xy: np.ndarray,
         surface[first:last + 1] = np.minimum(original, bound)
 
     if not backwater or surface[last] >= junction_level - 1e-9:
-        return
-    # Only the contiguous below-lake tail is backwater.  Raise it upstream to
-    # downstream under a running minimum of its bank ceilings.  Pointwise
-    # ``min(lake, ceiling[k])`` can rise downstream when a low bank is followed
-    # by a higher one; the running cap preserves the absolute downhill invariant.
-    # A low bank may therefore keep the final open vertex below the lake.
+        return False
+    # The lake expands into the contiguous below-lake tail.  Lake level is the
+    # authority here, including where it stands above the local dry-bank sample:
+    # the result is a deeper, flat backwater mouth rather than a river surface
+    # hidden below the lake or an uphill step into it.  The unchanged upstream
+    # point is already >= lake level, so replacing the tail cannot introduce a
+    # downstream rise.
     k = last
     while k >= first and surface[k] < junction_level - 1e-9:
         k -= 1
-    backwater_cap = float(junction_level)
-    for i in range(k + 1, last + 1):
-        backwater_cap = min(backwater_cap, float(ceiling[i]))
-        surface[i] = max(surface[i], backwater_cap)
+    surface[k + 1:last + 1] = float(junction_level)
+    return k < first
 
 
 def downhill_profiles(
@@ -368,6 +368,7 @@ def downhill_profiles(
     # downstream-first so lowering a tail is visible when that segment becomes
     # the main stem for the confluence above it.
     if wg is not None:
+        backwater_at_start: dict[int, float] = {}
         for sid in reversed(order):
             if sid not in out:
                 continue
@@ -388,16 +389,21 @@ def downhill_profiles(
                 first = spans[si - 1][1] + 1 if si > 0 else 0
                 depth = kvbathy.depth_for_order(
                     s.order, depth_by_order, depth_scale)
-                _grade_tail(lm, ceiling, s.xy, first, a - 1, lake_level,
-                            half_widths[sid] + plan.spacing_m, confluence_grade,
-                            depth,
-                            backwater=True)
+                reached_first = _grade_tail(
+                    lm, ceiling, s.xy, first, a - 1, lake_level,
+                    half_widths[sid] + plan.spacing_m, confluence_grade, depth,
+                    backwater=True)
+                if reached_first and first == 0:
+                    backwater_at_start[sid] = lake_level
 
             starts_in_lake = next((sp for sp in spans if sp[0] == 0), None)
             main_level = (_lake_level(wg, starts_in_lake[2])
                           if starts_in_lake is not None else float(lm[0]))
             if main_level is None or not np.isfinite(main_level):
                 continue
+            if starts_in_lake is not None:
+                backwater_at_start[sid] = float(main_level)
+            lake_backwater = sid in backwater_at_start
             for uid in s.upstream:
                 if uid not in out:
                     continue
@@ -411,10 +417,12 @@ def downhill_profiles(
                 touch = half_widths[sid] + half_widths[uid] + plan.spacing_m
                 depth = kvbathy.depth_for_order(
                     u.order, depth_by_order, depth_scale)
-                _grade_tail(ulm, ceilings[uid], u.xy, first, u.n - 1,
-                            main_level, touch, confluence_grade,
-                            depth,
-                            backwater=starts_in_lake is not None)
+                reached_first = _grade_tail(
+                    ulm, ceilings[uid], u.xy, first, u.n - 1,
+                    main_level, touch, confluence_grade, depth,
+                    backwater=lake_backwater)
+                if reached_first and first == 0 and lake_backwater:
+                    backwater_at_start[uid] = float(main_level)
 
         # Tie-ins changed surfaces after the first bed calculation.
         for sid, values in out.items():

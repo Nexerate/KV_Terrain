@@ -47,13 +47,12 @@ do not reach zero even when the channel's own samples never rise.
 
 FLOW DIRECTION
 --------------
-Source vertex order is trusted. ELVIS is designed to encode flow direction, but
-that is design intent rather than a per-feature guarantee, and nothing verifies
-it upstream of us. So a Z-derived direction is computed independently and the
-DISAGREEMENT RATE is reported as a diagnostic — broken out by whether the segment
-touches a lake, because clustering there indicates a real problem while a diffuse
-scatter is just DTM noise. Z never flips a segment: on flat reaches, through
-weirs, across lakes and over DTM artefacts it is the noisier signal of the two.
+Source vertex order is trusted except for an unmistakable, entirely open-channel
+error: a run whose DTM endpoint climbs by more than 25 m is reversed before links
+are built. ELVIS is designed to encode flow direction, but Lierne contains one
+such 58.6 m reversed run; trusting it carved the low endpoint through a hillside.
+Smaller disagreements remain diagnostics because on flat reaches, through weirs,
+across lakes and over DTM artefacts Z is the noisier signal.
 """
 
 from __future__ import annotations
@@ -90,6 +89,11 @@ JUNCTION_OUTFLOW = "Outflow"
 ENDPOINT_TOL_CELLS = 1.0
 # Descent tolerance: a rise smaller than this is DTM noise, not a real reversal.
 DESCENT_TOL_M = 0.05
+# Source order remains authoritative except for an unmistakable non-lake error.
+# Lierne contains one segment whose coordinates climb 58.6 m from start to end;
+# trusting it makes the downhill running minimum carve that entire hillside to
+# the low endpoint. Smaller disagreements can be dams, falls, or DTM noise.
+CLEAR_REVERSE_RISE_M = 25.0
 
 # The ELVIS query uses esriSpatialRelIntersects, so any feature TOUCHING the crop
 # comes back in full — including the part outside it. There is no terrain there:
@@ -231,6 +235,20 @@ def geometry_hash(xy: np.ndarray) -> str:
     return hashlib.blake2b(q.tobytes(), digest_size=16).hexdigest()
 
 
+def orient_clear_uphill_run(xy: np.ndarray, ground: np.ndarray,
+                            lake_spans: list,
+                            min_rise_m: float = CLEAR_REVERSE_RISE_M
+                            ) -> tuple[np.ndarray, bool]:
+    """Reverse only a clearly backward, entirely open-channel source run."""
+    p = np.asarray(xy, dtype=np.float64)
+    g = np.asarray(ground, dtype=np.float64)
+    if (p.shape[0] < 2 or g.size != p.shape[0] or lake_spans or
+            not np.isfinite(g[[0, -1]]).all() or
+            g[-1] <= g[0] + float(min_rise_m)):
+        return p, False
+    return p[::-1].copy(), True
+
+
 def _segment_pixel_path(plan: core.GridPlan, xy: np.ndarray) -> list:
     """8-connected pixel path covering the polyline, clipped to the grid."""
     r, c = _nearest_idx(plan, xy)
@@ -364,7 +382,7 @@ def trace_river_network(
         raise ValueError(f"height {height_nodata.shape} != grid {(SY, SX)}")
 
     segments: list = []
-    clip = {"features": 0, "clipped": 0, "split": 0,
+    clip = {"features": 0, "clipped": 0, "split": 0, "reversed_clear_uphill": 0,
             "vertices_in": 0, "vertices_dropped": 0, "features_dropped": 0}
     span_stats = {"raw": 0, "merged": 0, "dropped": 0, "kept": 0}
 
@@ -419,6 +437,13 @@ def trace_river_network(
             spans, st = _runs_of_lake(lake_at)
             for k in span_stats:
                 span_stats[k] += st[k]
+
+            row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
+            sampled_ground = _fill_nan_1d(_bilinear(height_nodata, row, col))
+            xy, reversed_clear = orient_clear_uphill_run(
+                xy, sampled_ground, spans)
+            if reversed_clear:
+                clip["reversed_clear_uphill"] += 1
 
             segments.append(RiverSegment(
                 seg_id=len(segments),
@@ -572,6 +597,8 @@ def build_river_network(
         "clip_features_dropped": clip["features_dropped"],
         "clip_segments_split": clip["split"],
         "clip_vertices_dropped": clip["vertices_dropped"],
+        "clear_uphill_segments_reversed": clip.get("reversed_clear_uphill", 0),
+        "clear_uphill_reverse_threshold_m": float(CLEAR_REVERSE_RISE_M),
         "clip_vertices_dropped_pct": (
             100.0 * clip["vertices_dropped"] / clip["vertices_in"]
         ) if clip["vertices_in"] else 0.0,
@@ -844,11 +871,10 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
     Compare the SOURCE vertex order against a Z-derived direction, and report how
     often they disagree — split by whether the segment touches a lake.
 
-    Source order wins in every case. This is a diagnostic, not a correction: a
-    diffuse low disagreement rate is ordinary DTM noise on flat reaches, whereas a
-    high rate, or one concentrated in lake-touching segments, points at something
-    real (a genuinely mis-ordered layer, or lake-through-lines whose flat Z carries
-    no directional signal at all).
+    Apart from the clear-uphill correction made during tracing, this is a
+    diagnostic, not a correction: a diffuse low disagreement rate is ordinary DTM
+    noise on flat reaches, whereas a high rate, or one concentrated in
+    lake-touching segments, points at something real.
     """
     dis = touch = dis_touch = n = vatn = 0
     for s in segments:
@@ -883,8 +909,9 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
             100.0 * dis_touch / touch) if touch else 0.0,
         "flowdir_disagreement_pct_non_lake": (
             100.0 * dis_non / non_touch) if non_touch else 0.0,
-        "flowdir_note": "source vertex order is authoritative; Z is an independent "
-                        "QA signal only and never flips a segment.",
+        "flowdir_note": "source vertex order is authoritative except that a non-lake "
+                        "run climbing more than 25 m endpoint-to-endpoint is reversed "
+                        "before linking; remaining Z disagreement is QA only.",
     }
 
 

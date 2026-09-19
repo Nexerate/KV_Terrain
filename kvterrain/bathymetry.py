@@ -903,10 +903,10 @@ def carve_river_beds(
     lowered one, or lowering the level would switch the carve off.
 
     `surface_target` is that shaped level raster. After the weighted trench pull,
-    any river sample still standing above it is lowered to the waterline. This is
-    the dry-band guard: a bank cap can move the surface down by more than the old
-    bank tolerance, but ground inside the rasterised channel must still be cut to
-    the new rim rather than left as an empty strip inside the water width.
+    a river sample still standing just above it is lowered to the waterline. This
+    is a dry-band guard, not permission to flatten a cliff: it uses the same bank
+    tolerance as the ordinary carve. An earlier unconditional form cut order-7
+    buffer pixels 30-40 m down where the rasterised strip lapped onto a steep bank.
 
     `order` is the per-pixel stream order (`WaterGrid.weight`). Returns a copy.
     """
@@ -985,6 +985,8 @@ def carve_river_beds(
         out[sel] = np.minimum(out[sel], pulled).astype(out.dtype)
     if surface_target is not None:
         surf = np.asarray(surface_target, dtype=np.float32)
-        sel = is_river & np.isfinite(surf) & (out > surf)
+        above = height_m.astype(np.float32) - surf
+        sel = (is_river & np.isfinite(surf) & (out > surf) &
+               (above <= max(float(bank_tolerance_m), 0.0)))
         out[sel] = surf[sel].astype(out.dtype)
     return out
