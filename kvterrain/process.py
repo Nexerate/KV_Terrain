@@ -328,6 +328,7 @@ def run_process(
                     width_scale=raster_opts.get("width_scale", 1.0),
                     bank_ground=bank_ground,
                     starting_profiles=(shaped_profiles if bank_pass else None),
+                    soften_gentle_drops=(bank_pass == passes - 1),
                     return_profiles=True)
                 river_surf = watersurface.apply_lake_tie_in(low_level, lake_tie)
                 del low_level

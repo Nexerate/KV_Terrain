@@ -226,6 +226,31 @@ def test_steep_grade_stops_at_carve_depth_and_tapers_upstream():
     assert np.all(np.diff(surface) <= 1e-9)
 
 
+def test_gentle_drop_ramp_is_backward_tapered_and_depth_bounded():
+    xy = np.stack([np.arange(5) * 5.0, np.zeros(5)], axis=1)
+    raw = np.array([10.0, 10.0, 10.0, 8.0, 8.0])
+    ceiling = np.full(5, np.inf)
+
+    surface = np.array([10.0, 10.0, 10.0, 8.0, 8.0])
+    before = surface.copy()
+    rep = riverbed._soften_gentle_drops(
+        surface, raw, ceiling, xy, [], 1.5, 5.0)
+    assert rep["candidates"] == rep["ramped"] == 1
+    assert before[2] - before[3] > 1.75
+    assert surface[2] - surface[3] < 1.75
+    assert np.max(before - surface) <= 1.5 + 1e-12
+    assert np.all(np.diff(surface) <= 1e-12)
+
+    # A larger real fall can only spend the same carve-depth budget, so the
+    # residual step remains white-water steep.
+    large = np.array([10.0, 10.0, 10.0, 5.0, 5.0])
+    original = large.copy()
+    riverbed._soften_gentle_drops(
+        large, raw, ceiling, xy, [], 1.5, 5.0)
+    assert np.max(original - large) <= 1.5 + 1e-12
+    assert large[2] - large[3] > 1.75
+
+
 def test_lake_inlet_is_graded_down_and_lake_expands_into_low_mouth():
     plan, ground, wg = world()
     wg.lake_table = {1: {"level_m": 91.0}}

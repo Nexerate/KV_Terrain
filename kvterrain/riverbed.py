@@ -121,6 +121,10 @@ CONFLUENCE_MAX_GRADE = 0.30
 GRADE_TAPER_VERTICES = 4
 MASK_EDGE_DIAGONAL_CELLS = 0.70711
 BANK_PROFILE_PASSES = 2
+BANK_EXCESS_CORRECTION_M = 0.5
+GENTLE_FALL_MAX_GRADE = 0.30
+GENTLE_FALL_CONTEXT_VERTICES = 2
+FALL_WHITE_SLOPE = 0.35
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
@@ -315,6 +319,93 @@ def _grade_tail(surface: np.ndarray, ceiling: np.ndarray, xy: np.ndarray,
     return k < first
 
 
+def _soften_gentle_drops(surface: np.ndarray, raw: np.ndarray,
+                         ceiling: np.ndarray, xy: np.ndarray,
+                         lake_spans: list, max_lowering_m: float,
+                         stride_m: float, *,
+                         max_grade: float = GENTLE_FALL_MAX_GRADE,
+                         ground_max_grade: float = FALL_WHITE_SLOPE,
+                         context_vertices: int = GENTLE_FALL_CONTEXT_VERTICES,
+                         taper_vertices: int = GRADE_TAPER_VERTICES) -> dict:
+    """Start isolated white-water drops earlier on otherwise gentle ground.
+
+    A downstream step remains authoritative: this pass never raises it.  It walks
+    backward from the lower vertex on a ``max_grade`` ramp and lowers upstream
+    vertices by at most one carve depth, tapering that lowering back to zero with
+    the same envelope used by confluence grades.  A fall larger than that bound
+    keeps the residual step and therefore remains a real fall.
+    """
+    n = int(surface.size)
+    report = {"candidates": 0, "ramped": 0,
+              "ground_step": 0, "bank_step": 0}
+    if n < 2:
+        return report
+
+    open_vertex = np.ones(n, dtype=bool)
+    for a, b, _lid in lake_spans:
+        open_vertex[max(int(a), 0):min(int(b) + 1, n)] = False
+    threshold = FALL_WHITE_SLOPE * float(stride_m)
+
+    # Work a contiguous open reach at a time; a ramp must never cross a lake.
+    padded = np.concatenate([[False], open_vertex, [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    for first, stop in zip(edges[0::2], edges[1::2]):
+        last = int(stop) - 1
+        first = int(first)
+        if last <= first:
+            continue
+        original = surface[first:last + 1].copy()
+        target = original.copy()
+        local_ceiling = ceiling[first:last + 1]
+        raw_floor = np.minimum.accumulate(
+            raw[first:last + 1] - float(max_lowering_m))
+        bank_floor = np.maximum.accumulate(
+            np.where(np.isfinite(local_ceiling),
+                     local_ceiling - 10.0, -np.inf)[::-1])[::-1]
+        floor = np.maximum(
+            original - float(max_lowering_m),
+            np.minimum(original, raw_floor))
+        floor = np.maximum(
+            floor, np.minimum(original, bank_floor))
+        original_falls = np.flatnonzero(
+            original[:-1] - original[1:] > threshold) + first
+        for k in original_falls[::-1]:
+            a = max(first, int(k) - max(int(context_vertices), 0))
+            b = min(last, int(k) + 1 + max(int(context_vertices), 0))
+            distance = float(np.hypot(
+                np.diff(xy[a:b + 1, 0]),
+                np.diff(xy[a:b + 1, 1])).sum())
+            if distance <= 1e-9:
+                continue
+            background_grade = abs(float(raw[a]) - float(raw[b])) / distance
+            if background_grade > float(ground_max_grade):
+                continue
+            report["candidates"] += 1
+            if raw[k] - raw[k + 1] > threshold:
+                report["ground_step"] += 1
+            else:
+                report["bank_step"] += 1
+            before = float(original[k - first] - original[k + 1 - first])
+            j = int(k) - first
+            # Propagate the allowed grade backward.  The ramp naturally tapers
+            # to zero where it meets the original profile; if the carve-depth
+            # floor is reached first, the remaining step is the real fall.
+            while j >= 0:
+                allowed = target[j + 1] + float(max_grade) * float(stride_m)
+                if target[j] <= allowed + 1e-12:
+                    break
+                lowered = max(allowed, floor[j])
+                if lowered >= target[j] - 1e-12:
+                    break
+                target[j] = lowered
+                j -= 1
+            after = float(target[k - first] - target[k + 1 - first])
+            if after < before - 1e-9:
+                report["ramped"] += 1
+        surface[first:last + 1] = target
+    return report
+
+
 def downhill_profiles(
     plan: core.GridPlan,
     traced: "rivernet.TracedNetwork",
@@ -328,6 +419,7 @@ def downhill_profiles(
     confluence_grade: float = CONFLUENCE_MAX_GRADE,
     bank_ground: Optional[np.ndarray] = None,
     starting_profiles: Optional[dict] = None,
+    soften_gentle_drops: bool = True,
 ) -> dict:
     """
     Per-segment (level, bed, level_downhill, bed_downhill), float64, keyed by
@@ -377,7 +469,17 @@ def downhill_profiles(
             previous = np.asarray(starting_profiles[sid][2], dtype=np.float64)
             radius = min(6, max(2, int(np.ceil(
                 half_w / max(plan.spacing_m, 1e-9)))))
-            lm = _shape_profile(previous, ceiling, radius, seed_l)
+            raw_floor = np.minimum.accumulate(lvl - depth)
+            floor = np.maximum(
+                previous - depth,
+                np.minimum(previous, raw_floor))
+            floor = np.minimum(floor, float(seed_l))
+            needs_correction = previous > ceiling + BANK_EXCESS_CORRECTION_M
+            bounded_ceiling = np.where(
+                needs_correction, np.maximum(ceiling, floor), np.inf)
+            lm = np.maximum(
+                _shape_profile(previous, bounded_ceiling, radius, seed_l),
+                floor)
         # The old exporter profile, retained only to report how much this change
         # lowers levels relative to the previous running-minimum implementation.
         old = np.fmin.accumulate(np.concatenate([[seed_old], lvl]))[1:]
@@ -447,7 +549,26 @@ def downhill_profiles(
                 if reached_first and first == 0 and lake_backwater:
                     backwater_at_start[uid] = float(main_level)
 
-        # Tie-ins changed surfaces after the first bed calculation.
+        fall_report = {"candidates": 0, "ramped": 0,
+                       "ground_step": 0, "bank_step": 0}
+        fall_by_order: dict[int, dict] = {}
+        if soften_gentle_drops:
+            for sid in order:
+                if sid not in out:
+                    continue
+                s = by_id[sid]
+                depth = kvbathy.depth_for_order(
+                    s.order, depth_by_order, depth_scale)
+                rep = _soften_gentle_drops(
+                    out[sid][2], out[sid][0], ceilings[sid], s.xy,
+                    s.lake_spans, depth, plan.spacing_m)
+                dst = fall_by_order.setdefault(
+                    int(s.order), {k: 0 for k in fall_report})
+                for key, value in rep.items():
+                    fall_report[key] += int(value)
+                    dst[key] += int(value)
+
+        # Tie-ins and fall ramps changed surfaces after the first bed calculation.
         for sid, values in out.items():
             depth = kvbathy.depth_for_order(by_id[sid].order, depth_by_order, depth_scale)
             out[sid] = (values[0], values[1], values[2], values[2] - depth)
@@ -474,6 +595,8 @@ def downhill_profiles(
         "profile_lowering_p90_m": float(np.percentile(drop, 90)) if drop.size else 0.0,
         "profile_lowering_max_m": float(drop.max()) if drop.size else 0.0,
         "confluence_max_grade": float(confluence_grade),
+        "gentle_fall_ramp": fall_report if wg is not None else {},
+        "gentle_fall_ramp_by_order": fall_by_order if wg is not None else {},
     }
 
 
@@ -490,6 +613,7 @@ def downhill_river_bed(
     width_scale: float = 1.0,
     bank_ground: Optional[np.ndarray] = None,
     starting_profiles: Optional[dict] = None,
+    soften_gentle_drops: bool = True,
     return_profiles: bool = False,
 ) -> tuple:
     """
@@ -505,7 +629,8 @@ def downhill_river_bed(
         plan, traced, ground, wg=wg, depth_by_order=depth_by_order,
         depth_scale=depth_scale, width_by_order=width_by_order,
         width_scale=width_scale, bank_ground=bank_ground,
-        starting_profiles=starting_profiles)
+        starting_profiles=starting_profiles,
+        soften_gentle_drops=soften_gentle_drops)
     profiles = prof["profiles"]
 
     SY, SX = plan.samples_y, plan.samples_x
@@ -544,6 +669,8 @@ def downhill_river_bed(
         "profile_lowering_p90_m": prof["profile_lowering_p90_m"],
         "profile_lowering_max_m": prof["profile_lowering_max_m"],
         "confluence_max_grade": prof["confluence_max_grade"],
+        "gentle_fall_ramp": prof["gentle_fall_ramp"],
+        "gentle_fall_ramp_by_order": prof["gentle_fall_ramp_by_order"],
     }
     for key, drops in (("level", level_drops), ("bed", bed_drops)):
         d = np.concatenate(drops) if drops else np.zeros(0)
