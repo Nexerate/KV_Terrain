@@ -15,13 +15,13 @@ authored lake identity). Beside them go the river network as polylines
 (`junctions.json`). Depth is `max(0, water_surface − terrain)` — no rim
 reconstruction, no seed-fill.
 
-> **Water redesign, first milestone implemented (2026-09-17):** the river bed is
+> **Water redesign in progress:** the river bed is
 > enforced downhill, and every export now carries a depression hierarchy
-> (`hierarchy.bin`, `labels.atlas`) and a water audit (`water_audit.json`) — see
+> (`hierarchy.bin`, `labels.atlas`, `hypsometry.bin`) and a water audit (`water_audit.json`) — see
 > [Depression hierarchy and water audit](#depression-hierarchy-and-water-audit).
-> The rest of the redesign (flow directions, hypsometry, discharge, `rivers.bin`
-> v2) is still design only, in [`WATER_REDESIGN.md`](WATER_REDESIGN.md). This
-> readme describes the tool as it runs today.
+> `rivers.bin` v2 adds modelled mean-annual discharge, hydraulic width and a
+> hierarchy-node attachment. Flow directions remain design work
+> in [`WATER_REDESIGN.md`](WATER_REDESIGN.md).
 
 Height data © Kartverket, licensed **CC BY 4.0**. Water data © **NVE** (Elvenett /
 Innsjødatabase). Attribute "© Kartverket" and "© NVE" in anything you ship.
@@ -55,17 +55,11 @@ the servers returned it, plus the raw NVE vectors that intersect it. Nothing in
 it has been carved, rasterised, repaired or packed. Fetch Lierne once, then carve
 it twenty different ways for free.
 
-The split itself changed nothing in the export. The water redesign's first
-milestone then changed it on purpose: the **file formats** of `manifest.json`,
-the atlases and `rivers.bin` are unchanged (the manifest only gained keys), but
-their **content** is not byte-identical to earlier exports, because the downhill
-river bed, the lake carve's edge ramp and watertight shoreline, and the correction
-of contradicted lake levels change `heights.atlas` and everything carved from it.
-Three new files sit beside the old ones. With `--no-downhill-river-bed
---no-lake-edge-is-shore --no-lake-shore-8-connected --no-hierarchy
---no-correct-lake-levels` every pre-existing file comes out byte for byte as
-before (checked on Lierne). The dataset format in between is internal
-and ours to change; see [The dataset format](#the-dataset-format-intermediate).
+The split itself changed nothing in the export. The water redesign then changed
+it deliberately: terrain conditioning changes atlas content, new hierarchy and
+audit sidecars sit beside the old products, and `rivers.bin` is now version 2.
+The dataset format in between is internal and ours to change; see
+[The dataset format](#the-dataset-format-intermediate).
 
 The Streamlit app is one process with three pages — **Fetch**, **Process**, and
 **Exports** (open a finished export and check it holds together) — and the CLI
@@ -441,13 +435,44 @@ Water products:
 | --- | --- |
 | `surface.atlas` | water surface elevation per sample, lakes and rivers in one field |
 | `water_id.atlas` | water class (dry / river / ocean / lake) plus authored lake identity per sample |
-| `rivers.bin` | the river network as densified polylines with links, bed and surface per vertex |
+| `rivers.bin` | the river network as densified polylines with links, Q/width/node per segment, bed and surface per vertex |
 | `lakes.json` | one record per authored lake: NVE ids, name, area, level and its provenance, bbox |
 | `junctions.json` | points where a river segment enters (`Inflow`) or leaves (`Outflow`) a lake |
 
 The manifest describes them under `water_surface` (encoding, sources, width
 model, lake levels, carve parameters), `water_id` (encoding) and `water_vector`
 (the polyline products and their validation report).
+
+### Authored river graph (`rivers.bin` v2)
+
+The 48-byte little-endian header is `<8sIIddfIII`: magic `KVRIVER2`, version 2,
+EPSG, origin x/y, vertex stride, segment count, vertex count, reserved zero.
+Every variable-length segment record starts with this 38-byte prefix:
+
+| offset | field | type |
+| ---: | --- | --- |
+| 0 | `seg_id` | u32 |
+| 4 | `strekn_lnr` (`-1` absent) | i64 |
+| 12 | `vatn_lnr` (`-1` absent) | i64 |
+| 20 | Strahler `order` | u16 |
+| 22 | `downstream_id` (`-1` absent) | i32 |
+| 26 | modelled mean-annual `discharge_m3_s` | f32 |
+| 30 | full hydraulic `width_m` | f32 |
+| 34 | downstream `node_id` (`0xFFFFFFFF` absent) | u32 |
+
+The existing variable tail is unchanged: upstream ids, two length-prefixed ASCII
+keys, lake spans, geometry hash, then `(x, y, bed z, surface level)` f32 vertices.
+`node_id` is the level-0 hierarchy leaf label at the segment's downstream-most
+vertex; 0 means it drains straight off-map.
+
+Q is explicitly a model, not a gauge value. Each unique NVE
+`arealregineenhet_km2` is apportioned once over that REGINE unit's emitted ELVIS
+segments by polyline length, accumulated downstream on the authored graph, then
+multiplied by the manifest's uniform effective runoff (default 1.0 m/year, or
+31.688 L/s/km²). Width uses the manifest function
+`clamp(a * Q^b, min_m, max_m) * scale`; its default coefficients are `a=8`,
+`b=0.5`, `min_m=2`, `max_m=80`. Q is rounded to its stored f32 before width is
+computed, so Terraform can reproduce every shipped width bit-for-bit.
 
 ### Water class and lake identity (`water_id.atlas`)
 
@@ -702,6 +727,31 @@ take the label of the **lowest child** (by that level's `heights.atlas` code) in
 the same corner-anchored 3×3 gather `water_id` uses, ties to the lower label, so
 the whole pyramid can be recomputed from the export alone — which
 `validate-hierarchy` does.
+
+These labels are the Priority-Flood depression partition, **not D8 catchment
+accumulation**. `cell_count` counts samples carrying that exact label (only leaves
+and the root have any); `subtree_cells` sums those partition cells through the
+depression tree. Neither is the upstream contributing area of a node or river.
+
+**`hypsometry.bin`** — fixed-size little-endian records indexed by hierarchy node
+id. The 32-byte header is `<8sIIIIII>`: magic `KVHYPS01`, version, header bytes,
+record bytes, node count, samples per node (64), and lower-block sample count
+(48). Each 260-byte record is `max_code:u16`, `flags:u16` (`bit 0 = valid`),
+then 64 cumulative flooded areas in square metres as f32. Record 0 (the root) is
+invalid; every other node is valid.
+
+The sample axis is absolute `heights.atlas` u16 elevation, derived from the node
+record rather than stored: 48 inclusive integer-half-up samples from
+`floor_code` to `spill_code`, then 16 samples after the lower block from the
+spill toward the subtree's `max_code`, inclusive of `max_code`. Interpolation is
+piecewise linear in absolute code, zero below the first sample and constant
+above the last; duplicate codes use the rightmost value. Leaf curves come from
+level-0 packed heights and labels. An internal curve is the sum of its immediate
+child curves at its own absolute samples, with children in ascending id order,
+f64 accumulation and f32 storage. This exact rule is what lets Terraform compose
+a rebuilt parent from untouched children. `validate-hierarchy` independently
+rebuilds every record from the shipped atlases and child curves and requires
+bit-for-bit equality.
 
 **`water_audit.json`** — the authored water checked against the hierarchy, with
 UTM coordinates. A summary also goes into `manifest.water_audit`.

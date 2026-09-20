@@ -155,7 +155,8 @@ def depth_for_order(order: int, table: dict, scale: float = 1.0) -> float:
 
 def channel_half_width_m(order: np.ndarray, mask: np.ndarray, spacing_m: float,
                          width_by_order: dict | None = None,
-                         width_scale: float = 1.0) -> np.ndarray:
+                         width_scale: float = 1.0,
+                         width_m: np.ndarray | None = None) -> np.ndarray:
     """
     Per-pixel modelled channel HALF-width in metres, floored at half a texel.
 
@@ -165,6 +166,14 @@ def channel_half_width_m(order: np.ndarray, mask: np.ndarray, spacing_m: float,
     the other is what fills it.
     """
     from . import water as kvwater
+
+    if width_m is not None:
+        explicit = np.asarray(width_m, dtype=np.float32)
+        if explicit.shape != mask.shape:
+            raise ValueError(f"width_m {explicit.shape} != mask {mask.shape}")
+        return np.where(
+            mask, np.maximum(0.5 * explicit, 0.5 * spacing_m),
+            0.5 * spacing_m).astype(np.float32)
 
     width_by_order = width_by_order or kvwater.DEFAULT_WIDTH_BY_ORDER
     orders = np.asarray(order, dtype=np.int32)
@@ -842,6 +851,7 @@ def carve_river_beds(
     depth_scale: float = 1.0,
     width_by_order: dict | None = None,
     width_scale: float = 1.0,
+    width_m: np.ndarray | None = None,
     bed_target: np.ndarray | None = None,
     surface_target: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -939,7 +949,7 @@ def carve_river_beds(
         depth_max[is_river & (orders == o)] = depth_for_order(
             int(o), depth_by_order, depth_scale)
     half_w = channel_half_width_m(orders, is_river, spacing_m,
-                                  width_by_order, width_scale)
+                                  width_by_order, width_scale, width_m=width_m)
 
     # The MODELLED half-width can exceed the width the channel actually got on the
     # grid — an order-4 river is modelled 8 m wide but rasterises to two texels at

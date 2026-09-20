@@ -67,6 +67,7 @@ def _water_opts(a) -> dict:
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
+        "river_runoff_m_per_year": a.river_runoff_m_per_year,
         "fill_lake_holes": not a.keep_lake_holes,
         "ocean_level_m": a.ocean_level,
         "emit_geojson": a.emit_geojson,
@@ -282,6 +283,12 @@ def _report_export(a, res, want_water: bool) -> None:
             r, lk, jn = wv["rivers"], wv["lakes"], wv["junctions"]
             print(f"  + {r['file']}: {r['segments']} segments, {r['vertices']} "
                   f"vertices ({r['bytes'] / 1e6:.1f} MB), upstream→downstream")
+            discharge = r.get("discharge")
+            if discharge:
+                print(f"    Q: modelled mean annual, median "
+                      f"{discharge['discharge_median_m3_s']:.3g} m³/s, max "
+                      f"{discharge['discharge_max_m3_s']:.3g} m³/s; effective "
+                      f"runoff {discharge['effective_runoff_m_per_year']:g} m/year")
             print(f"  + {lk['file']}: {lk['count']} lakes "
                   f"({lk['with_authored_level']} with an authored level)")
             print(f"  + {jn['file']}: {jn['count']} junctions "
@@ -298,9 +305,15 @@ def _report_export(a, res, want_water: bool) -> None:
         print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
               f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
               f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
-        print(f"  + river beds carved under the channel by stream order "
-              f"(× {a.river_depth_scale:g}); the surface is level across each "
+        print(f"  + river beds carved at the Q-derived hydraulic width "
+              f"(order still sets depth, × {a.river_depth_scale:g}); the surface is level across each "
               f"channel and holds water within {a.river_bank_tolerance:.1f} m of it")
+        hierarchy = res.manifest.get("hierarchy", {})
+        hypso = hierarchy.get("hypsometry")
+        if hypso:
+            print(f"  + {hypso['file']}: {hypso['node_count']} fixed "
+                  f"{hypso['samples_per_node']}-sample absolute-axis curves "
+                  f"({hypso['bytes'] / 1e6:.1f} MB)")
 
 
 def _print_water_report(rep: dict) -> None:
@@ -419,6 +432,12 @@ def cmd_validate_water(a):
                   "-> OK")
         else:
             print(f"[lake_islands] {islands.get('error', 'invalid')} -> MISMATCH")
+    hydro = rep.get("river_hydrology")
+    if hydro:
+        print(f"[river hydrology] widths {hydro['width_exact']}/"
+              f"{hydro['segments']} exact, "
+              f"{hydro['discharge_decreases_downstream']} Q decreases, "
+              f"{hydro['segments_without_hierarchy_node']} missing node ids")
 
     for note in rep.get("notes", []):
         print(f"    NOTE: {note}")
@@ -433,7 +452,7 @@ def cmd_validate_water(a):
 
 def cmd_validate_hierarchy(a):
     """
-    Check hierarchy.bin and labels.atlas against the manifest and heights.atlas:
+    Check hierarchy.bin, labels.atlas and hypsometry.bin against the manifest and heights.atlas:
     tree structure, stored codes, saddle placement, label counts, and every
     coarse label level recomputed from the one below. The checking is in
     `exports.check_hierarchy`.
@@ -454,6 +473,11 @@ def cmd_validate_hierarchy(a):
         print(f"[outflow head] {heads['exact']}/{heads['nodes']} exact, "
               f"{heads['within_one_surface_code']} within one code step, "
               f"{heads['mismatched']} mismatched")
+    hypso = rep.get("hypsometry")
+    if hypso:
+        print(f"[hypsometry] {hypso['exact']}/{hypso['nodes']} records exact, "
+              f"{hypso['mismatched']} mismatched "
+              f"({hypso['samples_per_node']} samples/node)")
     summ = rep.get("audit_summary")
     if summ:
         print(f"[audit] lakes {summ.get('lakes_by_status')}; rivers "
@@ -581,6 +605,11 @@ def _add_process_args(p):
                    help="spacing to densify river polylines to before sampling Z "
                         "(default: leaf spacing). Denser follows the channel more "
                         "closely; coarser shrinks rivers.bin.")
+    p.add_argument("--river-runoff-m-per-year", type=float, default=1.0,
+                   dest="river_runoff_m_per_year",
+                   help="uniform effective annual runoff used for modelled mean "
+                        "river discharge (default: 1.0 m/year; recorded verbatim "
+                        "in the manifest)")
     p.add_argument("--estimate-lake-levels", action=argparse.BooleanOptionalAction,
                    default=True, dest="estimate_lake_levels",
                    help="fill in a water level for lakes NVE gives no 'hoyde' for, "
@@ -727,8 +756,8 @@ def main(argv=None):
     vw.set_defaults(func=cmd_validate_water)
 
     vh = sub.add_parser("validate-hierarchy",
-                        help="check hierarchy.bin / labels.atlas against the "
-                             "manifest and heights.atlas")
+                        help="check hierarchy.bin / labels.atlas / hypsometry.bin "
+                             "against the manifest and heights.atlas")
     vh.add_argument("--out", required=True)
     vh.set_defaults(func=cmd_validate_hierarchy)
 

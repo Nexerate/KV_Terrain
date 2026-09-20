@@ -280,7 +280,8 @@ def river_surface_moh(
     # that pixel reads no water. The half-width is the SAME one the carve shapes its trench
     # with, so the level is flattened over exactly the width that gets carved.
     half_w = kvbathy.channel_half_width_m(
-        wg.weight, is_river, plan.spacing_m, width_by_order, width_scale)
+        wg.weight, is_river, plan.spacing_m, width_by_order, width_scale,
+        width_m=wg.width_m)
     out = channel_level(plan, feats, is_river, height_uncarved, half_w,
                         bank_tolerance_m=bank_tolerance_m)
 

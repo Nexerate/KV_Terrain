@@ -273,6 +273,53 @@ def test_hierarchy_bin_round_trip(tmp_path):
     assert nodes.tobytes() == h.nodes.tobytes()
 
 
+def test_hypsometry_absolute_axis_composes_and_round_trips(tmp_path):
+    g = np.full((9, 15), 20, dtype=np.uint16)
+    g[2:7, 2:6] = 4
+    g[2:7, 9:13] = 6
+    g[4, 6:9] = 8
+    g[4, 13:15] = 9
+    h = build(g)
+    records = H.build_hypsometry(h, g, spacing_m=5.0)
+
+    assert records.shape == (h.node_count,)
+    assert records[0]["flags"] == 0
+    assert ((records["flags"][1:] & H.HYPSOMETRY_FLAG_VALID) != 0).all()
+    for leaf in range(1, h.leaf_count + 1):
+        axis = H.hypsometry_axis(
+            h.nodes["floor_code"][leaf], h.nodes["spill_code"][leaf],
+            records["max_code"][leaf])
+        expected = np.array([
+            np.count_nonzero((h.labels == leaf) & (g <= z)) * 25.0
+            for z in axis
+        ], dtype=np.float32)
+        assert np.array_equal(records["area_m2"][leaf], expected)
+
+    parent = h.leaf_count + 1
+    axis = H.hypsometry_axis(
+        h.nodes["floor_code"][parent], h.nodes["spill_code"][parent],
+        records["max_code"][parent])
+    children = np.nonzero(h.nodes["parent"] == parent)[0]
+    expected = np.zeros(H.HYPSOMETRY_SAMPLES, dtype=np.float64)
+    for child in children:
+        child_axis = H.hypsometry_axis(
+            h.nodes["floor_code"][child], h.nodes["spill_code"][child],
+            records["max_code"][child])
+        for j, z in enumerate(axis):
+            expected[j] += H._curve_at(
+                child_axis, records["area_m2"][child], int(z))
+    assert np.array_equal(records["area_m2"][parent], expected.astype(np.float32))
+
+    path = str(tmp_path / H.HYPSOMETRY_FILE)
+    info = H.write_hypsometry_bin(records, path)
+    assert info["bytes"] == (H.HYPSOMETRY_HEADER_BYTES +
+                             H.HYPSOMETRY_DTYPE.itemsize * h.node_count)
+    header, got = H.read_hypsometry_bin(path)
+    assert header["node_count"] == h.node_count
+    assert header["samples_per_node"] == H.HYPSOMETRY_SAMPLES
+    assert got.tobytes() == records.tobytes()
+
+
 def test_labels_atlas_round_trip(tmp_path):
     plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
                          tile_cells=8, leaf_tiles_x=4, leaf_tiles_y=2, num_levels=2)

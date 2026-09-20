@@ -1,10 +1,11 @@
 # Water Redesign — Exporter Design Document
 
-> **STATUS: FIRST MILESTONE IMPLEMENTED (2026-09-17); THE REST IS DESIGN ONLY.**
+> **STATUS: HIERARCHY, HYPSOMETRY AND RIVER HYDROLOGY IMPLEMENTED.**
 >
 > Implemented, on branch `water/hierarchy`: §4.1 downhill-only river bed, §4.2 depression
-> hierarchy (node table and labels), §4.4 lake matching and the audit (without catchment), and
-> the `labels.atlas` / `hierarchy.bin` / `water_audit.json` exports with a `validate-hierarchy`
+> hierarchy (node table and labels), §4.4 lake matching and the audit (without catchment),
+> §4.5 composable absolute-axis hypsometry, and §4.6 graph discharge/width. The
+> `labels.atlas` / `hierarchy.bin` / `hypsometry.bin` / `water_audit.json` exports have a `validate-hierarchy`
 > check. `readme.md` documents them as they run, including formats and Lierne numbers; where it
 > and this document differ, the readme describes the code. Each section below is marked
 > IMPLEMENTED, PARTLY IMPLEMENTED or NOT IMPLEMENTED. Everything unmarked or marked not
@@ -46,8 +47,10 @@ These are settled; the rest of the document is read in their light.
      `validate-*` check in `exports.py`, following the existing pattern.
    - §6 synthetic tests and the hierarchy-vs-brute-force test.
 
-   Out of scope for now: flow-direction atlas and flat resolve (§4.3), hypsometry (§4.5), discharge
-   and width (§4.6), `rivers.bin` v2, and embankment treatment (§7).
+   Out of scope for now: flow-direction atlas and flat resolve (§4.3),
+   and embankment treatment (§7). Composable hypsometry ships in `hypsometry.bin` (§4.5);
+   modelled mean-annual discharge, hydraulic width and
+   the hierarchy attachment now ship in `rivers.bin` v2 (§4.6).
 
 5. **Edges and lake spans (owner, 2026-09-17, while implementing).** Every map-edge sample is an
    outlet, and partially cropped lakes must not empty: the lake carve now treats the map edge as
@@ -185,7 +188,7 @@ the enforcement moves here.
 
 ### 4.2 Priority-Flood and the depression hierarchy
 
-**IMPLEMENTED** except `catchment_m2` and `hypso` (they need §4.3 and §4.5), plus `outflow_head_m`
+**IMPLEMENTED** except hydrologic `catchment_m2` (it needs §4.3), plus `outflow_head_m`
 (decision 6). Node layout, ids and flags are in `readme.md`. Every edge sample is an outlet; merges
 happen during the flood.
 
@@ -222,12 +225,13 @@ that is what the runtime reads and §3's ordering rule requires it. Quantisation
 tie-breaking in the priority queue must be deterministic (e.g. by elevation, then cell index).
 
 **Noise pits.** The hierarchy will contain enormous numbers of tiny depressions. Keep them all in
-the tree (the runtime walk needs their spill points to escape pits) but do not compute hypsometry
-for them, and mark nodes below a depth/area threshold as never-displayed.
+the tree (the runtime walk needs their spill points to escape pits), compute the same fixed-size
+hypsometry record for deterministic rebuilding, and mark nodes below a depth/area threshold as
+never-displayed.
 
 ### 4.3 Flow directions and accumulation
 
-**NOT IMPLEMENTED.**
+**IMPLEMENTED (2026-09-20) as `hypsometry.bin`.**
 
 - D8 directions on the carved terrain, with flats resolved (Garbrecht & Martz 1997, or Barnes'
   improved flat resolution). A flat resolve was declined for the **runtime** because it was costly
@@ -270,11 +274,21 @@ page, like the existing lake-level breakdown and network validation.
 
 **NOT IMPLEMENTED.**
 
-For each node large enough to hold a visible lake: a cumulative area-by-elevation curve from
-`floor_m` to `spill_m`, including its descendants' cells. This lets the runtime solve
+For every non-root node: a cumulative area-by-elevation curve including its descendants' cells.
+This lets the runtime solve
 `L = min(spill, Area⁻¹(Q / E))` with a lookup.
 
-- Fixed bin count per node (e.g. 64), elevation-spaced. Store as one flat blob plus offsets.
+- The axis is **absolute packed elevation**, never an offset from the node floor. Each record has
+  64 f32 area samples: 48 inclusive integer-half-up u16-code samples from floor to spill, then 16
+  samples from spill toward the maximum code in the subtree (including that maximum). The upper
+  support lets a child be queried at a parent's higher axis without rescanning cells.
+- Leaves are derived from level-0 `heights.atlas` and `labels.atlas`. Every internal curve is
+  defined as the sum of its immediate child curves at that absolute code (piecewise-linear
+  interpolation, ascending child id, f64 accumulation then f32 storage). Consequently a rebuilt
+  internal node is composed from untouched children by exactly the same operation as the exporter.
+- `hypsometry.bin` is a fixed-record sidecar indexed directly by hierarchy node id, so
+  `hierarchy.bin` remains layout-compatible. Root record 0 is invalid because it also owns cells
+  draining directly off-map and is not a depression.
 - The area above the shoreline comes from LiDAR. The area below an authored lake's surface comes
   from the **invented carved bowl**. That does not affect levels at or above the authored level,
   but it does affect what a breached, drained lake looks like. Record it per node
@@ -282,13 +296,14 @@ For each node large enough to hold a visible lake: a cumulative area-by-elevatio
 
 ### 4.6 Discharge and width
 
-**NOT IMPLEMENTED.**
+**IMPLEMENTED (2026-09-20).**
 
 Elvenett has no width or discharge; today width is a heuristic on Strahler order.
 
-- **`Q` per segment = catchment area at its downstream end × export rainfall.** Record the rainfall
-  value in the manifest; the runtime needs it to decide whether its own rainfall knob scales
-  authored rivers.
+- **`Q` per segment = accumulated modelled catchment area × export effective runoff.** ELVIS ships
+  local REGINE-unit area rather than D8 accumulation, so each unique unit area is apportioned once
+  over its emitted segments by length and accumulated on the authored graph. The manifest records
+  the default 1.0 m/year effective runoff and labels Q as modelled mean annual, not gauged.
 - **Width = f(Q)**, e.g. `w = a · Q^0.5` (Leopold & Maddock). **This function must be identical in
   exporter and runtime.** Write its constants into the manifest and have the runtime read them
   rather than duplicating them.
@@ -299,15 +314,16 @@ Elvenett has no width or discharge; today width is a heuristic on Strahler order
 
 ## 5. Export format additions (sketch)
 
-**PARTLY IMPLEMENTED:** `labels.atlas`, `hierarchy.bin` (node table only, no hypsometry blob),
-`water_audit.json`, and the manifest's hierarchy/label descriptors and per-atlas bytes per sample.
-The rest of the table is not implemented.
+**PARTLY IMPLEMENTED:** `labels.atlas`, `hierarchy.bin`, the `hypsometry.bin` sidecar,
+`rivers.bin` v2, `water_audit.json`, and their manifest descriptors. `flowdir.atlas` remains
+unimplemented.
 
 | File | Contents |
 |---|---|
 | `labels.atlas` | u32 leaf node id per sample (4 bytes/sample atlas, §0.2); coarse levels take the lowest child's label |
 | `flowdir.atlas` | u8 D8 direction per sample, flats resolved |
-| `hierarchy.bin` | Node table (§4.2) + hypsometry blob (§4.5) |
+| `hierarchy.bin` | Node table (§4.2), unchanged fixed record layout |
+| `hypsometry.bin` | Fixed 64-sample absolute-axis record per hierarchy node (§4.5) |
 | `rivers.bin` v2 | v1 + per-segment `Q`, width, `node_id`; bed profile monotone |
 | `lakes.json` | + `node_id`, `spill_m`, audit flags |
 | `water_audit.json` | §4.4 findings with coordinates |

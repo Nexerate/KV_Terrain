@@ -117,6 +117,8 @@ RIVER_ELVID_FIELDS = ("elvid", "elvId", "ELVID", "elv_id")
 RIVER_VASSDRAG_FIELDS = ("vassdragsnr", "vassdragNr", "VASSDRAGSNR", "vassdragsnummer")
 RIVER_VATNLNR_FIELDS = ("vatnlnr", "vatnLnr", "VATNLNR", "vatn_lnr")
 RIVER_CATCHMENT_FIELDS = ("vnrnfelt", "vnrNfelt", "VNRNFELT")
+RIVER_REGINE_AREA_FIELDS = ("arealregineenhet_km2", "arealRegineenhet_km2",
+                            "AREALREGINEENHET_KM2", "arealregine_km2")
 LAKE_ID_FIELDS = ("vatnLnr", "vatnlnr", "lopenr", "LOPENR", "vassdragLnr", "objektNr")
 LAKE_NAME_FIELDS = ("navn", "NAVN", "sjonavn", "objektNavn", "vatnNavn")
 LAKE_AREA_FIELDS = ("areal_km2", "arealKm2", "areal", "AREAL")   # km² if *_km2, else m²
@@ -193,6 +195,8 @@ class RiverSeg:
     vassdragsnr: Optional[str] = None   # REGINE catchment key
     vatnlnr: Optional[int] = None       # lake serial, when the segment touches one
     vnrnfelt: Optional[str] = None      # parent catchment's vassdragsnr
+    regine_area_km2: Optional[float] = None  # local REGINE unit area, not accumulated
+    width_m: Optional[float] = None     # optional hydraulic width override
     part_index: int = 0                 # part number within a MultiLineString
     feature_index: int = -1             # index of the parent GeoJSON feature in the
                                         # RAW layer (before repeated copies are dropped)
@@ -257,6 +261,9 @@ class WaterGrid:
     # `rasterize_water`) but they are dry land: the carve leaves their DTM height
     # alone and treats them as shore, and the level estimator ignores them.
     lake_island: np.ndarray = None     # bool
+    # Full modelled width on river samples.  This is an intermediate used by the
+    # surface/carve; the runtime reads the same per-segment width from rivers.bin.
+    width_m: np.ndarray = None         # f4, 0 off-river
 
     def lake_level(self, info: dict):
         """
@@ -418,6 +425,7 @@ RIVER_FIELD_CANDIDATES = {
     "vassdragsnr": RIVER_VASSDRAG_FIELDS,
     "vatnlnr": RIVER_VATNLNR_FIELDS,
     "vnrnfelt": RIVER_CATCHMENT_FIELDS,
+    "regine_area_km2": RIVER_REGINE_AREA_FIELDS,
 }
 LAKE_FIELD_CANDIDATES = {
     "lopenr": LAKE_ID_FIELDS,
@@ -626,6 +634,13 @@ def features_from_geojson(
         s = str(v).strip()
         return s or None
 
+    def _to_float(v):
+        try:
+            x = float(v) if v is not None else None
+            return x if x is not None and np.isfinite(x) else None
+        except (TypeError, ValueError):
+            return None
+
     def _parse_rivers(feats, default_order, keep_identity: bool, label: str) -> list:
         out: list = []
         # Resolve the schema ONCE per layer instead of re-scanning every property
@@ -659,8 +674,11 @@ def features_from_geojson(
                 vdrag = _to_str(props.get(fmap["vassdragsnr"]) if fmap["vassdragsnr"] else None)
                 vatn = _to_int(props.get(fmap["vatnlnr"]) if fmap["vatnlnr"] else None)
                 nfelt = _to_str(props.get(fmap["vnrnfelt"]) if fmap["vnrnfelt"] else None)
+                regine_area = _to_float(
+                    props.get(fmap["regine_area_km2"])
+                    if fmap["regine_area_km2"] else None)
             else:
-                strekn = elvid = vdrag = vatn = nfelt = None
+                strekn = elvid = vdrag = vatn = nfelt = regine_area = None
 
             # A MultiLineString is several parts of ONE feature. Each part becomes
             # its own RiverSeg (they are geometrically disjoint) but all of them
@@ -673,6 +691,7 @@ def features_from_geojson(
                         order=order,
                         strekn_lnr=strekn, elvid=elvid, vassdragsnr=vdrag,
                         vatnlnr=vatn, vnrnfelt=nfelt,
+                        regine_area_km2=regine_area,
                         part_index=pi, feature_index=fi,
                     ))
         return out
@@ -1199,12 +1218,16 @@ def rasterize_water(
     # They deliberately overlap; the sort below burns higher orders last, so a main
     # river upgrades the order of the pixels it shares with its elvenett twin.
     # Only `feats.rivers` is serialised as polylines — see WaterFeatures.
-    weight_shapes = []   # (polygon, order)
+    weight_shapes = []   # (polygon, order, full width metres)
     for seg in list(feats.rivers) + list(feats.main_rivers):
         xy = seg.xy
         if xy.shape[0] < 2:
             continue
-        half = 0.5 * order_to_width_m(seg.order, width_by_order, width_scale)
+        explicit = getattr(seg, "width_m", None)
+        full_width = (float(explicit) if explicit is not None and
+                      np.isfinite(explicit) and explicit > 0 else
+                      order_to_width_m(seg.order, width_by_order, width_scale))
+        half = 0.5 * full_width
         half = max(half, 0.51 * plan.spacing_m)  # ensure at least ~1 sample wide
         for k in range(xy.shape[0] - 1):
             (x0, y0), (x1, y1) = xy[k], xy[k + 1]
@@ -1214,15 +1237,20 @@ def rasterize_water(
                 half, cap_style=2, join_style=2)  # flat caps, mitre joins
             if poly.is_empty:
                 continue
-            weight_shapes.append((poly, int(seg.order)))
+            weight_shapes.append((poly, int(seg.order), float(full_width)))
 
     # Burn larger rivers LAST so they win (rasterize is last-write per pixel).
-    order_sort = np.argsort([w for _, w in weight_shapes], kind="stable") \
-        if weight_shapes else np.array([], dtype=int)
+    order_sort = np.asarray(sorted(
+        range(len(weight_shapes)),
+        key=lambda i: (weight_shapes[i][2], weight_shapes[i][1], i)), dtype=int)
     weight_arr = np.zeros(shape, dtype=np.uint8)
+    width_arr = np.zeros(shape, dtype=np.float32)
     if len(order_sort):
-        w_sorted = [weight_shapes[i] for i in order_sort]
+        w_sorted = [(weight_shapes[i][0], weight_shapes[i][1]) for i in order_sort]
+        width_sorted = [(weight_shapes[i][0], weight_shapes[i][2]) for i in order_sort]
         rasterize(w_sorted, out=weight_arr, transform=transform,
+                  all_touched=all_touched_rivers, merge_alg=_replace())
+        rasterize(width_sorted, out=width_arr, transform=transform,
                   all_touched=all_touched_rivers, merge_alg=_replace())
 
     type_arr = np.where(weight_arr > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
@@ -1287,9 +1315,34 @@ def rasterize_water(
     lake_mask = lake_id_arr > 0
     type_arr[lake_mask] = TYPE_LAKE
     weight_arr[lake_mask] = 0
+    width_arr[lake_mask] = 0.0
 
     return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table,
-                     weight_raw=weight_raw, lake_island=island_mask)
+                     weight_raw=weight_raw, lake_island=island_mask,
+                     width_m=width_arr)
+
+
+def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
+                       *, all_touched_rivers: bool = True) -> None:
+    """Replace only the river footprint with hydraulically sized segments.
+
+    Lake ids, snapped shore pixels, resolved levels and island cells stay exactly
+    as they are.  The provisional order-width raster exists only to recover the
+    hovedelv order overlay before discharge is known; this second pass is the
+    final river mask used by the surface and carve.
+    """
+    feats = WaterFeatures(rivers=[RiverSeg(
+        xy=s.xy, order=int(s.order), width_m=float(s.width_m)) for s in segments])
+    river_only = rasterize_water(
+        plan, feats, all_touched_rivers=all_touched_rivers,
+        fill_lake_holes=False)
+    lake = wg.lake_id > 0
+    wg.weight_raw = river_only.weight_raw
+    wg.type[~lake] = np.where(
+        river_only.weight_raw[~lake] > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
+    wg.weight[~lake] = river_only.weight_raw[~lake]
+    wg.width_m = river_only.width_m
+    wg.width_m[lake] = 0.0
 
 
 def _replace():

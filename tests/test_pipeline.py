@@ -26,10 +26,20 @@ def test_new_products_and_manifest(export_dir):
     assert atlas["labels_file"] == "labels.atlas"
     assert atlas["bytes_per_sample"] == {"heights.atlas": 2, "surface.atlas": 2,
                                          "water_id.atlas": 2, "labels.atlas": 4}
-    for f in ("hierarchy.bin", "labels.atlas", "water_audit.json",
+    for f in ("hierarchy.bin", "hypsometry.bin", "labels.atlas", "water_audit.json",
               "lake_islands.bin"):
         assert os.path.exists(os.path.join(export_dir, f))
     assert m["hierarchy"]["record_bytes"] == 52
+    hypso = m["hierarchy"]["hypsometry"]
+    assert hypso["file"] == "hypsometry.bin"
+    assert hypso["format"] == "kvterrain-hypsometry/1"
+    assert hypso["samples_per_node"] == 64
+    assert hypso["axis"]["kind"] == "absolute_heights_atlas_u16_code"
+    rivers = m["water_vector"]["rivers"]
+    assert rivers["format"] == "kvterrain-rivers-bin/2"
+    assert rivers["discharge"]["kind"] == "modelled_mean_annual_discharge"
+    assert rivers["width_model"]["formula"].startswith("width_m = clamp")
+    assert rivers["hierarchy_attachment"]["missing"] == 0
     assert m["water_surface"]["river_bathymetry"]["downhill_bed"]["enabled"]
     assert m["water_surface"]["lake_bathymetry"]["edge_is_shore"]
     assert m["water_surface"]["lake_bathymetry"]["shore_8_connected"]

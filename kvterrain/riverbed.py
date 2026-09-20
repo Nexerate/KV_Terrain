@@ -129,10 +129,12 @@ SUNK_GUARD_M = 10.0
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
-                        width_scale: float) -> float:
+                        width_scale: float, width_m: Optional[float] = None) -> float:
     """The scalar form of `bathymetry.channel_half_width_m`."""
     table = width_by_order or kvwater.DEFAULT_WIDTH_BY_ORDER
-    return max(0.5 * kvwater.order_to_width_m(order, table, width_scale),
+    full = (float(width_m) if width_m is not None and np.isfinite(width_m) and
+            width_m > 0 else kvwater.order_to_width_m(order, table, width_scale))
+    return max(0.5 * full,
                0.5 * float(spacing_m))
 
 
@@ -517,7 +519,8 @@ def downhill_profiles(
         lvl = g
         depth = kvbathy.depth_for_order(s.order, depth_by_order, depth_scale)
         bed = g - depth
-        half_w = _segment_half_width(s.order, plan.spacing_m, width_by_order, width_scale)
+        half_w = _segment_half_width(
+            s.order, plan.spacing_m, width_by_order, width_scale, s.width_m)
         half_widths[sid] = half_w
         ceiling = (_bank_ceiling(plan, s.xy, bank_ground, wg.type, half_w)
                    if wg is not None else np.full(g.shape, np.inf, dtype=np.float64))
@@ -872,7 +875,8 @@ def downhill_river_bed(
         ~src, sampling=(plan.spacing_m, plan.spacing_m),
         return_distances=True, return_indices=True)
     half_w = kvbathy.channel_half_width_m(
-        wg.weight, is_river, plan.spacing_m, width_by_order, width_scale)
+        wg.weight, is_river, plan.spacing_m, width_by_order, width_scale,
+        width_m=wg.width_m)
     near = is_river & (dist <= half_w + plan.spacing_m)
     spread_l = src_l[ind[0], ind[1]]
     spread_b = src_b[ind[0], ind[1]]

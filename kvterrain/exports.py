@@ -377,6 +377,7 @@ def check_water(exp: Export) -> dict:
     # ---- rivers.bin -------------------------------------------------------- #
     path = os.path.join(exp.root, wv["rivers"]["file"])
     seen_ids, downstream_refs = set(), []
+    discharge_by_id, width_by_id, node_by_id, downstream_by_id = {}, {}, {}, {}
     total_v = 0
     try:
         with open(path, "rb") as fh:
@@ -388,12 +389,31 @@ def check_water(exp: Export) -> dict:
             report["rivers"] = {"file": wv["rivers"]["file"], "version": version,
                                 "epsg": epsg, "stride_m": stride,
                                 "segments": nseg, "vertices": nvert}
+            if version != 2:
+                raise ValueError(f"unsupported rivers.bin version {version}; expected 2")
             # Per-segment record, in write_rivers_bin's exact order. Walking it
             # in full (rather than seeking past it) IS the check: a wrong field
             # width desynchronises the stream and the walk runs off the end,
             # which is precisely the corruption a length-only check would miss.
             for _ in range(nseg):
-                (sid, strekn, vatn, order, down) = struct.unpack("<IqqHi", fh.read(26))
+                (sid, strekn, vatn, order, down, discharge, width,
+                 node_id) = struct.unpack("<IqqHiffI", fh.read(38))
+                if not np.isfinite(discharge) or discharge < 0:
+                    report["errors"].append(
+                        f"segment {sid} has invalid discharge {discharge}")
+                if not np.isfinite(width) or width <= 0:
+                    report["errors"].append(
+                        f"segment {sid} has invalid width {width}")
+                node_count = exp.manifest.get("hierarchy", {}).get("node_count")
+                if (node_count is not None and node_id != 0xFFFFFFFF and
+                        node_id >= int(node_count)):
+                    report["errors"].append(
+                        f"segment {sid} names hierarchy node {node_id}, but only "
+                        f"{node_count} nodes exist")
+                discharge_by_id[sid] = float(discharge)
+                width_by_id[sid] = float(width)
+                node_by_id[sid] = int(node_id)
+                downstream_by_id[sid] = int(down)
                 (nup,) = struct.unpack("<H", fh.read(2))
                 fh.read(4 * nup)                       # upstream ids, u32 each
                 for _field in range(2):                # elvid, vassdragsnr
@@ -425,6 +445,40 @@ def check_water(exp: Export) -> dict:
         if dangling:
             report["errors"].append(
                 f"{len(dangling)} downstream links point at no segment")
+        hydro = wv["rivers"].get("discharge", {})
+        model = wv["rivers"].get("width_model", {})
+        if hydro and model:
+            q = np.asarray([discharge_by_id[i] for i in sorted(discharge_by_id)],
+                           dtype=np.float32)
+            got_width = np.asarray(
+                [width_by_id[i] for i in sorted(width_by_id)], dtype=np.float32)
+            expected_width = np.asarray(rivernet.width_from_discharge(
+                q, coefficient=float(model["a"]), exponent=float(model["b"]),
+                min_width_m=float(model["min_m"]),
+                max_width_m=float(model["max_m"]),
+                scale=float(model.get("scale", 1.0))), dtype=np.float32)
+            width_exact = got_width.view("<u4") == expected_width.view("<u4")
+            decreases = sum(
+                1 for sid, down in downstream_by_id.items()
+                if down >= 0 and discharge_by_id[down] + 1e-6 < discharge_by_id[sid])
+            missing_nodes = sum(v == 0xFFFFFFFF for v in node_by_id.values())
+            report["river_hydrology"] = {
+                "segments": len(discharge_by_id),
+                "width_exact": int(width_exact.sum()),
+                "width_mismatched": int((~width_exact).sum()),
+                "discharge_decreases_downstream": int(decreases),
+                "segments_without_hierarchy_node": int(missing_nodes),
+            }
+            if not width_exact.all():
+                report["errors"].append(
+                    f"{int((~width_exact).sum())} river widths do not reproduce "
+                    "from discharge and the manifest width function")
+            if decreases:
+                report["errors"].append(
+                    f"{decreases} river links lose discharge downstream")
+            if exp.manifest.get("hierarchy") and missing_nodes:
+                report["errors"].append(
+                    f"{missing_nodes} river segments have no hierarchy node")
     except Exception as e:      # noqa: BLE001 — reported, not raised
         report["errors"].append(f"rivers.bin: {e}")
 
@@ -536,6 +590,8 @@ def check_hierarchy(exp: Export) -> dict:
         subtree, outlet_cell into overflow_to's;
       * every outflow head is reproduced exactly from surface.atlas and
         water_id.atlas;
+      * every hypsometry record is rebuilt exactly from level-0 packed heights,
+        level-0 labels, and immediate child curves;
       * every level-0 label is 0 or a leaf, and the per-node sample counts match;
       * every coarse label level is recomputed from the level below and the
         heights at that level, and must match exactly.
@@ -678,6 +734,47 @@ def check_hierarchy(exp: Export) -> dict:
             fail(f"{int(mismatch.sum())} outflow heads do not reproduce exactly "
                  "from the packed surface atlas")
         del surface, water_id, expected_head
+
+    hypso_block = hb.get("hypsometry")
+    if hypso_block:
+        hypso_path = os.path.join(exp.root, hypso_block["file"])
+        try:
+            hypso_header, actual_hypso = H.read_hypsometry_bin(hypso_path)
+        except Exception as e:      # noqa: BLE001
+            fail(f"{hypso_block['file']}: {e}")
+        else:
+            for key, want in (
+                    ("node_count", n),
+                    ("record_bytes", hypso_block["record_bytes"]),
+                    ("samples_per_node", H.HYPSOMETRY_SAMPLES),
+                    ("below_spill_samples", H.HYPSOMETRY_BELOW_SPILL_SAMPLES)):
+                if hypso_header[key] != want:
+                    fail(f"hypsometry header {key} = {hypso_header[key]}, "
+                         f"expected {want}")
+            packed_hierarchy = H.Hierarchy(
+                nodes=nodes, labels=labels, leaf_count=P,
+                samples_x=SX, samples_y=SY,
+                height_min=exp.height_range[0], height_max=exp.height_range[1],
+                seconds={})
+            expected_hypso = H.build_hypsometry(
+                packed_hierarchy, codes.reshape(SY, SX),
+                spacing_m=float(exp.manifest["leaf_spacing_m"]))
+            exact = ((actual_hypso["max_code"] == expected_hypso["max_code"])
+                     & (actual_hypso["flags"] == expected_hypso["flags"])
+                     & np.all(actual_hypso["area_m2"].view("<u4") ==
+                              expected_hypso["area_m2"].view("<u4"), axis=1))
+            report["hypsometry"] = {
+                "nodes": n,
+                "exact": int(exact.sum()),
+                "mismatched": int((~exact).sum()),
+                "samples_per_node": H.HYPSOMETRY_SAMPLES,
+            }
+            if not exact.all():
+                fail(f"{int((~exact).sum())} hypsometry records do not reproduce "
+                     "exactly from the packed heights, labels and child curves")
+            del expected_hypso, actual_hypso
+    else:
+        report["notes"].append("no hierarchy hypsometry block")
     del codes, lflat
 
     prev_labels = labels

@@ -78,8 +78,20 @@ RIVERS_GEOJSON_FILE = "rivers.geojson"
 LAKES_FILE = "lakes.json"
 JUNCTIONS_FILE = "junctions.json"
 
-BIN_MAGIC = b"KVRIVER1"
-BIN_VERSION = 1
+BIN_MAGIC = b"KVRIVER2"
+BIN_VERSION = 2
+NO_HIERARCHY_NODE = 0xFFFFFFFF
+
+# Modelled mean-annual flow.  One metre/year is 31.688 L/s/km², a deliberately
+# explicit effective-runoff assumption rather than an unlabeled rainfall knob.
+DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR = 1.0
+SECONDS_PER_MEAN_YEAR = 365.25 * 24.0 * 60.0 * 60.0
+
+# Hydraulic geometry shared with the runtime: full width = clamp(a * Q^b).
+DEFAULT_WIDTH_COEFFICIENT = 8.0
+DEFAULT_WIDTH_EXPONENT = 0.5
+DEFAULT_MIN_WIDTH_M = 2.0
+DEFAULT_MAX_WIDTH_M = 80.0
 
 JUNCTION_INFLOW = "Inflow"
 JUNCTION_OUTFLOW = "Outflow"
@@ -302,9 +314,15 @@ class RiverSegment:
     elvid: Optional[str] = None
     vassdragsnr: Optional[str] = None
     vatnlnr: Optional[int] = None
+    regine_area_km2: Optional[float] = None
     upstream: list = field(default_factory=list)     # seg_ids
     downstream: Optional[int] = None                 # seg_id
     lake_spans: list = field(default_factory=list)   # (start_idx, end_idx, local_lake_id)
+    discharge_m3_s: float = 0.0
+    width_m: Optional[float] = None
+    node_id: int = NO_HIERARCHY_NODE
+    local_catchment_m2: float = 0.0
+    accumulated_catchment_m2: float = 0.0
 
     @property
     def n(self) -> int:
@@ -459,6 +477,7 @@ def trace_river_network(
                 elvid=seg.elvid,
                 vassdragsnr=seg.vassdragsnr,
                 vatnlnr=seg.vatnlnr,
+                regine_area_km2=seg.regine_area_km2,
                 lake_spans=spans,
             ))
 
@@ -467,6 +486,172 @@ def trace_river_network(
     _link_segments(segments, tol_m=ENDPOINT_TOL_CELLS * plan.spacing_m)
     return TracedNetwork(segments=segments, stride_m=stride, clip=clip,
                          span_stats=span_stats)
+
+
+def width_from_discharge(discharge_m3_s, *,
+                         coefficient: float = DEFAULT_WIDTH_COEFFICIENT,
+                         exponent: float = DEFAULT_WIDTH_EXPONENT,
+                         min_width_m: float = DEFAULT_MIN_WIDTH_M,
+                         max_width_m: float = DEFAULT_MAX_WIDTH_M,
+                         scale: float = 1.0):
+    """Full modelled channel width in metres from discharge in m³/s."""
+    q = np.maximum(np.asarray(discharge_m3_s, dtype=np.float64), 0.0)
+    width = float(coefficient) * np.power(q, float(exponent))
+    width = np.clip(width, float(min_width_m), float(max_width_m)) * float(scale)
+    return width
+
+
+def assign_discharge_and_width(
+    traced: TracedNetwork,
+    *,
+    effective_runoff_m_per_year: float = DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR,
+    width_coefficient: float = DEFAULT_WIDTH_COEFFICIENT,
+    width_exponent: float = DEFAULT_WIDTH_EXPONENT,
+    min_width_m: float = DEFAULT_MIN_WIDTH_M,
+    max_width_m: float = DEFAULT_MAX_WIDTH_M,
+    width_scale: float = 1.0,
+) -> dict:
+    """Put modelled mean-annual Q and its matching hydraulic width on the graph.
+
+    ELVIS carries each local REGINE unit's area, not accumulated segment
+    catchments.  A unit's area is therefore apportioned once across its emitted
+    segments by polyline length (uniform lateral contribution), then accumulated
+    through the authored upstream/downstream graph.  This preserves mass across
+    forks and clipped components without pretending the source supplies gauges.
+    """
+    segments = traced.segments
+    if effective_runoff_m_per_year < 0:
+        raise ValueError("effective runoff must be non-negative")
+
+    groups: dict[str, list] = {}
+    missing = []
+    for s in segments:
+        if (s.vassdragsnr and s.regine_area_km2 is not None and
+                np.isfinite(s.regine_area_km2) and s.regine_area_km2 > 0):
+            groups.setdefault(s.vassdragsnr, []).append(s)
+        else:
+            missing.append(s)
+
+    represented_area_m2 = 0.0
+    inconsistent_units = 0
+    for unit, members in groups.items():
+        source_areas = np.asarray(
+            [float(s.regine_area_km2) for s in members], dtype=np.float64)
+        area_km2 = float(np.median(source_areas))
+        if float(source_areas.max() - source_areas.min()) > 1e-6:
+            inconsistent_units += 1
+        represented_area_m2 += area_km2 * 1e6
+        lengths = np.asarray([
+            float(np.hypot(np.diff(s.xy[:, 0]), np.diff(s.xy[:, 1])).sum())
+            for s in members], dtype=np.float64)
+        if not np.isfinite(lengths).all() or float(lengths.sum()) <= 0:
+            lengths[:] = 1.0
+        local = area_km2 * 1e6 * lengths / float(lengths.sum())
+        for s, a in zip(members, local):
+            s.local_catchment_m2 = float(a)
+
+    for s in missing:
+        s.local_catchment_m2 = 0.0
+
+    by_id = {s.seg_id: s for s in segments}
+    indegree = {s.seg_id: sum(1 for u in s.upstream if u in by_id)
+                for s in segments}
+    ready = sorted(sid for sid, degree in indegree.items() if degree == 0)
+    accumulated = {s.seg_id: float(s.local_catchment_m2) for s in segments}
+    visited = []
+    while ready:
+        sid = ready.pop(0)
+        visited.append(sid)
+        s = by_id[sid]
+        d = s.downstream
+        if d is not None and d in by_id:
+            accumulated[d] += accumulated[sid]
+            indegree[d] -= 1
+            if indegree[d] == 0:
+                ready.append(d)
+                ready.sort()
+
+    cyclic = set(by_id) - set(visited)
+    cycle_components = []
+    unseen = set(cyclic)
+    while unseen:
+        start = min(unseen)
+        component = []
+        sid = start
+        while sid in unseen:
+            unseen.remove(sid)
+            component.append(sid)
+            nxt = by_id[sid].downstream
+            if nxt is None or nxt not in cyclic:
+                break
+            sid = nxt
+        total = float(sum(accumulated[v] for v in component))
+        for v in component:
+            accumulated[v] = total
+        cycle_components.append((component, total))
+    q_scale = float(effective_runoff_m_per_year) / SECONDS_PER_MEAN_YEAR
+    for s in segments:
+        area = max(float(accumulated[s.seg_id]), 0.0)
+        s.accumulated_catchment_m2 = area
+        # Q is a per-segment f32 in rivers.bin. Derive width from THAT packed
+        # value so the runtime reproduces the shipped width bit-for-bit.
+        s.discharge_m3_s = float(np.float32(area * q_scale))
+        s.width_m = float(np.float32(width_from_discharge(
+            s.discharge_m3_s, coefficient=width_coefficient,
+            exponent=width_exponent, min_width_m=min_width_m,
+            max_width_m=max_width_m, scale=width_scale)))
+
+    sinks = [s for s in segments if s.downstream is None or s.downstream not in by_id]
+    sink_area = float(sum(accumulated[s.seg_id] for s in sinks) +
+                      sum(total for _component, total in cycle_components))
+    qs = np.asarray([s.discharge_m3_s for s in segments], dtype=np.float64)
+    widths = np.asarray([s.width_m for s in segments], dtype=np.float64)
+    return {
+        "kind": "modelled_mean_annual_discharge",
+        "units": "m3/s",
+        "reference_period": "mean annual",
+        "gauged": False,
+        "effective_runoff_m_per_year": float(effective_runoff_m_per_year),
+        "effective_runoff_l_s_km2": float(
+            effective_runoff_m_per_year * 1e6 * 1000.0 / SECONDS_PER_MEAN_YEAR),
+        "seconds_per_year": float(SECONDS_PER_MEAN_YEAR),
+        "regine_units": len(groups),
+        "regine_units_with_inconsistent_source_area": int(inconsistent_units),
+        "segments_without_regine_area": len(missing),
+        "represented_regine_area_m2": represented_area_m2,
+        "sink_accumulated_area_m2": sink_area,
+        "graph_cycle_segments": len(cyclic),
+        "graph_cycle_components": len(cycle_components),
+        "discharge_min_m3_s": float(qs.min()) if qs.size else 0.0,
+        "discharge_median_m3_s": float(np.median(qs)) if qs.size else 0.0,
+        "discharge_max_m3_s": float(qs.max()) if qs.size else 0.0,
+        "width_min_m": float(widths.min()) if widths.size else 0.0,
+        "width_median_m": float(np.median(widths)) if widths.size else 0.0,
+        "width_max_m": float(widths.max()) if widths.size else 0.0,
+        "method": "For each vassdragsnr, the median finite positive NVE REGINE "
+                  "unit area is apportioned once across "
+                  "its emitted ELVIS segments by in-export polyline length, then "
+                  "accumulated downstream on the authored graph. Q = accumulated "
+                  "area * uniform effective runoff / seconds_per_year.",
+        "source_field": "arealregineenhet_km2",
+        "source_field_semantics": "local REGINE-unit area, not upstream area",
+    }
+
+
+def attach_hierarchy_nodes(plan: core.GridPlan, net: RiverNetwork, hier) -> dict:
+    """Attach each segment to the leaf node at its downstream-most vertex."""
+    root = 0
+    counts = {"root": 0, "leaf": 0, "missing": 0}
+    for s in net.segments:
+        if s.n == 0:
+            s.node_id = NO_HIERARCHY_NODE
+            counts["missing"] += 1
+            continue
+        r, c = _nearest_idx(plan, s.xy[-1:])
+        node = int(hier.labels[int(r[0]), int(c[0])])
+        s.node_id = node
+        counts["root" if node == root else "leaf"] += 1
+    return counts
 
 
 def build_river_network(
@@ -950,7 +1135,7 @@ def validate_connectivity(segments: list) -> dict:
 # consumers, two formats, no conflict.
 #
 # Header (little-endian):
-#   8s  magic "KVRIVER1"
+#   8s  magic "KVRIVER2"
 #   I   version
 #   I   epsg
 #   d   origin_x            <- vertex x/y are stored RELATIVE to this
@@ -966,6 +1151,9 @@ def validate_connectivity(segments: list) -> dict:
 #   q   vatn_lnr          (-1 = absent)
 #   H   order
 #   i   downstream_id     (-1 = none)
+#   f   discharge_m3_s    (modelled mean annual discharge)
+#   f   width_m            (full hydraulic width from manifest function)
+#   I   node_id            (leaf label at downstream vertex; 0=root, UINT32_MAX=none)
 #   H   upstream_count, then I * upstream_count
 #   B   elvid_len,       then bytes (ascii)
 #   B   vassdragsnr_len, then bytes (ascii)
@@ -989,11 +1177,12 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
 
         for s in net.segments:
             fh.write(struct.pack(
-                "<IqqHi", s.seg_id,
+                "<IqqHiffI", s.seg_id,
                 -1 if s.strekn_lnr is None else int(s.strekn_lnr),
                 -1 if s.vatnlnr is None else int(s.vatnlnr),
                 int(s.order),
-                -1 if s.downstream is None else int(s.downstream)))
+                -1 if s.downstream is None else int(s.downstream),
+                float(s.discharge_m3_s), float(s.width_m), int(s.node_id)))
             fh.write(struct.pack("<H", len(s.upstream)))
             if s.upstream:
                 fh.write(np.asarray(s.upstream, dtype="<u4").tobytes())
@@ -1013,12 +1202,39 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
 
     return {
         "file": os.path.basename(path),
-        "format": "kvterrain-rivers-bin/1",
+        "format": "kvterrain-rivers-bin/2",
         "magic": BIN_MAGIC.decode("ascii"),
+        "version": BIN_VERSION,
         "byte_order": "little_endian",
+        "header_bytes": 48,
+        "header_layout": "<8sIIddfIII",
         "bytes": os.path.getsize(path),
         "segments": len(net.segments),
         "vertices": net.total_vertices(),
+        "segment_prefix_bytes": 38,
+        "segment_prefix_layout": "<IqqHiffI",
+        "segment_prefix_fields": [
+            {"name": "seg_id", "dtype": "u32le", "offset": 0},
+            {"name": "strekn_lnr", "dtype": "i64le", "offset": 4,
+             "none": -1},
+            {"name": "vatn_lnr", "dtype": "i64le", "offset": 12,
+             "none": -1},
+            {"name": "order", "dtype": "u16le", "offset": 20},
+            {"name": "downstream_id", "dtype": "i32le", "offset": 22,
+             "none": -1},
+            {"name": "discharge_m3_s", "dtype": "f32le", "offset": 26},
+            {"name": "width_m", "dtype": "f32le", "offset": 30},
+            {"name": "node_id", "dtype": "u32le", "offset": 34,
+             "none": NO_HIERARCHY_NODE},
+        ],
+        "segment_tail": "u16 upstream_count; upstream_count*u32 ids; u8+ASCII "
+                        "elvid; u8+ASCII vassdragsnr; u16 lake_span_count; "
+                        "lake_span_count*(u32 start,u32 end,u16 lake_id); "
+                        "16-byte geometry hash; u32 vertex_count; "
+                        "vertex_count*(4*f32)",
+        "node_id": "level-0 hierarchy leaf label at the nearest sample to the "
+                   "segment's downstream-most vertex; 0 drains directly off-map; "
+                   "4294967295 means unavailable",
         "vertex_fields": ["x_rel_origin_m", "y_rel_origin_m", "z_bed_m", "level_surface_m"],
         "vertex_order": "upstream_to_downstream",
         "note": ("z is the sampled DTM BED — the floor of the carved channel — burn "
@@ -1056,6 +1272,9 @@ def write_rivers_geojson(net: RiverNetwork, plan: core.GridPlan, path: str) -> d
                 "downstream_id": s.downstream,
                 "upstream_ids": list(s.upstream),
                 "lake_spans": [[int(a), int(b), int(l)] for a, b, l in s.lake_spans],
+                "discharge_m3_s": float(s.discharge_m3_s),
+                "width_m": float(s.width_m),
+                "node_id": int(s.node_id),
                 "level_m": [round(float(v), 2) for v in s.level],
             },
         })
@@ -1162,6 +1381,12 @@ def export_river_network(
             net, plan, os.path.join(out_dir, JUNCTIONS_FILE)),
         "validation": net.report,
     }
+    hydro = net.report.get("hydrology")
+    if hydro:
+        man["rivers"]["discharge"] = hydro
+        man["rivers"]["width_model"] = net.report["width_model"]
+        man["rivers"]["hierarchy_attachment"] = net.report.get(
+            "hierarchy_attachment", {})
     if emit_geojson:
         man["rivers_geojson"] = write_rivers_geojson(
             net, plan, os.path.join(out_dir, RIVERS_GEOJSON_FILE))
