@@ -489,8 +489,9 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
     `outflow_head_m` for every node that spills through a river sample: the river
     surface there minus the spill — the river's depth at the spill point — never
     negative; 0 elsewhere. The higher of the two saddle samples counts.
-    `river_surface` is the exported water surface (m.o.h.); only river samples
-    are read.
+    `river_surface` is quantised and decoded exactly as surface.atlas before any
+    samples are read.  Heads therefore reproduce bit-for-bit when the runtime
+    derives them from that atlas rather than from this in-memory float raster.
 
     Measured before the lake tie-in, with the channel's own ground as its level,
     509 Lierne lakes still stood a median 0.45 m above spill + head: at an outlet
@@ -498,11 +499,16 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
     The exported surface is raised to the lake there, which is what the river
     actually carries out of it.
     """
+    from . import watersurface
+
     nodes = h.nodes
     has = (nodes["flags"] & FLAG_HAS_SPILL) != 0
     head = np.zeros(h.node_count, dtype=np.float64)
     riv = np.asarray(is_river, dtype=bool).ravel()
-    lvl = np.asarray(river_surface, dtype=np.float32).ravel()
+    packed = watersurface.pack_surface_u16(
+        np.asarray(river_surface), h.height_min, h.height_max)
+    lvl = watersurface.unpack_surface_u16(
+        packed, h.height_min, h.height_max).ravel()
     spill = nodes["spill_m"].astype(np.float64)
     for key in ("spill_cell", "outlet_cell"):
         cell = nodes[key].astype(np.int64)
@@ -674,8 +680,10 @@ def manifest_block(h: Hierarchy, *, hier_file: dict, labels: dict,
             "lake_id": "authored lake matched to this node (lakes.json lake_id), 0 = none",
             "outflow_head_m": "depth of water the outflow river carries over the "
                               "spill: the node holds water up to spill_m + "
-                              "outflow_head_m. The exported river surface at the "
-                              "spill minus spill_m (0 where the spill is on land); "
+                              "outflow_head_m. The river surface at the spill is "
+                              "first encoded and decoded with surface.atlas's "
+                              "[0,65534] packing, then reduced by spill_m (0 where "
+                              "the spill is on land); "
                               "for a matched lake whose authored level lies within "
                               "that head plus tolerance, raised to authored_level_m "
                               "- spill_m",

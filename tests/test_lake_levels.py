@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from kvterrain import core, hierarchy as H, wateraudit, water
+from kvterrain import core, hierarchy as H, wateraudit, water, watersurface
 
 
 def bowl_with_outlet(outlet_is_river=True):
@@ -42,6 +42,26 @@ def test_outflow_head_is_river_depth_at_the_spill():
     assert abs(float(hier.nodes["spill_m"][v]) - 12.0) < 0.02
     assert abs(float(hier.nodes["outflow_head_m"][v]) - 2.0) < 0.02
     assert row["status"] == "ok"
+
+
+def test_outflow_head_uses_surface_atlas_round_trip():
+    h, wg, channel = bowl_with_outlet()
+    channel[wg.type == water.TYPE_RIVER] = 14.003
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    H.set_outflow_heads(hier, wg.type == water.TYPE_RIVER, channel)
+
+    v = int(hier.labels[7, 7])
+    stored = watersurface.unpack_surface_u16(
+        watersurface.pack_surface_u16(channel, hier.height_min, hier.height_max),
+        hier.height_min, hier.height_max)[7, 11]
+    expected = np.float32(max(
+        np.float64(stored) - np.float64(hier.nodes["spill_m"][v]), 0.0))
+    actual = hier.nodes["outflow_head_m"][v]
+    assert actual.tobytes() == expected.tobytes()
+    raw = np.float32(max(
+        np.float64(channel[7, 11]) - np.float64(hier.nodes["spill_m"][v]), 0.0))
+    assert actual.tobytes() != raw.tobytes()
 
 
 def test_level_within_outflow_head_is_held_and_reproduced():

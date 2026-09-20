@@ -15,8 +15,9 @@ unchanged; its CONTENT changed deliberately with the first milestone of the wate
 redesign (WATER_REDESIGN.md §0): the river bed is enforced downhill, lakes cut by
 the map edge ramp back up to their level there, and a published lake level the
 terrain contradicts is replaced, so `heights.atlas` (and what is carved from it)
-differs from earlier exports. Three new products sit beside the old ones:
-`labels.atlas`, `hierarchy.bin` and `water_audit.json`. With `downhill_river_bed`,
+differs from earlier exports. Four new products sit beside the old ones:
+`labels.atlas`, `hierarchy.bin`, `water_audit.json` and `lake_islands.bin`. With
+`downhill_river_bed`,
 `lake_edge_is_shore`, `lake_shore_8_connected` and `hierarchy` off and
 `lake_level_max_above_shore_m=None`, every pre-existing file is byte-identical to
 the export before the redesign.
@@ -574,6 +575,8 @@ def run_process(
         res.manifest["water_surface"] = wsurf
 
         wid = waterid.export_water_id_tiles(plan, water_id_levels, out_dir)
+        wid["lake_islands"] = waterid.export_lake_islands(
+            water_leaf.lake_island, out_dir)
         res.manifest["atlas"]["water_id_file"] = wid["atlas_file"]
         res.manifest["atlas"]["bytes_per_sample"][wid["atlas_file"]] = 2
         res.manifest["water_id"] = wid

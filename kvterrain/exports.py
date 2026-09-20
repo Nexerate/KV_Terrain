@@ -358,7 +358,8 @@ def check_water(exp: Export) -> dict:
     """
     Re-read the exported water products and check them against the manifest:
     `rivers.bin` parses cleanly and its counts match, every segment link resolves,
-    every junction names a lake that exists, and the water_id atlas is dense.
+    every junction names a lake that exists, the water_id atlas is dense, and
+    the lake-island sidecar is structurally valid.
 
     The advisory checks (descent, flow direction) are replayed from the stored
     report rather than recomputed — the tool never corrects them, so the numbers
@@ -486,6 +487,36 @@ def check_water(exp: Export) -> dict:
     elif exp.manifest.get("water_id"):
         report["errors"].append("manifest names a water_id atlas that is not there")
 
+    # ---- lake_islands.bin ------------------------------------------------- #
+    island_info = exp.manifest.get("water_id", {}).get("lake_islands")
+    if island_info:
+        try:
+            from . import waterid
+            island_path = os.path.join(exp.root, island_info["file"])
+            indices = waterid.read_lake_islands(island_path)
+            SY, SX = exp.level_shape(0)
+            if island_info.get("count") != int(indices.size):
+                raise ValueError(
+                    f"manifest count {island_info.get('count')} != file count "
+                    f"{indices.size}")
+            if island_info.get("bytes") != os.path.getsize(island_path):
+                raise ValueError(
+                    f"manifest bytes {island_info.get('bytes')} != file bytes "
+                    f"{os.path.getsize(island_path)}")
+            if island_info.get("samples_x") != SX or island_info.get("samples_y") != SY:
+                raise ValueError(
+                    "manifest lake-island dimensions do not match level 0")
+            if indices.size and int(indices[-1]) >= SX * SY:
+                raise ValueError("lake-island cell index lies outside level 0")
+            report["lake_islands"] = {
+                "file": island_info["file"], "count": int(indices.size),
+                "bytes": os.path.getsize(island_path), "ok": True}
+        except Exception as e:      # noqa: BLE001
+            report["lake_islands"] = {"ok": False, "error": str(e)}
+            report["errors"].append(f"lake islands: {e}")
+    elif exp.manifest.get("water_id"):
+        report["errors"].append("water_id manifest has no lake_islands sidecar")
+
     report["ok"] = not report["errors"]
     return report
 
@@ -503,6 +534,8 @@ def check_hierarchy(exp: Export) -> dict:
         spill_code = max over spill_cell and outlet_cell;
       * each saddle sits where it says: spill_cell drains into the node's own
         subtree, outlet_cell into overflow_to's;
+      * every outflow head is reproduced exactly from surface.atlas and
+        water_id.atlas;
       * every level-0 label is 0 or a leaf, and the per-node sample counts match;
       * every coarse label level is recomputed from the level below and the
         heights at that level, and must match exactly.
@@ -511,6 +544,7 @@ def check_hierarchy(exp: Export) -> dict:
     few hundred MB on a large export.
     """
     from . import hierarchy as H
+    from . import waterid as WID
 
     hb = exp.manifest.get("hierarchy")
     if not hb:
@@ -610,6 +644,40 @@ def check_hierarchy(exp: Export) -> dict:
         lo = lflat[oc].astype(np.int64)
         if ((tin[lo] < tin[ov]) | (tin[lo] >= tout[ov])).any():
             fail("an outlet_cell does not drain into overflow_to's subtree")
+
+    if exp.atlas_path("surface") and exp.atlas_path("water_id"):
+        surface = exp.read_surface(0).ravel()
+        water_id = exp.read_level("water_id", 0).ravel()
+        expected_head = np.zeros(n, dtype=np.float64)
+        spill_m = nodes["spill_m"].astype(np.float64)
+        has = (flags & H.FLAG_HAS_SPILL) != 0
+        for key in ("spill_cell", "outlet_cell"):
+            cell = nodes[key].astype(np.int64)
+            ok = has & (cell != H.NONE)
+            c = cell[ok]
+            level = np.where(
+                water_id[c] == WID.CODE_RIVER, surface[c], np.nan).astype(np.float64)
+            candidate = np.where(np.isfinite(level), level - spill_m[ok], 0.0)
+            expected_head[ok] = np.maximum(expected_head[ok], candidate)
+        expected_head = np.maximum(expected_head, 0.0).astype(np.float32)
+        actual_head = nodes["outflow_head_m"]
+        exact = actual_head.view("<u4") == expected_head.view("<u4")
+        mismatch = ~exact
+        quantum_m = ((exp.height_range[1] - exp.height_range[0]) / 65534.0)
+        within = mismatch & (np.abs(
+            actual_head.astype(np.float64) - expected_head.astype(np.float64))
+                             <= quantum_m)
+        report["outflow_heads"] = {
+            "nodes": n,
+            "exact": int(exact.sum()),
+            "within_one_surface_code": int(within.sum()),
+            "mismatched": int(mismatch.sum()),
+            "surface_code_step_m": float(quantum_m),
+        }
+        if mismatch.any():
+            fail(f"{int(mismatch.sum())} outflow heads do not reproduce exactly "
+                 "from the packed surface atlas")
+        del surface, water_id, expected_head
     del codes, lflat
 
     prev_labels = labels

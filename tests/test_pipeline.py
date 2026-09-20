@@ -26,12 +26,16 @@ def test_new_products_and_manifest(export_dir):
     assert atlas["labels_file"] == "labels.atlas"
     assert atlas["bytes_per_sample"] == {"heights.atlas": 2, "surface.atlas": 2,
                                          "water_id.atlas": 2, "labels.atlas": 4}
-    for f in ("hierarchy.bin", "labels.atlas", "water_audit.json"):
+    for f in ("hierarchy.bin", "labels.atlas", "water_audit.json",
+              "lake_islands.bin"):
         assert os.path.exists(os.path.join(export_dir, f))
     assert m["hierarchy"]["record_bytes"] == 52
     assert m["water_surface"]["river_bathymetry"]["downhill_bed"]["enabled"]
     assert m["water_surface"]["lake_bathymetry"]["edge_is_shore"]
     assert m["water_surface"]["lake_bathymetry"]["shore_8_connected"]
+    islands = m["water_id"]["lake_islands"]
+    assert islands["file"] == "lake_islands.bin"
+    assert islands["bytes"] == 4 + 4 * islands["count"]
     audit = json.load(open(os.path.join(export_dir, "water_audit.json")))
     assert audit["summary"]["lakes"] == len(audit["lakes"])
 

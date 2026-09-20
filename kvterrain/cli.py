@@ -273,6 +273,10 @@ def _report_export(a, res, want_water: bool) -> None:
         if wid:
             print(f"  + {wid['atlas_file']} (u16 class + lake id; "
                   f"lake code = {wid['encoding']['lake_id_base']} + lake_id)")
+            islands = wid.get("lake_islands")
+            if islands:
+                print(f"  + {islands['file']}: {islands['count']} level-0 "
+                      "lake-island cells")
         wv = res.manifest.get("water_vector", {})
         if wv:
             r, lk, jn = wv["rivers"], wv["lakes"], wv["junctions"]
@@ -408,6 +412,13 @@ def cmd_validate_water(a):
     if wid:
         print(f"[water_id] {wid['bytes']} bytes, expected {wid['expected_bytes']} "
               f"-> {'OK' if wid['ok'] else 'MISMATCH'}")
+    islands = rep.get("lake_islands")
+    if islands:
+        if islands.get("ok"):
+            print(f"[lake_islands] {islands['count']} cells, {islands['bytes']} bytes "
+                  "-> OK")
+        else:
+            print(f"[lake_islands] {islands.get('error', 'invalid')} -> MISMATCH")
 
     for note in rep.get("notes", []):
         print(f"    NOTE: {note}")
@@ -438,6 +449,11 @@ def cmd_validate_hierarchy(a):
         print(f"[hierarchy] {st['nodes']} nodes, {st['leaves']} leaves, "
               f"{st['minor']} minor, {st['with_lake']} matched to a lake, "
               f"{st['spilling_off_map']} spilling off the map")
+    heads = rep.get("outflow_heads")
+    if heads:
+        print(f"[outflow head] {heads['exact']}/{heads['nodes']} exact, "
+              f"{heads['within_one_surface_code']} within one code step, "
+              f"{heads['mismatched']} mismatched")
     summ = rep.get("audit_summary")
     if summ:
         print(f"[audit] lakes {summ.get('lakes_by_status')}; rivers "
