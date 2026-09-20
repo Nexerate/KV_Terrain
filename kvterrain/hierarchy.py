@@ -872,8 +872,9 @@ def manifest_block(h: Hierarchy, *, hier_file: dict, labels: dict,
     nonroot = np.arange(h.node_count) != ROOT
     return {
         "format": "kvterrain-depression-hierarchy/1",
-        "status": "node table, labels and composable absolute-axis hypsometry; "
-                  "no hydrologic catchment or flow directions yet",
+        "status": "node table, labels, composable absolute-axis hypsometry and "
+                  "flow-derived node catchments; flow directions are a level-0 "
+                  "sidecar atlas",
         "file": hier_file["file"],
         "bytes": hier_file["bytes"],
         "magic": BIN_MAGIC.decode("ascii"),

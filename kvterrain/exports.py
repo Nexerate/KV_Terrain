@@ -38,10 +38,11 @@ DEFAULT_ROOT = os.path.join(PROJECT_ROOT, "exports")
 MANIFEST_NAME = "manifest.json"
 
 # The atlases, in the order a reader most wants them.
-ATLAS_KINDS = ("height", "surface", "water_id", "labels")
+ATLAS_KINDS = ("height", "surface", "water_id", "labels", "flowdir")
 _ATLAS_KEYS = {"height": "height_file", "surface": "surface_file",
-               "water_id": "water_id_file", "labels": "labels_file"}
-_DTYPE_BY_BYTES = {2: "<u2", 4: "<u4"}
+               "water_id": "water_id_file", "labels": "labels_file",
+               "flowdir": "flowdir_file"}
+_DTYPE_BY_BYTES = {1: "u1", 2: "<u2", 4: "<u4"}
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +111,12 @@ class Export:
         atlas = self.manifest.get("atlas", {})
         fn = atlas.get(_ATLAS_KEYS[kind])
         return int((atlas.get("bytes_per_sample") or {}).get(fn, 2))
+
+    def atlas_levels(self, kind: str) -> int:
+        """Number of levels physically present; flowdir is deliberately L0-only."""
+        if kind == "flowdir":
+            return int(self.manifest.get("flow_direction", {}).get("levels", 1))
+        return self.num_levels
 
     @property
     def has_hierarchy(self) -> bool:
@@ -191,6 +198,9 @@ class Export:
         path = self.atlas_path(kind)
         if path is None:
             raise FileNotFoundError(f"export has no {kind} atlas")
+        levels = self.atlas_levels(kind)
+        if level < 0 or level >= levels:
+            raise ValueError(f"{kind} atlas has {levels} level(s), not level {level}")
         lx, ly = self.leaf_tiles
         ts, tc = self.tile_samples, self.tile_cells
         tiles_x, tiles_y = core.tiles_at_level(lx, ly, level)
@@ -203,7 +213,7 @@ class Export:
         with open(path, "rb") as fh:
             for ty in range(tiles_y):
                 for tx in range(tiles_x):
-                    off = core.atlas_tile_offset(lx, ly, self.num_levels, ts,
+                    off = core.atlas_tile_offset(lx, ly, levels, ts,
                                                  level, tx, ty, bps)
                     fh.seek(off)
                     buf = fh.read(tile_bytes)
@@ -320,7 +330,8 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
         entry = {"kind": kind, "file": os.path.basename(path)}
         bps = exp.bytes_per_sample(kind)
         a_tile_bytes = core.atlas_tile_bytes(ts, bps)
-        a_expect = core.atlas_total_bytes(lx, ly, exp.num_levels, ts, bps)
+        levels = exp.atlas_levels(kind)
+        a_expect = core.atlas_total_bytes(lx, ly, levels, ts, bps)
         actual = os.path.getsize(path)
         entry["bytes"] = actual
         entry["bytes_per_sample"] = bps
@@ -331,7 +342,7 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
 
         if entry["size_ok"]:
             with open(path, "rb") as fh:
-                for lvl in range(exp.num_levels):
+                for lvl in range(levels):
                     tx, ty = core.tiles_at_level(lx, ly, lvl)
                     coords = [(x, y) for y in range(ty) for x in range(tx)]
                     pick = rng.choice(len(coords),
@@ -339,7 +350,7 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
                                       replace=False)
                     for idx in pick:
                         x, y = coords[int(idx)]
-                        off = core.atlas_tile_offset(lx, ly, exp.num_levels, ts,
+                        off = core.atlas_tile_offset(lx, ly, levels, ts,
                                                      lvl, x, y, bps)
                         fh.seek(off)
                         if len(fh.read(a_tile_bytes)) != a_tile_bytes:
@@ -599,6 +610,7 @@ def check_hierarchy(exp: Export) -> dict:
     Reads a whole level 0 of heights and labels, so it takes a few seconds and a
     few hundred MB on a large export.
     """
+    from . import flowdir as F
     from . import hierarchy as H
     from . import waterid as WID
 
@@ -775,6 +787,65 @@ def check_hierarchy(exp: Export) -> dict:
             del expected_hypso, actual_hypso
     else:
         report["notes"].append("no hierarchy hypsometry block")
+
+    flow_block = exp.manifest.get("flow_direction")
+    catch_block = hb.get("catchments")
+    if flow_block:
+        try:
+            actual_flow = exp.read_level("flowdir", 0)
+            expected_flow = F.build_flow_directions(codes.reshape(SY, SX))
+        except Exception as e:      # noqa: BLE001
+            fail(f"flowdir.atlas: {e}")
+        else:
+            exact_flow = actual_flow == expected_flow
+            report["flow_direction"] = {
+                "samples": int(actual_flow.size),
+                "exact": int(exact_flow.sum()),
+                "mismatched": int((~exact_flow).sum()),
+            }
+            if not exact_flow.all():
+                fail(f"{int((~exact_flow).sum())} flow directions do not reproduce "
+                     "from the packed heights")
+
+            if catch_block:
+                catch_path = os.path.join(exp.root, catch_block["file"])
+                try:
+                    catch_header, actual_catch = F.read_catchments_bin(catch_path)
+                    expected_catch, accumulation = F.node_catchment_areas(
+                        actual_flow, labels, nodes,
+                        spacing_m=float(exp.manifest["leaf_spacing_m"]))
+                except Exception as e:      # noqa: BLE001
+                    fail(f"{catch_block['file']}: {e}")
+                else:
+                    for key, want in (("node_count", n), ("record_bytes", 8)):
+                        if catch_header[key] != want:
+                            fail(f"catchments header {key} = {catch_header[key]}, "
+                                 f"expected {want}")
+                    if actual_catch.shape != expected_catch.shape:
+                        fail(f"catchments payload has {actual_catch.size} records, "
+                             f"expected {expected_catch.size}")
+                        exact_catch = np.zeros(n, dtype=bool)
+                    else:
+                        exact_catch = (actual_catch.view("<u8") ==
+                                       expected_catch.view("<u8"))
+                    report["catchments"] = {
+                        "nodes": n,
+                        "exact": int(exact_catch.sum()),
+                        "mismatched": int((~exact_catch).sum()),
+                        "root_area_m2": float(actual_catch[0]),
+                        "accumulation": accumulation,
+                    }
+                    if not exact_catch.all():
+                        fail(f"{int((~exact_catch).sum())} catchment records do not "
+                             "reproduce exactly from flowdir.atlas")
+                    del actual_catch, expected_catch
+            else:
+                fail("flow_direction exists without hierarchy.catchments")
+            del actual_flow, expected_flow
+    elif catch_block:
+        fail("hierarchy.catchments exists without flow_direction")
+    else:
+        report["notes"].append("no flow-direction or catchment products")
     del codes, lflat
 
     prev_labels = labels

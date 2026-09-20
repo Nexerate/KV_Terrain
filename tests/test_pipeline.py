@@ -24,10 +24,12 @@ def test_new_products_and_manifest(export_dir):
     m = json.load(open(os.path.join(export_dir, "manifest.json")))
     atlas = m["atlas"]
     assert atlas["labels_file"] == "labels.atlas"
+    assert atlas["flowdir_file"] == "flowdir.atlas"
     assert atlas["bytes_per_sample"] == {"heights.atlas": 2, "surface.atlas": 2,
-                                         "water_id.atlas": 2, "labels.atlas": 4}
-    for f in ("hierarchy.bin", "hypsometry.bin", "labels.atlas", "water_audit.json",
-              "lake_islands.bin"):
+                                         "water_id.atlas": 2, "labels.atlas": 4,
+                                         "flowdir.atlas": 1}
+    for f in ("hierarchy.bin", "hypsometry.bin", "catchments.bin", "labels.atlas",
+              "flowdir.atlas", "water_audit.json", "lake_islands.bin"):
         assert os.path.exists(os.path.join(export_dir, f))
     assert m["hierarchy"]["record_bytes"] == 52
     hypso = m["hierarchy"]["hypsometry"]
@@ -35,6 +37,12 @@ def test_new_products_and_manifest(export_dir):
     assert hypso["format"] == "kvterrain-hypsometry/1"
     assert hypso["samples_per_node"] == 64
     assert hypso["axis"]["kind"] == "absolute_heights_atlas_u16_code"
+    catch = m["hierarchy"]["catchments"]
+    assert catch["file"] == "catchments.bin"
+    assert catch["record_bytes"] == 8
+    assert catch["parent_includes_children"] is True
+    assert m["flow_direction"]["file"] == "flowdir.atlas"
+    assert m["flow_direction"]["levels"] == 1
     rivers = m["water_vector"]["rivers"]
     assert rivers["format"] == "kvterrain-rivers-bin/2"
     assert rivers["discharge"]["kind"] == "modelled_mean_annual_discharge"

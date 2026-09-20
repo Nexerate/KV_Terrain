@@ -15,9 +15,9 @@ deliberately changed its contents and added products; `rivers.bin` is now versio
 2 with Q, hydraulic width and hierarchy attachment. The river bed is enforced downhill, lakes cut by
 the map edge ramp back up to their level there, and a published lake level the
 terrain contradicts is replaced, so `heights.atlas` (and what is carved from it)
-differs from earlier exports. Five new products sit beside the old ones:
-`labels.atlas`, `hierarchy.bin`, `hypsometry.bin`, `water_audit.json` and
-`lake_islands.bin`. With
+differs from earlier exports. The new products beside the old ones are:
+`labels.atlas`, `flowdir.atlas`, `hierarchy.bin`, `hypsometry.bin`,
+`catchments.bin`, `water_audit.json` and `lake_islands.bin`. With
 `downhill_river_bed`, `lake_edge_is_shore`, `lake_shore_8_connected` and
 `hierarchy` remain independently switchable; the v2 river graph contract is not.
 
@@ -178,6 +178,9 @@ def run_process(
     emit_geojson = False
     hier = None
     hypso = None
+    flow_dirs = None
+    catchment_area = None
+    catchment_report = None
     codes0 = None
     audit = None
     bed_report: dict = {"enabled": False}
@@ -452,7 +455,7 @@ def run_process(
         #    packed. Nothing below this point may touch `leaf`: the hierarchy
         #    describes these codes and no others (WATER_REDESIGN.md §3).
         if build_hier:
-            from . import hierarchy, wateraudit
+            from . import flowdir, hierarchy, wateraudit
             stages.begin("hierarchy")
             hmin_p, hmax_p = core.resolve_height_range(leaf, height_min, height_max)
             codes0 = core.pack_leaf_codes(leaf, hmin_p, hmax_p, nodata_fill_m)
@@ -462,6 +465,9 @@ def run_process(
                 rivernet.attach_hierarchy_nodes(plan, river_net, hier)
             hypso = hierarchy.build_hypsometry(
                 hier, codes0, spacing_m=plan.spacing_m)
+            flow_dirs = flowdir.build_flow_directions(codes0)
+            catchment_area, catchment_report = flowdir.node_catchment_areas(
+                flow_dirs, hier.labels, hier.nodes, spacing_m=plan.spacing_m)
 
             # 8. Match authored lakes to nodes and audit rivers and depressions.
             #    Writes each matched lake into its node, so it runs before packing.
@@ -510,7 +516,7 @@ def run_process(
     res.water_audit = audit
 
     if hier is not None:
-        from . import hierarchy, wateraudit
+        from . import flowdir, hierarchy, wateraudit
         if (res.height_min, res.height_max) != (hier.height_min, hier.height_max):
             raise RuntimeError("hierarchy was built on a different packing range "
                                "than the atlas was written with")
@@ -530,9 +536,15 @@ def run_process(
             hier, os.path.join(out_dir, hierarchy.HIERARCHY_FILE))
         hypso_info = hierarchy.write_hypsometry_bin(
             hypso, os.path.join(out_dir, hierarchy.HYPSOMETRY_FILE))
+        flow_info = flowdir.export_flowdir_atlas(plan, flow_dirs, out_dir)
+        catch_info = flowdir.write_catchments_bin(
+            catchment_area, os.path.join(out_dir, flowdir.CATCHMENTS_FILE))
         res.manifest["atlas"]["labels_file"] = labels_info["atlas_file"]
         res.manifest["atlas"]["bytes_per_sample"][labels_info["atlas_file"]] = \
             hierarchy.LABELS_BYTES_PER_SAMPLE
+        res.manifest["atlas"]["flowdir_file"] = flow_info["file"]
+        res.manifest["atlas"]["bytes_per_sample"][flow_info["file"]] = \
+            flowdir.FLOWDIR_BYTES_PER_SAMPLE
         res.manifest["hierarchy"] = hierarchy.manifest_block(
             hier, hier_file=hier_info, labels=labels_info,
             minor_depth_m=hierarchy.DEFAULT_MINOR_DEPTH_M,
@@ -540,6 +552,10 @@ def run_process(
             ocean_level_m=ocean_level_m)
         res.manifest["hierarchy"]["hypsometry"] = hierarchy.hypsometry_manifest(
             hier, hypso, hypso_info, spacing_m=plan.spacing_m)
+        res.manifest["hierarchy"]["catchments"] = flowdir.catchments_manifest(
+            hier.node_count, catch_info, catchment_report,
+            spacing_m=plan.spacing_m)
+        res.manifest["flow_direction"] = flow_info
         res.manifest["water_audit"] = wateraudit.write_audit(audit, out_dir)
 
     if surface_levels is not None:

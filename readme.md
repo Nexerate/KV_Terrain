@@ -17,10 +17,12 @@ reconstruction, no seed-fill.
 
 > **Water redesign in progress:** the river bed is
 > enforced downhill, and every export now carries a depression hierarchy
-> (`hierarchy.bin`, `labels.atlas`, `hypsometry.bin`) and a water audit (`water_audit.json`) — see
+> (`hierarchy.bin`, `labels.atlas`, `flowdir.atlas`, `catchments.bin`,
+> `hypsometry.bin`) and a water audit (`water_audit.json`) — see
 > [Depression hierarchy and water audit](#depression-hierarchy-and-water-audit).
 > `rivers.bin` v2 adds modelled mean-annual discharge, hydraulic width and a
-> hierarchy-node attachment. Flow directions remain design work
+> hierarchy-node attachment. Flat-resolved D8 directions and per-node catchments
+> are now exported for in-place runtime edits.
 > in [`WATER_REDESIGN.md`](WATER_REDESIGN.md).
 
 Height data © Kartverket, licensed **CC BY 4.0**. Water data © **NVE** (Elvenett /
@@ -435,6 +437,11 @@ Water products:
 | --- | --- |
 | `surface.atlas` | water surface elevation per sample, lakes and rivers in one field |
 | `water_id.atlas` | water class (dry / river / ocean / lake) plus authored lake identity per sample |
+| `labels.atlas` | Priority-Flood leaf label per sample |
+| `flowdir.atlas` | level-0 flat-resolved D8 pointer per sample |
+| `hierarchy.bin` | packed-height depression hierarchy |
+| `catchments.bin` | f64 upstream contributing area per hierarchy node |
+| `hypsometry.bin` | composable absolute-axis flooded-area curve per hierarchy node |
 | `rivers.bin` | the river network as densified polylines with links, Q/width/node per segment, bed and surface per vertex |
 | `lakes.json` | one record per authored lake: NVE ids, name, area, level and its provenance, bbox |
 | `junctions.json` | points where a river segment enters (`Inflow`) or leaves (`Outflow`) a lake |
@@ -733,6 +740,32 @@ accumulation**. `cell_count` counts samples carrying that exact label (only leav
 and the root have any); `subtree_cells` sums those partition cells through the
 depression tree. Neither is the upstream contributing area of a node or river.
 
+**`flowdir.atlas`** — level 0 only, one **u8** per sample in the same dense,
+north-up, row-major tile order as the other atlases. It deliberately has one
+level; `manifest.flow_direction.levels == 1`. Codes are `0 = terminal`, then
+clockwise `1..8 = N, NE, E, SE, S, SW, W, NW`. Every map-edge sample is a zero
+terminal. On a strict slope the pointer takes the steepest D8 descent, comparing
+integer `drop²/distance²`, with ties to the lower direction code.
+
+An 8-connected equal-code flat is resolved by seeding its edge samples and its
+samples with a strictly lower neighbour, sorting those seeds by row-major cell
+index, then running a multi-source FIFO breadth-first walk whose neighbours are
+visited in direction-code order; first reach wins. A closed flat instead uses
+its lowest row-major sample as its sole terminal. The field is built from
+level-0 packed `heights.atlas` codes, so there is no floating-point elevation
+comparison for Terraform to reproduce.
+
+**`catchments.bin`** — one f64 square-metre value per hierarchy node. Its
+24-byte header is `<8sIIII>`: magic `KVCTCH01`, version, header bytes, record
+bytes (8), and node count. Payload record `i` belongs to hierarchy node `i`.
+A leaf receives the area of every level-0 source sample whose D8 chain ends at
+that leaf's pit, including the terminal sample; membership is by flow, not by
+the Priority-Flood label count. An internal node is exactly the sum of its
+immediate children. Root additionally includes the trees that terminate
+directly off-map, so its value is the area assigned to the whole sample lattice.
+The canonical descriptors are `manifest.flow_direction` and
+`manifest.hierarchy.catchments`.
+
 **`hypsometry.bin`** — fixed-size little-endian records indexed by hierarchy node
 id. The 32-byte header is `<8sIIIIII>`: magic `KVHYPS01`, version, header bytes,
 record bytes, node count, samples per node (64), and lower-block sample count
@@ -767,15 +800,15 @@ UTM coordinates. A summary also goes into `manifest.water_audit`.
     there, the spill location and `spill_through`: `river_channel`, `land`,
     `other_lake` or `map_edge`;
   - `below_spill_regulated` (report only), `no_node`, `no_level`.
-- **Rivers.** Steepest descent on the packed heights from each segment's first
-  open-channel vertex (no flow-direction atlas yet). A walk that gets within two
+- **Rivers.** The historical audit still uses direct steepest descent on packed
+  heights from each segment's first open-channel vertex. A walk that gets within two
   samples of a lake has reached it. Findings: `pit` (listed from 0.5 m deep,
   shallower ones counted) and `leaves_corridor`.
 - **Unexplained depressions.** Deep (≥ 2 m), large (≥ 5 000 m²), no lake in or
   around them, outermost only, ranked by area × depth. One that spills into a
   matched lake at or below that lake's level joins the lake (typically an inflow
   trench carved below the lake level) and is only counted. Geometric only until
-  catchment areas exist.
+  geometric ranking is retained for continuity even though node catchments now ship.
 
 **Outflow head.** A spill is only the level a lake is *stable* up to. While water
 leaves through its outflow river, the lake stands higher by the river's depth at

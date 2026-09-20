@@ -314,6 +314,13 @@ def _report_export(a, res, want_water: bool) -> None:
             print(f"  + {hypso['file']}: {hypso['node_count']} fixed "
                   f"{hypso['samples_per_node']}-sample absolute-axis curves "
                   f"({hypso['bytes'] / 1e6:.1f} MB)")
+        flow = res.manifest.get("flow_direction")
+        catch = hierarchy.get("catchments")
+        if flow and catch:
+            print(f"  + {flow['file']}: level-0 flat-resolved D8 directions "
+                  f"({flow['bytes'] / 1e6:.1f} MB)")
+            print(f"  + {catch['file']}: {catch['node_count']} f64 node "
+                  f"catchments ({catch['bytes'] / 1e6:.1f} MB)")
 
 
 def _print_water_report(rep: dict) -> None:
@@ -478,6 +485,15 @@ def cmd_validate_hierarchy(a):
         print(f"[hypsometry] {hypso['exact']}/{hypso['nodes']} records exact, "
               f"{hypso['mismatched']} mismatched "
               f"({hypso['samples_per_node']} samples/node)")
+    flow = rep.get("flow_direction")
+    if flow:
+        print(f"[flow direction] {flow['exact']}/{flow['samples']} exact, "
+              f"{flow['mismatched']} mismatched")
+    catch = rep.get("catchments")
+    if catch:
+        print(f"[catchments] {catch['exact']}/{catch['nodes']} exact, "
+              f"{catch['mismatched']} mismatched; root "
+              f"{catch['root_area_m2'] / 1e6:.3f} km²")
     summ = rep.get("audit_summary")
     if summ:
         print(f"[audit] lakes {summ.get('lakes_by_status')}; rivers "
@@ -756,8 +772,8 @@ def main(argv=None):
     vw.set_defaults(func=cmd_validate_water)
 
     vh = sub.add_parser("validate-hierarchy",
-                        help="check hierarchy.bin / labels.atlas / hypsometry.bin "
-                             "against the manifest and heights.atlas")
+                        help="check hierarchy, labels, hypsometry, flow directions "
+                             "and catchments against the packed export")
     vh.add_argument("--out", required=True)
     vh.set_defaults(func=cmd_validate_hierarchy)
 

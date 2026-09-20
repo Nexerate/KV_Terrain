@@ -1,11 +1,12 @@
 # Water Redesign — Exporter Design Document
 
-> **STATUS: HIERARCHY, HYPSOMETRY AND RIVER HYDROLOGY IMPLEMENTED.**
+> **STATUS: HIERARCHY, HYPSOMETRY, CATCHMENTS AND RIVER HYDROLOGY IMPLEMENTED.**
 >
 > Implemented, on branch `water/hierarchy`: §4.1 downhill-only river bed, §4.2 depression
 > hierarchy (node table and labels), §4.4 lake matching and the audit (without catchment),
-> §4.5 composable absolute-axis hypsometry, and §4.6 graph discharge/width. The
-> `labels.atlas` / `hierarchy.bin` / `hypsometry.bin` / `water_audit.json` exports have a `validate-hierarchy`
+> §4.3 flat-resolved D8 directions and node catchments, §4.5 composable absolute-axis
+> hypsometry, and §4.6 graph discharge/width. The `labels.atlas` / `flowdir.atlas` /
+> `hierarchy.bin` / `catchments.bin` / `hypsometry.bin` / `water_audit.json` exports have a `validate-hierarchy`
 > check. `readme.md` documents them as they run, including formats and Lierne numbers; where it
 > and this document differ, the readme describes the code. Each section below is marked
 > IMPLEMENTED, PARTLY IMPLEMENTED or NOT IMPLEMENTED. Everything unmarked or marked not
@@ -47,8 +48,9 @@ These are settled; the rest of the document is read in their light.
      `validate-*` check in `exports.py`, following the existing pattern.
    - §6 synthetic tests and the hierarchy-vs-brute-force test.
 
-   Out of scope for now: flow-direction atlas and flat resolve (§4.3),
-   and embankment treatment (§7). Composable hypsometry ships in `hypsometry.bin` (§4.5);
+   Out of scope for now: embankment treatment (§7). Flat-resolved D8 directions and node
+   catchments ship as `flowdir.atlas` and `catchments.bin` (§4.3); composable hypsometry ships
+   in `hypsometry.bin` (§4.5);
    modelled mean-annual discharge, hydraulic width and
    the hierarchy attachment now ship in `rivers.bin` v2 (§4.6).
 
@@ -188,7 +190,7 @@ the enforcement moves here.
 
 ### 4.2 Priority-Flood and the depression hierarchy
 
-**IMPLEMENTED** except hydrologic `catchment_m2` (it needs §4.3), plus `outflow_head_m`
+**IMPLEMENTED**, including sidecar hydrologic `catchment_m2` and `outflow_head_m`
 (decision 6). Node layout, ids and flags are in `readme.md`. Every edge sample is an outlet; merges
 happen during the flood.
 
@@ -231,24 +233,27 @@ never-displayed.
 
 ### 4.3 Flow directions and accumulation
 
-**IMPLEMENTED (2026-09-20) as `hypsometry.bin`.**
+**IMPLEMENTED (2026-09-20) as `flowdir.atlas` and `catchments.bin`.**
 
-- D8 directions on the carved terrain, with flats resolved (Garbrecht & Martz 1997, or Barnes'
-  improved flat resolution). A flat resolve was declined for the **runtime** because it was costly
-  and the pools already produce the partition; offline it is cheap and the runtime walks need a
-  direction on flats.
+- D8 directions on the carved, packed terrain. Strict slopes take the steepest descent (integer
+  `drop²/distance²`, ties by clockwise code from north). Equal-code components use a deterministic
+  multi-source breadth-first resolve from their edge/lower outlets; a closed component terminates
+  at its lowest row-major cell. The complete convention is in the manifest.
 - Directions inside a depression point toward its floor; the walk jumps via `spill_cell` from
   there.
-- Flow accumulation gives catchment area per cell, hence `catchment_m2` per node and per river
-  segment.
-- Pack directions as a 1-byte-per-sample atlas on the same lattice and pyramid scheme as heights.
-  Coarse levels should take the direction of the child with the largest accumulation, not a
-  majority vote.
+- Flow accumulation gives catchment area per cell and hence `catchment_m2` per hierarchy node.
+  Authored river Q remains the separate graph accumulation described in §4.6.
+- Pack directions as a level-0-only 1-byte-per-sample atlas, in the same dense north-up tile order
+  as the other atlases. `0` is a pit or off-map terminal; `1..8` are N, NE, E, SE, S, SW, W, NW.
+- `catchments.bin` is one f64 square-metre value per hierarchy node. A leaf is the source area of
+  every sample whose D8 chain terminates in that pit, including the terminal. An internal node is
+  exactly the sum of its immediate children. Root additionally owns the direct off-map trees.
 
 ### 4.4 Matching authored water, and the audit
 
 **PARTLY IMPLEMENTED.** Lakes and rivers as described (rivers by steepest descent on the packed
-heights). Unexplained depressions are geometric only: no catchment filter until §4.3.
+heights). Node catchments now ship, but the existing unexplained-depression audit remains
+geometrically ranked for result continuity.
 
 **Lakes.** For each authored lake, find the node whose cells best cover its rasterised mask at its
 authored level. Check:
@@ -272,7 +277,7 @@ page, like the existing lake-level breakdown and network validation.
 
 ### 4.5 Hypsometry
 
-**NOT IMPLEMENTED.**
+**IMPLEMENTED (2026-09-20) as `hypsometry.bin`.**
 
 For every non-root node: a cumulative area-by-elevation curve including its descendants' cells.
 This lets the runtime solve
@@ -314,15 +319,15 @@ Elvenett has no width or discharge; today width is a heuristic on Strahler order
 
 ## 5. Export format additions (sketch)
 
-**PARTLY IMPLEMENTED:** `labels.atlas`, `hierarchy.bin`, the `hypsometry.bin` sidecar,
-`rivers.bin` v2, `water_audit.json`, and their manifest descriptors. `flowdir.atlas` remains
-unimplemented.
+**IMPLEMENTED:** `labels.atlas`, `flowdir.atlas`, `hierarchy.bin`, the `catchments.bin` and
+`hypsometry.bin` sidecars, `rivers.bin` v2, `water_audit.json`, and their manifest descriptors.
 
 | File | Contents |
 |---|---|
 | `labels.atlas` | u32 leaf node id per sample (4 bytes/sample atlas, §0.2); coarse levels take the lowest child's label |
 | `flowdir.atlas` | u8 D8 direction per sample, flats resolved |
 | `hierarchy.bin` | Node table (§4.2), unchanged fixed record layout |
+| `catchments.bin` | One f64 upstream contributing area per hierarchy node (§4.3) |
 | `hypsometry.bin` | Fixed 64-sample absolute-axis record per hierarchy node (§4.5) |
 | `rivers.bin` v2 | v1 + per-segment `Q`, width, `node_id`; bed profile monotone |
 | `lakes.json` | + `node_id`, `spill_m`, audit flags |
