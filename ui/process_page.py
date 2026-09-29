@@ -107,6 +107,11 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             help="Depth contours and spot depths where NVE has surveyed a lake; "
                  "only max/mean depth for some. The synthetic shape is bent to "
                  "pass through them.")
+        river_mouths = st.toggle(
+            "Carry rivers into lakes", value=True, disabled=t,
+            help="Continue each river's channel into its lake: a delta at inflows, "
+                 "a funnel behind outlets. Shorelines and outlet sills stay on the "
+                 "waterline.")
         lake_slope_ratio = st.slider(
             "Underwater slope ÷ land slope", 0.1, 2.0, float(lbd.slope_ratio), 0.05,
             disabled=t,
@@ -241,6 +246,7 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_min_depth_m": lake_min_depth,
             "lake_bed_model": lake_bed_model,
             "lake_surveys": lake_surveys,
+            "river_mouths": river_mouths,
             "lake_slope_ratio": lake_slope_ratio,
             "lake_bed_curvature": lake_bed_curvature,
             "lake_bed_noise": lake_bed_noise,

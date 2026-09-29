@@ -154,7 +154,8 @@ def run_process(
     (`Dataset.bathymetry_geojson`), or None when the dataset predates them — the
     lake beds are then synthetic everywhere, and the manifest says so.
     """
-    from . import water, bathymetry, watersurface, waterid, rivernet, riverbed, lakebed
+    from . import (water, bathymetry, watersurface, waterid, rivernet, riverbed,
+                   lakebed, rivermouth)
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -182,6 +183,7 @@ def run_process(
     lake_bed_model = lakebed.DEFAULT_MODEL
     lake_bed_params = None
     lake_bed_report: dict = {}
+    mouth_params = None
     snap_report: dict = {}
     emit_geojson = False
     hier = None
@@ -238,6 +240,8 @@ def run_process(
                     setattr(lbp, attr, type(getattr(lbp, attr))(val)
                             if getattr(lbp, attr) is not None else float(val))
         lake_bed_params = lbp
+        mouth_params = rivermouth.MouthParams(
+            enabled=bool(opts.pop("river_mouths", True)))
         if survey_layers is None:
             survey_layers = opts.pop("bathymetry", None)
         else:
@@ -466,6 +470,18 @@ def run_process(
             )
             lake_bed_report["dataset_has_bathymetry"] = survey_layers is not None
 
+            # 3b. Carry each river's channel on into its lake: the bed just built
+            #     treats a mouth as shore, which left a line on the waterline right
+            #     across every channel. Depths are read off the river-carved,
+            #     lake-uncarved bed. See rivermouth.
+            mouths = rivermouth.find_mouths(
+                plan, traced.segments, leaf_bed_uncarved, lake_surf,
+                spacing_m=plan.spacing_m, depth_scale=depth_scale)
+            leaf, lake_bed_report["river_mouths"] = rivermouth.carve_river_mouths(
+                leaf, mouths, plan=plan, water_type=water_leaf.type,
+                lake_id=water_leaf.lake_id, island=water_leaf.lake_island,
+                params=mouth_params)
+
         # 4. Unified water surface (lakes = authored level, rivers = the channel
         #    level from step 2), then its water-only pyramid.
         stages.begin("surface_pyramid")
@@ -546,6 +562,8 @@ def run_process(
             "lake_bed_model": lake_bed_model,
             "lake_bed": (lake_bed_params.to_dict()
                          if lake_bed_model == lakebed.MODEL_TERRAIN else None),
+            "river_mouths": (mouth_params.to_dict()
+                             if lake_bed_model == lakebed.MODEL_TERRAIN else None),
             "lake_snap_px": lake_snap_px,
             "lake_holes_filled": fill_lake_holes,
             "ocean_level_m": ocean_level_m,
@@ -752,6 +770,14 @@ def _lake_bathymetry_block(model: str, rep: dict, snap_report: dict,
         "shore_8_connected": bool(water_params.get("lake_shore_8_connected", False)),
         "shoreline_snap": snap_report,
         "islands": "island samples keep their DTM height and count as shore",
+        "river_mouths_method": "each river's channel continued into its lake along "
+                               "its polyline: the river's depth at the mouth (capped "
+                               "at its order's modelled depth), widening and fading "
+                               "out over ~12 channel widths, only ever lowering the "
+                               "bed. The shore ring stays on the waterline except an "
+                               "inlet's throat, opened only where a flood check "
+                               "shows the lake cannot spill through it; outlet sills "
+                               "stay shut (see kvterrain/rivermouth.py)",
         "rationale": "lakes can drain at runtime, so the bed must pass for ground: "
                      "it continues the land around it, never breaks the waterline "
                      "(multiplicative noise cannot move a zero or cross it), and "

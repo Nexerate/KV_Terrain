@@ -251,7 +251,7 @@ else is a `process` flag and is free to re-run: `--river-width-scale`,
 default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
 `--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
-`--(no-)lake-surveys`, the ramp model's `--lake-max-depth` and
+`--(no-)lake-surveys`, `--(no-)river-mouths`, the ramp model's `--lake-max-depth` and
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
@@ -646,6 +646,21 @@ and leaves the water surface where the ground is:
   `--lake-bed-max-depth` is an optional ceiling (none by default). On Lierne the
   deepest bed is Tunnsjøen at 225 m; the median body is a 2 m pond.
 
+  **Rivers run on into their lakes** (`--river-mouths`, on by default;
+  `kvterrain/rivermouth.py`). The bed above treats a river mouth as shore, which
+  left a line on the waterline across every channel and a lake shallower than the
+  river for the next 10 m. So each river's channel is continued along its polyline:
+  the river's depth at the mouth (capped at its order's modelled depth), widening
+  into a delta at inflows and a funnel behind outlets, fading out over about twelve
+  channel widths. It only ever lowers the bed. Every shore ring stays on the
+  waterline — it is the shoreline, and it is what holds each lake at its level in
+  the depression hierarchy — except an inlet's throat, which opens only where a
+  flood check shows the lake cannot spill through the inflow's trench to lower
+  ground. Outlet sills stay shut: opened, the lake's spill becomes a lake sample
+  with no outflow head, and 465 Lierne lakes then read `level_above_spill`. On
+  Lierne 1 148 of 1 573 inlets open, and the water audit is unchanged but for one
+  small pond.
+
   `--lake-bed ramp` restores the legacy carve: a straight ramp at
   `--lake-shore-slope` (1.0 m per m) down to `--lake-max-depth` (20 m), flat from
   there inward, sized only so the renderer reads the water as opaque.
@@ -1036,6 +1051,9 @@ and offsets, so the same placement logic applies.
   channel, stopping at the waterline, plus the legacy straight-ramp lake carve.
 - `kvterrain/lakebed.py` — lake beds: the terrain-continuation model, NVE surveys
   (contours, spot depths, max/mean) and world-anchored noise.
+- `kvterrain/rivermouth.py` — continues each river's channel into its lake: delta
+  at inflows, funnel behind outlets, with the leak check that decides which inlets
+  may open.
 - `kvterrain/lakecalib.py` — scores the synthetic bed against NVE-surveyed lakes
   and sweeps its parameters (`calibrate-lake-beds`).
 - `kvterrain/watersurface.py` — computes the initial channel-level raster and the

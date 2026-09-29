@@ -67,6 +67,7 @@ def _water_opts(a) -> dict:
         "lake_shore_slope": a.lake_shore_slope,
         "lake_bed_model": a.lake_bed,
         "lake_surveys": a.lake_surveys,
+        "river_mouths": a.river_mouths,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
@@ -685,6 +686,12 @@ def _add_process_args(p):
                    help="use NVE lake surveys (contours, spot depths, max/mean "
                         "depth) where the dataset has them (default: on; terrain "
                         "model only)")
+    p.add_argument("--river-mouths", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_mouths",
+                   help="carry each river's channel on into its lake: a delta at "
+                        "inflows, a funnel behind outlets (default: on; terrain "
+                        "model only). Outlet sills and every shoreline stay on the "
+                        "waterline")
     p.add_argument("--lake-slope-ratio", type=float, default=None,
                    dest="lake_slope_ratio",
                    help="terrain model: underwater slope at the shore as a fraction "
