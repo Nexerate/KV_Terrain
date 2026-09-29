@@ -83,13 +83,22 @@ def test_the_outlet_sill_and_the_shoreline_stay_on_the_waterline():
     assert np.array_equal(out[south_ring], bed[south_ring])
 
 
-def test_an_inlet_stays_shut_where_the_lake_could_spill_through_it():
+def test_an_inlet_opens_onto_an_enclosed_hollow_beside_its_trench():
     plan, bed, typ, lake_id, surf, seg, lake, ring = _scene()
-    # A hollow beside the inflow's trench, a metre below the lake's level: opening
-    # the throat would let the lake drain into it.
-    bed[C - 40, C + 1:C + 4] = LEVEL - 1.0
+    # A hollow beside the inflow's trench, a metre below the lake's level: the lake
+    # fills it through the opened throat, but cannot drain through it.
+    bed[C - 34, C + 1:C + 4] = LEVEL - 1.0
     out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
-    assert rep["inlets_kept_shut"] == {"land_below_level": 1}
+    assert rep["inlets_kept_shut"] == {}
+    assert (LEVEL - out[C - 32:C - 20, C]).min() > 1.5
+
+
+def test_an_inlet_stays_shut_where_the_lake_would_drain_through_it():
+    plan, bed, typ, lake_id, surf, seg, lake, ring = _scene()
+    # A ditch below the lake's level from beside the trench to the map edge.
+    bed[C - 34, C + 1:] = LEVEL - 1.0
+    out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
+    assert rep["inlets_kept_shut"] == {"map_edge": 1}
     assert np.array_equal(out[ring], bed[ring])        # every sill on the waterline
     # The channel behind the sill is still cut.
     assert (LEVEL - out[C - 26:C - 20, C]).min() > 1.5
@@ -99,7 +108,10 @@ def test_a_trenched_river_does_not_carry_its_trench_into_the_lake():
     plan, bed, typ, lake_id, surf, seg, lake, ring = _scene(river_depth=20.0)
     mouths = rivermouth.find_mouths(plan, [seg], bed, surf, spacing_m=SP)
     assert {m.kind for m in mouths} == {rivermouth.INFLOW, rivermouth.OUTFLOW}
-    assert all(m.depth_m == 3.0 for m in mouths)       # order 3's modelled depth
+    by = {m.kind: m for m in mouths}
+    assert by[rivermouth.INFLOW].depth_m == 3.0        # order 3's modelled depth
+    # An outlet's funnel may follow its river deeper, to twice that at most.
+    assert by[rivermouth.OUTFLOW].depth_m == 6.0 and by[rivermouth.OUTFLOW].capped
 
 
 def test_mouths_can_be_switched_off():

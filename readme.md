@@ -654,12 +654,14 @@ and leaves the water surface where the ground is:
   into a delta at inflows and a funnel behind outlets, fading out over about twelve
   channel widths. It only ever lowers the bed. Every shore ring stays on the
   waterline — it is the shoreline, and it is what holds each lake at its level in
-  the depression hierarchy — except an inlet's throat, which opens only where a
-  flood check shows the lake cannot spill through the inflow's trench to lower
-  ground. Outlet sills stay shut: opened, the lake's spill becomes a lake sample
-  with no outflow head, and 465 Lierne lakes then read `level_above_spill`. On
-  Lierne 1 148 of 1 573 inlets open, and the water audit is unchanged but for one
-  small pond.
+  the depression hierarchy — except an inlet's throat: the lake backs up the
+  inflow's trench until the bed rises above its level, as a real lake does. A
+  throat stays shut only if that flood escapes (reaches the map edge, or runs
+  more than 1.5 km), since then the lake would drain. Outlet sills stay shut for
+  now: the runtime reads an outflow head only at a river-sample spill and matches
+  a lake by flooding to its bare spill, and a funnel cut to the river's depth
+  breaks both for ~570 Lierne lakes (see the module docstring). On Lierne 1 488 of
+  1 573 inlets open, and the water audit moves by a handful of small ponds.
 
   `--lake-bed ramp` restores the legacy carve: a straight ramp at
   `--lake-shore-slope` (1.0 m per m) down to `--lake-max-depth` (20 m), flat from
