@@ -86,13 +86,55 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
                  "channel, so this is what stops a thin film of water climbing a "
                  "cliff the rasterised channel ran past. Lower = water stays in the "
                  "channel; higher = wider, more forgiving channels.")
+        from kvterrain import lakebed as _lakebed
+        lbd = _lakebed.LakeBedParams()
+        lake_bed_model = st.radio(
+            "Lake beds", ["terrain", "ramp"], horizontal=True, disabled=d,
+            format_func={"terrain": "Continue the terrain (+ NVE surveys)",
+                         "ramp": "Legacy straight ramp"}.get,
+            help="Lakes can drain at runtime, so the bed has to pass for ground. "
+                 "'Continue the terrain' reads the slope of the land around each "
+                 "lake and carries it under the water — deep under cliffs, shallow "
+                 "in bogs, deepest furthest from shore, never flat — with noise on "
+                 "top, and follows NVE depth surveys where the dataset has them.")
+        t = d or lake_bed_model != "terrain"
+        if ds.has_water and not ds.has_bathymetry:
+            st.caption("This dataset predates lake surveys: every bed is synthetic. "
+                       "`kvterrain fetch-bathymetry --dataset "
+                       f"{ds.slug}` adds them without refetching heights.")
+        lake_surveys = st.toggle(
+            "Use NVE lake surveys", value=True, disabled=t,
+            help="Depth contours and spot depths where NVE has surveyed a lake; "
+                 "only max/mean depth for some. The synthetic shape is bent to "
+                 "pass through them.")
+        lake_slope_ratio = st.slider(
+            "Underwater slope ÷ land slope", 0.1, 2.0, float(lbd.slope_ratio), 0.05,
+            disabled=t,
+            help="How steeply the bed leaves the shore, as a fraction of how "
+                 "steeply the land around the lake rises.")
+        lake_bed_curvature = st.slider(
+            "Bed curvature", 0.05, 2.0, float(lbd.curvature), 0.05, disabled=t,
+            help="How soon the bed bends over toward the centre. Small = a bowl "
+                 "with a gentle floor; large = a straight-sided cone. Never flat.")
+        lake_bed_noise = st.slider(
+            "Bed noise", 0.0, 0.9, float(lbd.noise_amplitude), 0.05, disabled=t,
+            help="Multiplicative: depth × (1 ± this). A zero stays zero and a "
+                 "positive depth stays positive, so the shoreline never moves and "
+                 "no shoal reaches the surface.")
+        lake_bed_wavelength = st.slider(
+            "Bed noise wavelength (m)", 50.0, 2000.0, float(lbd.noise_wavelength_m),
+            50.0, disabled=t)
+        lake_bed_seed = st.number_input("Bed noise seed", 0, 10_000,
+                                        int(lbd.noise_seed), 1, disabled=t)
         lake_shore_slope = st.slider(
-            "Lake shore slope (m depth / m shore)", 0.1, 2.0, 1.0, 0.1, disabled=d,
+            "Lake shore slope (m depth / m shore)", 0.1, 2.0, 1.0, 0.1,
+            disabled=d or lake_bed_model != "ramp",
             help="The lake bed descends on a STRAIGHT ramp at this slope until it "
                  "reaches the carve depth. At 1.0 a 20 m carve is reached 20 m from "
                  "shore — four texels at 5 m spacing. Lower = gentler sides.")
         lake_max_depth = st.slider(
-            "Lake carve depth (m, real)", 1.0, 40.0, 20.0, 1.0, disabled=d,
+            "Lake carve depth (m, real)", 1.0, 40.0, 20.0, 1.0,
+            disabled=d or lake_bed_model != "ramp",
             help="Deepest the lake bed goes below the authored surface, reached only "
                  "by lakes big enough to ramp that far. Must exceed the renderer's "
                  "opaque threshold AFTER any height compression (e.g. 20 m real → "
@@ -197,6 +239,13 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_shore_slope": lake_shore_slope,
             "lake_max_depth_m": lake_max_depth,
             "lake_min_depth_m": lake_min_depth,
+            "lake_bed_model": lake_bed_model,
+            "lake_surveys": lake_surveys,
+            "lake_slope_ratio": lake_slope_ratio,
+            "lake_bed_curvature": lake_bed_curvature,
+            "lake_bed_noise": lake_bed_noise,
+            "lake_bed_noise_wavelength_m": lake_bed_wavelength,
+            "lake_bed_seed": int(lake_bed_seed),
             "lake_snap_px": lake_snap_px,
             "ocean_level_m": ocean_level,
             "emit_geojson": emit_geojson,
@@ -459,6 +508,25 @@ def _reports(state: dict) -> None:
                            f"{snap['lakes_grown']:,} lakes were still the lake's own "
                            f"flat water surface outside its polygon and are now part "
                            f"of it.")
+            lb = wm.get("lake_bathymetry", {})
+            if lb.get("model") == "terrain":
+                import pandas as pd
+                st.markdown("**Lake beds** — continued from the surrounding terrain")
+                deep = lb.get("body_max_depth_m") or {}
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Water bodies", f"{lb.get('bodies', 0):,}")
+                c2.metric("Deepest", f"{deep.get('max', 0):.1f} m")
+                c3.metric("Median body max depth", f"{deep.get('p50', 0):.1f} m")
+                if not lb.get("dataset_has_bathymetry"):
+                    st.caption("No NVE lake surveys in this dataset — every bed is "
+                               "synthetic.")
+                elif lb.get("surveyed_lakes"):
+                    cols = ["name", "vatnlnr", "tier", "model_max_depth_m",
+                            "survey_max_depth_m", "model_mean_depth_m",
+                            "survey_mean_depth_m", "level_offset_m", "survey_year",
+                            "cropped_by_map_edge"]
+                    st.dataframe(pd.DataFrame(lb["surveyed_lakes"]).reindex(
+                        columns=cols), width="stretch", hide_index=True)
 
     with tabs[2]:
         if not wv:

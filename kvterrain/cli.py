@@ -14,6 +14,7 @@ the split.
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -64,6 +65,8 @@ def _water_opts(a) -> dict:
         "lake_max_depth_m": a.lake_max_depth,
         "lake_min_depth_m": a.lake_min_depth,
         "lake_shore_slope": a.lake_shore_slope,
+        "lake_bed_model": a.lake_bed,
+        "lake_surveys": a.lake_surveys,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
@@ -82,6 +85,17 @@ def _water_opts(a) -> dict:
     }
     if a.river_vertex_stride is not None:
         opts["river_vertex_stride_m"] = a.river_vertex_stride
+    # Unset terrain-model knobs are left out, so lakebed.LakeBedParams stays the
+    # one place the (calibrated) defaults live.
+    for key, val in (("lake_slope_ratio", a.lake_slope_ratio),
+                     ("lake_bed_curvature", a.lake_bed_curvature),
+                     ("lake_ring_fraction", a.lake_ring_fraction),
+                     ("lake_bed_noise", a.lake_bed_noise),
+                     ("lake_bed_noise_wavelength_m", a.lake_bed_noise_wavelength),
+                     ("lake_bed_seed", a.lake_bed_seed),
+                     ("lake_bed_max_depth_m", a.lake_bed_max_depth)):
+        if val is not None:
+            opts[key] = val
     return opts
 
 
@@ -145,6 +159,39 @@ def cmd_fetch(a):
 # --------------------------------------------------------------------------- #
 # datasets — what is already on disk                                           #
 # --------------------------------------------------------------------------- #
+
+def cmd_fetch_bathymetry(a):
+    """Add NVE lake surveys to a dataset fetched before they were part of a fetch."""
+    from . import fetch as kvfetch
+
+    d = _resolve_dataset(a.dataset, a.root)
+    d = kvfetch.fetch_bathymetry_into(d, progress=_bar("lake surveys"))
+    print()
+    c = d.manifest["water"]["bathymetry"]["counts"]
+    print(f"dataset {d.name!r}: {c['surveys']} lake surveys, {c['contours']} depth "
+          f"contours, {c['points']} spot depths, {c['shores']} surveyed shorelines")
+
+
+def cmd_calibrate_lake_beds(a):
+    """Score the synthetic lake bed against NVE-surveyed lakes and sweep its knobs."""
+    from . import lakecalib
+
+    res = lakecalib.calibrate(a.n, cache=a.cache or lakecalib.DEFAULT_CACHE, seed=a.seed,
+                              max_area_km2=a.max_area, cache_only=a.cache_only)
+    best = res["best"]
+    print(f"\nbest of {len(res['ranking'])} combinations over {res['lakes']} lakes: "
+          f"{best['params']}")
+    print(f"  median |log error| at survey samples {best['sample_abs_log_err']:.3f} "
+          f"(x{math.exp(best['sample_abs_log_err']):.2f}), bias "
+          f"{best['sample_log_bias']:+.3f}")
+    print(f"  max depth |log error| {best['max_abs_log_err']:.3f}, bias "
+          f"{best['max_log_bias']:+.3f}; mean depth |log error| "
+          f"{best['mean_abs_log_err']:.3f}, bias {best['mean_log_bias']:+.3f}")
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(res, f, indent=1, default=str)
+        print(f"  full results: {a.json}")
+
 
 def cmd_datasets(a):
     from . import dataset as ds_mod
@@ -302,9 +349,34 @@ def _report_export(a, res, want_water: bool) -> None:
                   f"{snap['lakes_grown']} lakes were still the lake's own flat water "
                   f"surface outside its polygon and are now part of it")
         lb = wm.get("lake_bathymetry", {})
-        print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
-              f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
-              f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
+        if lb.get("model") == "terrain":
+            t = lb.get("tiers", {})
+            deep = lb.get("body_max_depth_m") or {}
+            surveyed = [e for e in lb.get("surveyed_lakes", [])
+                        if e.get("tier") != "synthetic"]
+            print(f"  + lake beds continue the surrounding terrain: "
+                  f"{lb.get('bodies', 0)} water bodies, deepest {deep.get('max', 0):.1f} m "
+                  f"(median body {deep.get('p50', 0):.1f} m)")
+            if not lb.get("dataset_has_bathymetry"):
+                print("    no NVE lake survey layers in this run (a dataset fetched "
+                      "before they were part of a fetch lacks them; `kvterrain "
+                      "fetch-bathymetry --dataset ...` adds them)")
+            else:
+                print(f"    NVE surveys: {lb.get('surveys_in_region', 0)} in region, "
+                      f"{sum(1 for e in surveyed if e['tier'] == 'surveyed')} fitted "
+                      f"to contours, "
+                      f"{sum(1 for e in surveyed if e['tier'] == 'summary')} scaled "
+                      f"to max/mean depth")
+                for e in surveyed:
+                    print(f"      {e.get('name') or e['vatnlnr']}: {e['tier']}, max "
+                          f"{e.get('model_max_depth_m')} m (survey "
+                          f"{e.get('survey_max_depth_m')} m), mean "
+                          f"{e.get('model_mean_depth_m')} m (survey "
+                          f"{e.get('survey_mean_depth_m')} m)")
+        else:
+            print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
+                  f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
+                  f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
         print(f"  + river beds carved at the Q-derived hydraulic width "
               f"(order still sets depth, × {a.river_depth_scale:g}); the surface is level across each "
               f"channel and holds water within {a.river_bank_tolerance:.1f} m of it")
@@ -591,16 +663,53 @@ def _add_process_args(p):
                         "covered by the water surface (their own terrain hides it) "
                         "because the polygon/raster misalignment otherwise leaves a "
                         "one-texel dry moat around every island.")
+    p.add_argument("--lake-bed", choices=["terrain", "ramp"], default="terrain",
+                   dest="lake_bed",
+                   help="how lake beds are built. 'terrain' (default) continues the "
+                        "land around each lake under the water — deep under cliffs, "
+                        "shallow in bogs, deepest furthest from shore, with noise — "
+                        "and follows NVE depth surveys where the dataset has them. "
+                        "'ramp' is the legacy straight ramp to --lake-max-depth.")
+    p.add_argument("--lake-surveys", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_surveys",
+                   help="use NVE lake surveys (contours, spot depths, max/mean "
+                        "depth) where the dataset has them (default: on; terrain "
+                        "model only)")
+    p.add_argument("--lake-slope-ratio", type=float, default=None,
+                   dest="lake_slope_ratio",
+                   help="terrain model: underwater slope at the shore as a fraction "
+                        "of the land slope around the lake")
+    p.add_argument("--lake-bed-curvature", type=float, default=None,
+                   dest="lake_bed_curvature",
+                   help="terrain model: how soon the bed bends over toward the "
+                        "centre. Small = bowl with a gentle floor; large = cone")
+    p.add_argument("--lake-ring-fraction", type=float, default=None,
+                   dest="lake_ring_fraction",
+                   help="terrain model: width of the land ring the slope is read "
+                        "from, as a fraction of the lake's max distance from shore")
+    p.add_argument("--lake-bed-noise", type=float, default=None, dest="lake_bed_noise",
+                   help="terrain model: multiplicative noise amplitude (0..0.95); "
+                        "depth *= 1 + a*n. Cannot move the shoreline or reach the "
+                        "surface")
+    p.add_argument("--lake-bed-noise-wavelength", type=float, default=None,
+                   dest="lake_bed_noise_wavelength",
+                   help="terrain model: longest noise wavelength in metres")
+    p.add_argument("--lake-bed-seed", type=int, default=None, dest="lake_bed_seed",
+                   help="terrain model: noise seed")
+    p.add_argument("--lake-bed-max-depth", type=float, default=None,
+                   dest="lake_bed_max_depth",
+                   help="terrain model: optional ceiling on synthetic depth (m). "
+                        "Default: none")
     p.add_argument("--lake-shore-slope", type=float, default=1.0, dest="lake_shore_slope",
-                   help="metres of lake depth gained per metre of shore, on a "
+                   help="ramp model: metres of lake depth gained per metre of shore, on a "
                         "STRAIGHT ramp. At the default 1.0 a --lake-max-depth of 20 m "
                         "is reached 20 m from shore (four texels at 5 m spacing). "
                         "Lower = gentler sides over a longer ramp.")
     p.add_argument("--lake-ramp-radius", type=float, default=0.0, dest="lake_ramp_radius",
-                   help="set the ramp length in metres directly, overriding "
+                   help="ramp model: set the ramp length in metres directly, overriding "
                         "--lake-shore-slope. 0 (default) derives it from the slope.")
     p.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
-                   help="maximum synthetic lake depth in metres, reached only by "
+                   help="ramp model: maximum lake depth in metres, reached only by "
                         "lakes big enough to ramp that far")
     p.add_argument("--lake-min-depth", type=float, default=2.0, dest="lake_min_depth",
                    help="depth every lake reaches at its deepest sample, however "
@@ -714,6 +823,13 @@ def main(argv=None):
                         "DTM accuracy but is LOSSY.")
     f.set_defaults(func=cmd_fetch)
 
+    fb = sub.add_parser("fetch-bathymetry",
+                        help="add NVE lake surveys to a dataset fetched before they "
+                             "were part of every fetch (heights are not refetched)")
+    fb.add_argument("--dataset", required=True)
+    fb.add_argument("--root", default=None)
+    fb.set_defaults(func=cmd_fetch_bathymetry)
+
     dl = sub.add_parser("datasets", help="list the datasets already fetched")
     dl.add_argument("--root", default=None)
     dl.add_argument("--verbose", action="store_true", help="dump each summary as JSON")
@@ -776,6 +892,21 @@ def main(argv=None):
                              "and catchments against the packed export")
     vh.add_argument("--out", required=True)
     vh.set_defaults(func=cmd_validate_hierarchy)
+
+    cl = sub.add_parser("calibrate-lake-beds",
+                        help="score the synthetic lake bed against NVE-surveyed lakes "
+                             "and sweep its parameters (network on first run, "
+                             "cached after)")
+    cl.add_argument("--n", type=int, default=80, help="lakes to sample")
+    cl.add_argument("--seed", type=int, default=1, help="lake sampling seed")
+    cl.add_argument("--max-area", type=float, default=25.0, dest="max_area",
+                    help="skip surveyed lakes larger than this (km²)")
+    cl.add_argument("--cache", default=None,
+                    help="per-lake cache directory (default: data/lakecalib)")
+    cl.add_argument("--json", default=None, help="write the full results here")
+    cl.add_argument("--cache-only", action="store_true", dest="cache_only",
+                    help="use only lakes already in the cache (no DTM downloads)")
+    cl.set_defaults(func=cmd_calibrate_lake_beds)
 
     a = p.parse_args(argv)
     a.func(a)

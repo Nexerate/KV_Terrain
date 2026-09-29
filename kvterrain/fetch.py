@@ -22,6 +22,10 @@ network:
 * `max_fetch_px` (how the region is chunked into exportImage requests);
 * whether to pull the `hovedelv` layer at all (a second, separate NVE query).
 
+NVE's lake surveys (depth contours, spot depths, max/mean depth) come with the
+water. They are raw data like the rest, so they belong here; how a lake bed is
+built from them is `kvterrain.lakebed`, at process time.
+
 `tile_cells` is the one judgement call. It is recorded, because `plan_grid` needs
 one to pad the region out to whole power-of-two tiles — but the padded lattice it
 produces supports every smaller power-of-two tiling too, so process time may
@@ -160,15 +164,19 @@ def run_fetch(
 
     # ---- phase 2: the NVE vectors ------------------------------------------ #
     rivers = main_rivers = lakes = []
+    bathymetry = None
     seconds_water = 0.0
     if include_water:
         t0 = time.time()
-        n_layers = 3 if include_main_rivers else 2
+        n_layers = (3 if include_main_rivers else 2) + 1
         state = {"i": 0, "label": "water"}
 
         def on_layer(i, n, label):
+            # `n` is the caller's own layer count; the bar is sized by ours, which
+            # also counts the lake surveys fetched after it.
             state["i"], state["label"] = i, label
-            emit(HEIGHT_SHARE + (1.0 - HEIGHT_SHARE) * i / max(n, 1), f"{label}: querying")
+            emit(HEIGHT_SHARE + (1.0 - HEIGHT_SHARE) * i / max(n_layers, 1),
+                 f"{label}: querying")
 
         def water_progress(done, total, msg):
             # A paged ArcGIS query cannot know its own total, so the bar advances
@@ -182,10 +190,14 @@ def run_fetch(
                 kvwater.synthetic_water_features(plan))
             if not include_main_rivers:
                 main_rivers = []
+            bathymetry = {}
         else:
             rivers, main_rivers, lakes = kvwater.fetch_water_geojson(
                 plan, include_main_rivers=include_main_rivers, session=session,
                 progress=water_progress, on_layer=on_layer)
+            on_layer(n_layers - 1, n_layers, "lake surveys")
+            bathymetry = kvwater.fetch_bathymetry_geojson(
+                plan, session=session, progress=water_progress)
         seconds_water = time.time() - t0
     emit(0.97, "writing dataset")
 
@@ -219,6 +231,7 @@ def run_fetch(
         server_url=server_url,
         demo=demo,
         rivers=rivers, main_rivers=main_rivers, lakes=lakes,
+        bathymetry=bathymetry,
         include_water=include_water,
         include_main_rivers=include_main_rivers,
         compression=compression,
@@ -245,3 +258,27 @@ def run_fetch(
                        seconds_total=time.time() - t_start,
                        seconds_heights=seconds_heights,
                        seconds_water=seconds_water)
+
+
+def fetch_bathymetry_into(ds: ds_mod.Dataset, *, session=None,
+                          progress: Optional[Progress] = None) -> ds_mod.Dataset:
+    """
+    Fetch the NVE lake surveys for an existing dataset's region and add them to it,
+    leaving the heights and the other vectors untouched. For datasets fetched
+    before bathymetry was part of a fetch; a fresh fetch already includes it.
+    """
+    from . import water as kvwater
+
+    if progress:
+        progress(0.0, "lake surveys: querying")
+
+    def water_progress(done, total, msg):
+        if progress:
+            progress(0.5, msg)
+
+    bathy = kvwater.fetch_bathymetry_geojson(ds.plan(), session=session,
+                                             progress=water_progress)
+    out = ds_mod.write_bathymetry(ds, bathy)
+    if progress:
+        progress(1.0, "done")
+    return out

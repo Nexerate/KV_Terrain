@@ -218,7 +218,13 @@ python -m kvterrain.cli datasets
 
 # stage two: build the export — run this as often as you like
 python -m kvterrain.cli process --dataset lierne --out ./out \
-    --lake-max-depth 20 --lake-shore-slope 1.0 --river-width-scale 1.5
+    --lake-bed-noise 0.35 --river-width-scale 1.5
+
+# add NVE lake surveys to a dataset fetched before they were part of a fetch
+python -m kvterrain.cli fetch-bathymetry --dataset lierne
+
+# score the synthetic lake bed against NVE-surveyed lakes (cached after first run)
+python -m kvterrain.cli calibrate-lake-beds --n 130
 
 # re-tile the SAME fetched samples, no network
 python -m kvterrain.cli process --dataset lierne --out ./out --tile-cells 256
@@ -241,10 +247,12 @@ bytes have to come off the network — the rectangle, `--spacing`, `--epsg`,
 `--source`, `--max-px`, `--compress`, and `--no-main-rivers` (a second NVE
 query). Everything
 else is a `process` flag and is free to re-run: `--river-width-scale`,
-`--river-depth-scale`, `--river-bank-tolerance`, `--lake-max-depth` (default
-**20**, real metres, how far below the water surface a lake bed is carved),
-`--lake-shore-slope` (default **1.0**, how fast it gets there, in metres of depth
-per metre of shore), `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
+`--river-depth-scale`, `--river-bank-tolerance`, `--lake-bed` (`terrain`, the
+default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
+`--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
+`--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
+`--(no-)lake-surveys`, the ramp model's `--lake-max-depth` and
+`--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
 `--(no-)correct-lake-levels` with `--lake-level-max-above-shore` (default 2 m), and
@@ -272,6 +280,9 @@ data/datasets/<slug>/
   water/rivers.geojson.gz      NVE elvenett  — RAW GeoJSON features
   water/main_rivers.geojson.gz NVE hovedelv  — RAW GeoJSON features
   water/lakes.geojson.gz       NVE Innsjødatabase — RAW GeoJSON features
+  water/bathymetry.geojson.gz  NVE lake surveys — {surveys, contours, points,
+                               shores}, RAW GeoJSON features (absent in datasets
+                               fetched before 2026-09-29; `fetch-bathymetry` adds it)
 ```
 
 ### How the lattice is stored
@@ -583,23 +594,47 @@ return), and a river's channel is likewise only as deep as the DTM resolved it.
 Neither leaves room for water in a depth renderer, so the tool cuts the bed down
 and leaves the water surface where the ground is:
 
-- **Lakes** descend on a **straight ramp** at `--lake-shore-slope` metres of depth
-  per metre of shore (default **1.0**) until they reach `--lake-max-depth` (default
-  20 real metres), and are flat from there inward. At the defaults that is 20 m of
-  depth over 20 m of shore — four texels at 5 m spacing, giving 0 / 5 / 10 / 15 / 20.
-  `--lake-ramp-radius` sets the ramp length in metres directly if you would rather
-  not think in slopes; `--lake-min-depth` (default 2 m) is the floor every body
-  reaches at its deepest sample, so a pond too small to ramp still holds water.
+- **Lakes** (`--lake-bed terrain`, the default) get a bed that still passes for
+  ground once the water is gone — the runtime drains lakes, and a flat floor at a
+  fixed depth behind a uniform wall is obviously invented. The bed continues the
+  land around the lake under the water (`kvterrain/lakebed.py`):
 
-  A lake wider than twice the ramp reaches full depth in the middle, which at the
-  default slope is most lakes. That is deliberate. An earlier revision stretched the
-  ramp to 150 m so that lake *size* decided depth and small lakes stayed shallow —
-  and the cost was that near-shore water was too shallow to render, so lakes came out
-  as rounded blobs sitting inside their own shorelines with every bay and headland
-  gone (measured at a 0.5 m visibility threshold: Kroktjønna rendered 55% of its own
-  polygon, median depth 0.61 m). Depth now follows distance from shore and nothing
-  else. Lower `--lake-max-depth` for shallower lakes, `--lake-shore-slope` for
-  gentler sides.
+      depth = S · dmax · b · (1 − exp(−k · q / b))
+
+  `q` is distance from the shore over the body's maximum (rounded at the
+  centreline), so the deepest water is furthest from any shore, narrows are
+  shallow and the bed rises to meet islands. `S` is the slope of the land around
+  the lake — height gained per metre walked away from the water, read over a ring
+  as wide as the lake's own max distance from shore and blended over the water —
+  so a lake under cliffs is deep, one in a bog shallow, and the deepest point leans
+  toward the steeper side. `k` (`--lake-slope-ratio`, 0.9) is the submerged slope
+  at the shore as a fraction of the land's, and `b` (`--lake-bed-curvature`, 0.6)
+  makes the floor ease off toward the middle without ever going flat. Both were
+  calibrated against 130 NVE-surveyed lakes (`calibrate-lake-beds`): median error
+  ×1.35 on max depth and ×1.28 on mean depth, where the same shape with a constant
+  slope manages only ×1.64 and ×1.7.
+
+  **NVE surveys come first.** About 690 lakes have one. Where the dataset carries
+  contours or spot depths (re-referenced from the survey's water level to today's),
+  the synthetic shape is multiplied by a smooth field fitted through them; where a
+  survey gives only max and mean depth (Tunnsjøen: 222 m / 87 m), the shape is
+  scaled to that max with a profile exponent that reproduces the mean. A survey is
+  applied to its lake as a whole, across every body it falls into, and a lake mostly
+  outside the region is not forced to a max depth it may not have here.
+
+  **Noise never touches the shoreline.** It is multiplicative, `depth · (1 + a·n)`
+  with `|a·n| < 1` (`--lake-bed-noise`, 0.35): zero depth stays zero, so the outline
+  is exactly the polygon's, and positive depth stays positive, so no shoal reaches
+  the surface. A fine detail term in metres roughens the shallows and fades with
+  depth, bounded by 30 % of the local depth. Both are anchored to world
+  coordinates. Closed hollows in a bed are allowed: a drained lake leaves water in
+  them. `--lake-min-depth` (2 m) is still the floor for the smallest ponds, and
+  `--lake-bed-max-depth` is an optional ceiling (none by default). On Lierne the
+  deepest bed is Tunnsjøen at 225 m; the median body is a 2 m pond.
+
+  `--lake-bed ramp` restores the legacy carve: a straight ramp at
+  `--lake-shore-slope` (1.0 m per m) down to `--lake-max-depth` (20 m), flat from
+  there inward, sized only so the renderer reads the water as opaque.
 - **Rivers** get a trench under the channel, deepest along the middle and feathering
   out at the banks, scaled by stream order (1.5 m for a headwater stream to 11 m for
   an order-8 trunk, × `--river-depth-scale`) and by the modelled channel width. It
@@ -647,9 +682,10 @@ and leaves the water surface where the ground is:
   now sits on the waterline, and lake bodies for the minimum-depth floor are
   8-connected too, so a diagonal sliver is not stepped 2 m deep at the shore.
 
-Neither carve is surveyed bathymetry; both exist to give the renderer enough depth
-to read opaque. (If your engine compresses height, e.g. 1:5, size them so they still
-clear your opaque threshold after compression: 20 m → 4 units at 1:5.)
+The river trench and the legacy lake ramp are not bathymetry; they exist to give
+the renderer enough depth to read opaque. (If your engine compresses height, e.g.
+1:5, size them so they still clear your opaque threshold after compression: 20 m →
+4 units at 1:5.) The terrain lake bed is modelled, or surveyed where NVE has it.
 
 **Shoreline snap.** An NVE outline and a Kartverket LiDAR block are independent
 products, so the polygon boundary lands *near* — not on — the flat plane the flight
@@ -981,9 +1017,12 @@ and offsets, so the same placement logic applies.
   onto the height grid, lake identity and levels, shoreline snap. Pulls in
   rasterio/shapely; imported lazily.
 - `kvterrain/bathymetry.py` — resolves lake levels (published `hoyde`, else the
-  LiDAR interior capped by a perimeter scan) and carves both beds: lakes deepening
-  inward on a straight shore ramp, rivers as a trench under the channel that stops
-  at the waterline.
+  LiDAR interior capped by a perimeter scan) and carves the river trench under the
+  channel, stopping at the waterline, plus the legacy straight-ramp lake carve.
+- `kvterrain/lakebed.py` — lake beds: the terrain-continuation model, NVE surveys
+  (contours, spot depths, max/mean) and world-anchored noise.
+- `kvterrain/lakecalib.py` — scores the synthetic bed against NVE-surveyed lakes
+  and sweeps its parameters (`calibrate-lake-beds`).
 - `kvterrain/watersurface.py` — computes the initial channel-level raster and the
   unified per-pixel water surface (lakes = `hoyde`, rivers = the shaped profile)
   and packs `surface.atlas`.
@@ -1035,10 +1074,12 @@ and offsets, so the same placement logic applies.
 - **Modelled river width & depth** are heuristics, not surveyed values. Tune
   `--river-width-scale` / the `width_by_order` table; width decides how many
   pixels a river seeds, how wide its level is flattened, and how wide the trench feathers.
-- **Lake depth follows distance from shore**, not lake size: at the default 1:1
-  slope every lake deeper than four texels from its bank is at `--lake-max-depth`.
-  If you want small lakes shallower, lower that; `--lake-min-depth` is only the
-  floor for bodies too small to ramp at all.
+- **Synthetic lake depth is a model**, calibrated but not measured: a typical lake
+  lands within ×1.35 of its true max depth, one in ten is off by ×3 or more. Only
+  lakes NVE surveyed are real, and only where the dataset carries the survey
+  layers (`fetch-bathymetry` adds them to older datasets). The water audit matches
+  a handful more tiny sliver lakes to no node than it did with the flat ramp
+  (Lierne: 7 of 2 180, from 1); they were already borderline there.
 - **River descent is enforced on the terrain and in `rivers.bin`.** With
   `--downhill-river-bed` (the default) the bed and shaped surface are carried in
   downstream order along the graph (see [The carves](#the-carves)). The

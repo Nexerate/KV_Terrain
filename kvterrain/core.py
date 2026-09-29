@@ -588,6 +588,9 @@ def run_export(
                 features = _water.fetch_water_features(
                     plan, progress=progress,
                     include_main_rivers=bool(wopts.get("include_main_rivers", True)))
+                if "bathymetry" not in wopts:
+                    wopts["bathymetry"] = _water.fetch_bathymetry_geojson(
+                        plan, progress=progress)
         water_opts = wopts
 
     # `run_process` reports a fraction; this function's callers were written

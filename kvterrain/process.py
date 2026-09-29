@@ -133,6 +133,7 @@ def run_process(
     out_dir: str,
     *,
     features=None,
+    survey_layers: Optional[dict] = None,
     source_kind: str = "DTM",
     nodata_fill_m: float = 0.0,
     height_min: Optional[float] = None,
@@ -148,8 +149,12 @@ def run_process(
     shaped `(plan.samples_y, plan.samples_x)`. It is COPIED before anything else:
     the carves write in place, and the caller's array is very often a dataset's
     read-only memory map that must survive to be processed again.
+
+    `survey_layers` is the dataset's raw NVE lake-survey layers
+    (`Dataset.bathymetry_geojson`), or None when the dataset predates them — the
+    lake beds are then synthetic everywhere, and the manifest says so.
     """
-    from . import water, bathymetry, watersurface, waterid, rivernet, riverbed
+    from . import water, bathymetry, watersurface, waterid, rivernet, riverbed, lakebed
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -174,6 +179,9 @@ def run_process(
     lake_ramp_m = 0.0
     lake_min_depth_m = 0.0
     lake_slope = 0.0
+    lake_bed_model = lakebed.DEFAULT_MODEL
+    lake_bed_params = None
+    lake_bed_report: dict = {}
     snap_report: dict = {}
     emit_geojson = False
     hier = None
@@ -208,6 +216,32 @@ def run_process(
         if "lake_bevel_px" in opts:        # legacy alias -> ramp width in metres
             lake_ramp_m = max(1.0, float(opts.pop("lake_bevel_px"))) * plan.spacing_m
         lake_min_depth_m = float(opts.pop("lake_min_depth_m", bathymetry.DEFAULT_MIN_DEPTH_M))
+        # The lake bed model. `terrain` (default) continues the surrounding land
+        # under the water and uses NVE surveys where they exist; `ramp` is the
+        # legacy 1:1 ramp to carve_depth_m above.
+        lake_bed_model = str(opts.pop("lake_bed_model", lakebed.DEFAULT_MODEL))
+        if lake_bed_model not in lakebed.MODELS:
+            raise ValueError(f"lake_bed_model must be one of {lakebed.MODELS}, "
+                             f"not {lake_bed_model!r}")
+        lbp = lakebed.LakeBedParams(min_depth_m=lake_min_depth_m)
+        for key, attr in (("lake_slope_ratio", "slope_ratio"),
+                          ("lake_bed_curvature", "curvature"),
+                          ("lake_ring_fraction", "ring_fraction"),
+                          ("lake_bed_noise", "noise_amplitude"),
+                          ("lake_bed_noise_wavelength_m", "noise_wavelength_m"),
+                          ("lake_bed_seed", "noise_seed"),
+                          ("lake_bed_max_depth_m", "max_depth_m"),
+                          ("lake_surveys", "use_surveys")):
+            if key in opts:
+                val = opts.pop(key)
+                if val is not None:
+                    setattr(lbp, attr, type(getattr(lbp, attr))(val)
+                            if getattr(lbp, attr) is not None else float(val))
+        lake_bed_params = lbp
+        if survey_layers is None:
+            survey_layers = opts.pop("bathymetry", None)
+        else:
+            opts.pop("bathymetry", None)
         lake_snap_px = int(opts.pop("lake_snap_px", water.DEFAULT_LAKE_SNAP_PX))
         depth_scale = float(opts.pop("river_depth_scale", 1.0))
         bank_tol_m = float(opts.pop("river_bank_tolerance_m",
@@ -385,9 +419,13 @@ def run_process(
         #     recomputed from `z`.
         leaf_bed_uncarved = leaf.copy()
 
-        # 3. Carve the lake bowls so the water plane does not z-fight the
-        #    LiDAR-flattened lake surface. Safe for the solver only because the lake
-        #    level is authored and pinned — see carve_lake_beds.
+        # 3. Carve the lake beds. The water plane must not z-fight the
+        #    LiDAR-flattened lake surface, and — since lakes can drain at runtime —
+        #    the bed must also pass for ground once exposed: the `terrain` model
+        #    continues the land around each lake under it, with NVE surveys where
+        #    they exist (see lakebed). Safe for the solver only because the lake
+        #    level is authored and pinned, the shore ring stays on the waterline and
+        #    no rim is lowered — see carve_lake_beds.
         #
         #    `estimate_missing` is tied to the SAME switch that governs the surface
         #    raster. It must never be true while the raster is empty: the carve's
@@ -395,20 +433,38 @@ def run_process(
         #    hoyde ended up as 20 m dry pits. Either both know a level, or neither
         #    touches the lake.
         stages.begin("carve_lakes")
-        leaf = bathymetry.carve_lake_beds(
-            leaf,
-            water_leaf.type,
-            plan.spacing_m,
-            surface_moh=lake_surf,
-            carve_depth_m=carve_depth_m,
-            shore_slope=lake_slope,
-            ramp_m=lake_ramp_m or None,
-            min_depth_m=lake_min_depth_m,
-            island=water_leaf.lake_island,
-            estimate_missing=False,
-            edge_is_shore=lake_edge_is_shore,
-            shore_8_connected=lake_shore_8,
-        )
+        if lake_bed_model == lakebed.MODEL_RAMP:
+            leaf = bathymetry.carve_lake_beds(
+                leaf,
+                water_leaf.type,
+                plan.spacing_m,
+                surface_moh=lake_surf,
+                carve_depth_m=carve_depth_m,
+                shore_slope=lake_slope,
+                ramp_m=lake_ramp_m or None,
+                min_depth_m=lake_min_depth_m,
+                island=water_leaf.lake_island,
+                estimate_missing=False,
+                edge_is_shore=lake_edge_is_shore,
+                shore_8_connected=lake_shore_8,
+            )
+        else:
+            surveys = lakebed.parse_surveys(survey_layers, step_m=plan.spacing_m)
+            leaf, lake_bed_report = lakebed.build_lake_beds(
+                leaf, water_leaf.type, plan.spacing_m,
+                surface_moh=lake_surf,
+                ground_m=leaf_uncarved,
+                lake_id=water_leaf.lake_id,
+                lake_table=water_leaf.lake_table,
+                island=water_leaf.lake_island,
+                surveys=surveys,
+                world_origin=(plan.origin_x, plan.origin_y),
+                params=lake_bed_params,
+                edge_is_shore=lake_edge_is_shore,
+                shore_8_connected=lake_shore_8,
+                progress=stages.within,
+            )
+            lake_bed_report["dataset_has_bathymetry"] = survey_layers is not None
 
         # 4. Unified water surface (lakes = authored level, rivers = the channel
         #    level from step 2), then its water-only pyramid.
@@ -487,6 +543,9 @@ def run_process(
             "lake_shore_slope": lake_slope,
             "lake_shore_ramp_m": lake_ramp_m or (carve_depth_m / max(lake_slope, 1e-6)),
             "lake_min_depth_m": lake_min_depth_m,
+            "lake_bed_model": lake_bed_model,
+            "lake_bed": (lake_bed_params.to_dict()
+                         if lake_bed_model == lakebed.MODEL_TERRAIN else None),
             "lake_snap_px": lake_snap_px,
             "lake_holes_filled": fill_lake_holes,
             "ocean_level_m": ocean_level_m,
@@ -572,8 +631,11 @@ def run_process(
         wsurf["lake_levels"] = level_report
         wsurf["discharge"] = river_net.report.get("hydrology", {})
         wsurf["width_model"] = river_net.report.get("width_model", {})
-        wsurf["lake_bathymetry"] = {
+        wsurf["lake_bathymetry"] = _lake_bathymetry_block(
+            lake_bed_model, lake_bed_report, snap_report, water_params) \
+            if lake_bed_model == "terrain" else {
             "enabled": True,
+            "model": "ramp",
             "carve_depth_m": float(carve_depth_m),
             "shore_slope_m_per_m": float(lake_slope),
             "shore_ramp_m": float(lake_ramp_m or (carve_depth_m / max(lake_slope, 1e-6))),
@@ -664,6 +726,40 @@ def run_process(
 # Dataset entry point                                                          #
 # --------------------------------------------------------------------------- #
 
+def _lake_bathymetry_block(model: str, rep: dict, snap_report: dict,
+                           water_params: dict) -> dict:
+    """The manifest's account of the `terrain` lake-bed model."""
+    return {
+        "enabled": True,
+        "model": model,
+        "method": "terrain_continuation_with_nve_surveys",
+        "profile": "depth = S * dmax * b * (1 - exp(-k * q / b)), q = distance "
+                   "from shore / the body's max distance (centreline rounded), "
+                   "S = secant slope of the land ring around the lake blended over "
+                   "the water, k = slope_ratio, b = curvature; then depth *= "
+                   "(1 + noise_amplitude * n) with world-anchored fractal noise n "
+                   "in [-1, 1]",
+        "tiers": {
+            "surveyed": "NVE depth contours/points: the synthetic shape times a "
+                        "smooth multiplier fitted through the survey depths "
+                        "(re-referenced from the survey water level to today's)",
+            "summary": "NVE max/mean depth only: the synthetic shape scaled to the "
+                       "max, with a profile exponent that reproduces the mean",
+            "synthetic": "no survey: the shape alone, scaled up to min_depth_m "
+                         "if a body is too small to reach it",
+        },
+        "edge_is_shore": bool(water_params.get("lake_edge_is_shore", False)),
+        "shore_8_connected": bool(water_params.get("lake_shore_8_connected", False)),
+        "shoreline_snap": snap_report,
+        "islands": "island samples keep their DTM height and count as shore",
+        "rationale": "lakes can drain at runtime, so the bed must pass for ground: "
+                     "it continues the land around it, never breaks the waterline "
+                     "(multiplicative noise cannot move a zero or cross it), and "
+                     "uses real bathymetry wherever NVE has surveyed the lake",
+        **rep,
+    }
+
+
 def process_dataset(
     ds,
     out_dir: str,
@@ -709,6 +805,7 @@ def process_dataset(
     res = run_process(
         plan, ds.heights(), out_dir,
         features=features,
+        survey_layers=ds.bathymetry_geojson() if include_water else None,
         source_kind=ds.source_kind,
         nodata_fill_m=nodata_fill_m,
         height_min=height_min, height_max=height_max,

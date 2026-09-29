@@ -85,6 +85,26 @@ RIVER_LAYER_MAIN = 1       # 'hovedelv'  — main rivers only (polyline)
 LAKE_SERVICE = "https://kart.nve.no/enterprise/rest/services/Innsjodatabase2/MapServer"
 LAKE_LAYER = 5             # 'Innsjodatabase' — lake polygons
 
+# Surveyed lake bathymetry, in the SAME service (group layer 0 'Batymetri'). About
+# 690 lakes nationally carry a survey. Every layer keys on `vatnlnr`, the lake
+# number `LAKE_ID_FIELDS` resolves, so a survey joins to its lake without geometry.
+#
+#   4 Dybdekart               one polygon per survey: maksdyp_m, middeldyp_m, and
+#                             `oppmaltvannstand_m` — the water level the depths are
+#                             measured FROM, which is not always today's `hoyde`
+#                             (regulated lakes especially). Some surveys stop here:
+#                             Tunnsjøen has its max and mean depth but no contours.
+#   2 DybdeKurve              depth contours, `dybde_m` (positive down)
+#   1 DybdePunkt              spot depths, `dybde_m`
+#   3 Innsjo_ved_dybdemaling  the shoreline as surveyed
+BATHY_SURVEY_LAYER = 4
+BATHY_CONTOUR_LAYER = 2
+BATHY_POINT_LAYER = 1
+BATHY_SHORE_LAYER = 3
+# Layers 1-3 are queried by lake number, not by bbox, so a survey that the region
+# only clips still arrives whole. This many numbers go in one `IN (...)` clause.
+BATHY_IDS_PER_QUERY = 40
+
 # Attribute names, tried in order; the FIRST entry of each tuple is the name the
 # live service actually uses, verified against the layer's own `?f=json` metadata
 # (see `describe_layer` / `kvterrain describe-services`). The rest are historical
@@ -342,33 +362,38 @@ WaterFetcher = Callable[[core.GridPlan], WaterFeatures]
 
 
 def _arcgis_query_geojson(
-    server: str, layer: int, epsg: int, bbox: tuple[float, float, float, float],
-    *, session=None, out_fields: str = "*", page: int = DEFAULT_PAGE,
+    server: str, layer: int, epsg: int,
+    bbox: Optional[tuple[float, float, float, float]],
+    *, where: str = "1=1", session=None, out_fields: str = "*", page: int = DEFAULT_PAGE,
     timeout: int = 120, retries: int = 4, pause: float = 1.5,
     progress: Optional[Callable[[int, int, str], None]] = None, label: str = "",
 ) -> list:
     """
     Page through an ArcGIS MapServer feature layer's /query endpoint, asking the
     server for GeoJSON already projected into `epsg` (outSR). Returns the raw list
-    of GeoJSON feature dicts intersecting `bbox`.
+    of GeoJSON feature dicts intersecting `bbox` (every feature matching `where`
+    when `bbox` is None).
     """
     import requests
 
     url = f"{server.rstrip('/')}/{layer}/query"
-    xmin, ymin, xmax, ymax = bbox
     base = {
-        "geometry": f"{xmin},{ymin},{xmax},{ymax}",
-        "geometryType": "esriGeometryEnvelope",
-        "inSR": str(epsg),
         "outSR": str(epsg),
-        "spatialRel": "esriSpatialRelIntersects",
-        "where": "1=1",
+        "where": where,
         "outFields": out_fields,
         "returnGeometry": "true",
         "geometryPrecision": "2",
         "f": "geojson",
         "resultRecordCount": str(page),
     }
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        base.update({
+            "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": str(epsg),
+            "spatialRel": "esriSpatialRelIntersects",
+        })
     sess = session or requests.Session()
     feats: list = []
     offset = 0
@@ -1131,6 +1156,40 @@ def fetch_water_geojson(
                                            session=sess, progress=progress,
                                            label=label)
     return got.get("rivers", []), got.get("main-rivers", []), got.get("lakes", [])
+
+
+def fetch_bathymetry_geojson(
+    plan: core.GridPlan, *, session=None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> dict:
+    """
+    Every NVE lake survey that intersects the plan bbox, RAW:
+    `{"surveys", "contours", "points", "shores"}` as GeoJSON feature lists in the
+    plan's CRS (see BATHY_*_LAYER for what each holds).
+
+    The surveys are found by bbox; their contours, points and surveyed shorelines
+    are then fetched by lake number, so a lake the region only clips still arrives
+    whole and interpolates the same at the crop line as it would uncropped.
+    """
+    import requests
+    sess = session or requests.Session()
+    surveys = _arcgis_query_geojson(LAKE_SERVICE, BATHY_SURVEY_LAYER, plan.epsg,
+                                    plan.bbox_utm, session=sess, progress=progress,
+                                    label="lake-surveys")
+    ids = sorted({int(v) for v in (
+        (f.get("properties") or {}).get("vatnlnr") for f in surveys)
+        if v is not None})
+    out = {"surveys": surveys, "contours": [], "points": [], "shores": []}
+    for key, layer, label in (("contours", BATHY_CONTOUR_LAYER, "depth-contours"),
+                              ("points", BATHY_POINT_LAYER, "depth-points"),
+                              ("shores", BATHY_SHORE_LAYER, "survey-shores")):
+        for i in range(0, len(ids), BATHY_IDS_PER_QUERY):
+            chunk = ids[i:i + BATHY_IDS_PER_QUERY]
+            where = f"vatnlnr IN ({','.join(str(v) for v in chunk)})"
+            out[key].extend(_arcgis_query_geojson(
+                LAKE_SERVICE, layer, plan.epsg, None, where=where, session=sess,
+                progress=progress, label=label))
+    return out
 
 
 def fetch_water_features(
