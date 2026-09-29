@@ -13,8 +13,14 @@ LAKES
 -----
 For each authored lake with a level L:
 
-1. Take the leaf holding most of the lake's mask (islands excluded).
-2. Walk up from it. At each node N the pool is N's subtree below
+1. Group the leaves under the lake's mask (islands excluded) by where the walk
+   below would stop — their first ancestor spilling above L — and take the leaf
+   holding most of the mask within the group holding most of it (and, as a
+   second start, the leaf holding most of the mask overall). On a flat carved
+   floor both are the same leaf. On a bed with relief (`lakebed`) the samples
+   drain to many small pits, and the single pit draining the most can belong to
+   a side pocket that spills away from the lake rather than into it.
+2. Walk up from each. At each node N the pool is N's subtree below
    min(L, spill(N)) — connected by construction, because every merge inside N
    happened below N's spill. Measure its overlap with the mask (IoU), flooding
    out from the mask samples with a size cap.
@@ -322,33 +328,67 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
         tol_code = tol_m / max(step_m, 1e-9)
         cap = int(max(POOL_CAP_FACTOR * cnt, POOL_CAP_MIN))
         buf = np.empty(cap, dtype=np.int64)
+        spill_code = nodes["spill_code"]
+        under = level_code - tol_code
+        over = level_code + tol_code
+        group_n: dict = {}
+        group_best: dict = {}
+        top_of: dict = {}          # memo: a big lake has thousands of pits
+        for lf, cn in zip(leaf_ids, leaf_n):
+            if cn == 0:
+                continue
+            path = []
+            top = int(lf)
+            while top not in top_of and float(spill_code[top]) <= over and \
+                    int(parent[top]) not in (H.ROOT, H.NONE):
+                path.append(top)
+                top = int(parent[top])
+            top = top_of.get(top, top)
+            for v in path:
+                top_of[v] = top
+            group_n[top] = group_n.get(top, 0) + int(cn)
+            if cn > group_best.get(top, (None, 0))[1]:
+                group_best[top] = (int(lf), int(cn))
+        start = group_best[max(group_n, key=group_n.get)][0]
+        starts = [start] + ([leaf] if leaf != start else [])
 
         best = None
-        v = leaf
-        while v != H.ROOT and v != H.NONE:
-            # The pool of v at the lake level, capped at v's own spill, plus the
-            # tolerance: a lake's shoreline samples sit exactly ON its level (depth
-            # 0), and on a small lake they are most of the mask. Flooding stays
-            # inside v's subtree, so the tolerance cannot leak across the saddle.
-            eff = min(level_code, float(nodes["spill_code"][v])) + tol_code
-            # One stamp value per evaluation marks visited samples without ever
-            # clearing the array.
-            stamp_val += 1
-            n, inter, capped = _pool_overlap(
-                codes, labels, tin, tout, v, eff, cells, lake_id, np.uint16(lid),
-                island, stamp, np.int32(stamp_val), cap, buf)
-            iou = inter / max(n + cnt - inter, 1)
-            if best is None or iou > best[1]:
-                best = (v, iou, n, inter, capped)
-            if capped or n > POOL_CAP_FACTOR * cnt:
-                break
-            # The pool at L cannot grow past a node that spills above L. A node
-            # spilling AT L (within tolerance) is not a wall: parts of one lake
-            # separated by a neck whose shore samples sit exactly on the waterline
-            # merge there, so keep climbing.
-            if float(nodes["spill_code"][v]) > level_code + tol_code:
-                break
-            v = int(parent[v])
+        for v in starts:
+            while v != H.ROOT and v != H.NONE:
+                # A node spilling below the level has a parent whose pool contains
+                # its whole pool, also below the level: skip straight past it. A bed
+                # with relief nests hundreds of small pits under a big lake, and
+                # re-flooding the lake at each of them is what cost the audit its
+                # time.
+                up = int(parent[v])
+                if (float(spill_code[v]) < under and up not in (H.ROOT, H.NONE)
+                        and float(spill_code[up]) < under):
+                    v = up
+                    continue
+                # The pool of v at the lake level, capped at v's own spill, plus the
+                # tolerance: a lake's shoreline samples sit exactly ON its level
+                # (depth 0), and on a small lake they are most of the mask. Flooding
+                # stays inside v's subtree, so the tolerance cannot leak across the
+                # saddle.
+                eff = min(level_code, float(spill_code[v])) + tol_code
+                # One stamp value per evaluation marks visited samples without ever
+                # clearing the array.
+                stamp_val += 1
+                n, inter, capped = _pool_overlap(
+                    codes, labels, tin, tout, v, eff, cells, lake_id, np.uint16(lid),
+                    island, stamp, np.int32(stamp_val), cap, buf)
+                iou = inter / max(n + cnt - inter, 1)
+                if best is None or iou > best[1]:
+                    best = (v, iou, n, inter, capped)
+                if capped or n > POOL_CAP_FACTOR * cnt:
+                    break
+                # The pool at L cannot grow past a node that spills above L. A node
+                # spilling AT L (within tolerance) is not a wall: parts of one lake
+                # separated by a neck whose shore samples sit exactly on the
+                # waterline merge there, so keep climbing.
+                if float(spill_code[v]) > level_code + tol_code:
+                    break
+                v = up
 
         v, iou, n, inter, capped = best
         spill_m = float(nodes["spill_m"][v])
