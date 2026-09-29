@@ -420,10 +420,24 @@ check the live Swagger page and adjust `ost`/`nord`/`koordsys` in
   offset by half a texel so pixel centers land on the sample grid (this is what
   makes the output corner-centered).
 - **Per-request cap is 15000 px/side**; the tool tiles fetches at ≤4096 by default
-  and stitches them seamlessly.
+  (`--max-px`) and stitches them seamlessly. Chunks are balanced so a lattice of
+  2^k + 1 samples is not sent as full chunks plus a 1-sample sliver (that used to
+  be 9 of Lierne's 25 requests at 2048, each costing a full request's latency).
+- **Requests run in parallel** (`--fetch-workers`, default 4). A chunk that fails is
+  split in four and the quarters go back into the same pool (down to 256 px, where
+  a piece is retried after pauses of 5, 20, 60 and 120 s) rather than asking the server again for
+  the request it just failed to finish:
+  on a bad day hoydedata.no's proxy answers any request it cannot finish in
+  ~90–110 s with a 502, whatever the client's timeout (seen 2026-09-29, when even
+  512² requests took ~30 s and the Lierne heights took 1 917 s against 43 s on
+  2026-09-01).
+- **An interrupted fetch resumes.** Chunks land in
+  `<dataset root>/.fetch-cache/<key>/` as they arrive; running the same fetch again
+  reads them back, and the cache is deleted once the dataset is written.
 - **DTM1 / DOM1 are 1 m** national coverage — don't set `--spacing` below ~1 m or
   you're just paying to interpolate. 5 m is a sensible default for terrain.
-- No API key; open data. Be polite with concurrency.
+- No API key; open data. Be polite with concurrency: the default of 4 in flight is
+  enough to hide one slow response behind the others.
 
 ---
 
@@ -929,7 +943,8 @@ reports. `manifest.water_id` records the class/identity encoding.
   query returns empty attributes. Flow direction and geometry don't depend on
   attributes and will still be correct; a lake missing `hoyde` falls back to a DTM
   shoreline estimate.
-- No API key; open data. Be polite with concurrency.
+- No API key; open data. Be polite with concurrency: the default of 4 in flight is
+  enough to hide one slow response behind the others.
 
 ---
 

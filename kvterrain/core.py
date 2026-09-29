@@ -228,6 +228,54 @@ def export_image_fetch(
     raise RuntimeError(f"exportImage failed after {retries} tries: {last_err}")
 
 
+# A remainder this small is absorbed into the chunks before it rather than sent as
+# its own request. `plan_grid` pads to a power of two PLUS ONE sample (corner-
+# centred tiles share their edge), so a lattice is almost always 2^k + 1 wide and
+# a power-of-two chunk size used to leave a one-sample sliver in every row and
+# column of chunks: 9 of Lierne's 25 requests were 1 px wide, and against a slow
+# server each costs as much wall clock as a full chunk. The ImageServer accepts
+# up to 15000 px per side, so a chunk this much over max_fetch_px is safe.
+CHUNK_SLACK_FRACTION = 0.125
+# Parallel exportImage requests. Enough to hide one slow response behind the
+# others; few enough to stay polite to a public service.
+DEFAULT_FETCH_WORKERS = 4
+# A chunk that still fails after the fetcher's own retries is split in four and
+# the quarters are fetched instead, down to this size. hoydedata.no answers a
+# request it cannot finish in ~90-110 s with a 502 from its proxy, whatever the
+# client's timeout, so a smaller request is the only thing that can get through.
+MIN_SPLIT_PX = 256
+# A piece too small to split is retried after these pauses (seconds). Asking
+# again at once is how a 99%-done Lierne fetch died on 2026-09-29: three 500s in
+# a row on one 256 px piece while the server was having a bad minute.
+RETRY_BACKOFF_S = (5.0, 20.0, 60.0, 120.0)
+
+
+def chunk_spans(n: int, max_px: int) -> list[tuple[int, int]]:
+    """
+    Split `n` samples into (start, size) spans of at most ~max_px, balanced so
+    that no span is a sliver: a remainder of up to CHUNK_SLACK_FRACTION * max_px
+    is shared out among the other spans instead of becoming a request of its own.
+    """
+    max_px = max(int(max_px), 1)
+    k = -(-n // max_px)
+    if k > 1 and n - (k - 1) * max_px <= max(1, int(CHUNK_SLACK_FRACTION * max_px)):
+        k -= 1
+    base, extra = divmod(n, k)
+    spans, start = [], 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        spans.append((start, size))
+        start += size
+    return spans
+
+
+def fetch_chunks(plan: "GridPlan", max_px: int) -> list[tuple[int, int, int, int]]:
+    """(ix, iy, nx, ny) per exportImage request; iy counts rows from the SOUTH."""
+    return [(ix, iy, nx, ny)
+            for iy, ny in chunk_spans(plan.samples_y, max_px)
+            for ix, nx in chunk_spans(plan.samples_x, max_px)]
+
+
 def assemble_region(
     plan: GridPlan,
     fetcher: Fetcher,
@@ -235,30 +283,145 @@ def assemble_region(
     *,
     max_fetch_px: int = DEFAULT_MAX_FETCH_PX,
     progress: Optional[Callable[[int, int, str], None]] = None,
+    workers: int = 1,
+    cache_dir: Optional[str] = None,
+    min_split_px: int = MIN_SPLIT_PX,
+    retry_backoff_s: tuple = RETRY_BACKOFF_S,
+    stats: Optional[dict] = None,
 ) -> np.ndarray:
+    """
+    Fetch the plan's lattice block by block into one north-up array.
+
+    Blocks start as `fetch_chunks(plan, max_fetch_px)`. `workers` > 1 fetches
+    them concurrently (`fetcher` must then be thread-safe). A block whose fetch
+    raises is split into quarters that go back into the same pool, recursively,
+    down to `min_split_px`; a block too small to split is retried after each
+    pause in `retry_backoff_s`, then given up on. With `cache_dir`, every block is saved there as it
+    arrives and read back instead of refetched, so a fetch that dies half-way
+    resumes where it stopped; the caller deletes the directory once the result is
+    safe. `progress(done, total, msg)` counts samples; `stats` receives counts.
+    """
+    import os
+    from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, wait)
+
     SX, SY = plan.samples_x, plan.samples_y
     out = np.full((SY, SX), np.nan, dtype=np.float32)
+    chunks = fetch_chunks(plan, max_fetch_px)
+    counts = {"chunks": len(chunks), "requests": 0, "failed_requests": 0,
+              "splits": 0, "from_cache": 0}
+    total_px = SX * SY
+    done_px = 0
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
 
-    x_starts = list(range(0, SX, max_fetch_px))
-    y_starts = list(range(0, SY, max_fetch_px))
-    total = len(x_starts) * len(y_starts)
-    done = 0
+    def cache_path(b):
+        ix, iy, nx, ny = b
+        return os.path.join(cache_dir, f"{iy}_{ix}_{ny}x{nx}.npy")
 
-    for jy in y_starts:
-        ny = min(max_fetch_px, SY - jy)
-        for ix in x_starts:
-            nx = min(max_fetch_px, SX - ix)
-            sx0 = plan.origin_x + ix * plan.spacing_m
-            sy0 = plan.origin_y + jy * plan.spacing_m
+    def quarters(b):
+        ix, iy, nx, ny = b
+        hx, hy = nx // 2, ny // 2
+        return [(qx, qy, qnx, qny)
+                for qy, qny in ((iy, hy), (iy + hy, ny - hy))
+                for qx, qnx in ((ix, hx), (ix + hx, nx - hx))]
 
-            block = fetcher(server_url, plan.epsg, sx0, sy0, nx, ny, plan.spacing_m)
-            top = SY - (jy + ny)
-            out[top:top + ny, ix:ix + nx] = block
+    def cached(b):
+        """Blocks to place from the cache, and blocks still to fetch, for `b`
+        (an earlier run may have finished it whole or only some of its quarters)."""
+        if not cache_dir:
+            return [], [b]
+        if os.path.exists(cache_path(b)):
+            return [b], []
+        if min(b[2], b[3]) >= 2 * min_split_px and any(
+                os.path.exists(cache_path(q)) for q in quarters(b)):
+            hit, miss = [], []
+            for q in quarters(b):
+                h, m = cached(q)
+                hit += h
+                miss += m
+            return hit, miss
+        return [], [b]
 
-            done += 1
-            if progress:
-                progress(done, total, f"tile {done}/{total}")
+    def fetch(b, wait_s=0.0):
+        if wait_s:
+            time.sleep(wait_s)
+        ix, iy, nx, ny = b
+        arr = np.asarray(fetcher(server_url, plan.epsg,
+                                 plan.origin_x + ix * plan.spacing_m,
+                                 plan.origin_y + iy * plan.spacing_m,
+                                 nx, ny, plan.spacing_m), dtype=np.float32)
+        if arr.shape != (ny, nx):
+            raise ValueError(f"fetcher returned {arr.shape}, asked for {(ny, nx)}")
+        if cache_dir:
+            tmp = cache_path(b) + ".tmp.npy"
+            np.save(tmp, arr)
+            os.replace(tmp, cache_path(b))
+        return arr
 
+    def place(b, arr):
+        nonlocal done_px
+        ix, iy, nx, ny = b
+        top = SY - (iy + ny)
+        out[top:top + ny, ix:ix + nx] = arr
+        done_px += nx * ny
+        if progress:
+            extra = (f", {counts['failed_requests']} failed requests re-asked as "
+                     f"smaller pieces" if counts["failed_requests"] else "")
+            progress(done_px, total_px,
+                     f"{100.0 * done_px / total_px:.0f}% of samples{extra}")
+
+    todo = []
+    for c in chunks:
+        hit, miss = cached(c)
+        for b in hit:
+            place(b, np.load(cache_path(b)))
+            counts["from_cache"] += 1
+        todo += miss
+
+    tries: dict = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            running = {}
+
+            def submit(b, wait_s=0.0):
+                counts["requests"] += 1
+                running[pool.submit(fetch, b, wait_s)] = b
+
+            for b in todo:
+                submit(b)
+            try:
+                while running:
+                    finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    for fut in finished:
+                        b = running.pop(fut)
+                        try:
+                            arr = fut.result()
+                        except Exception:
+                            counts["failed_requests"] += 1
+                            if min(b[2], b[3]) >= 2 * min_split_px:
+                                counts["splits"] += 1
+                                for q in quarters(b):
+                                    submit(q)
+                                continue
+                            k = tries.get(b, 0)
+                            if k >= len(retry_backoff_s):
+                                raise
+                            tries[b] = k + 1
+                            submit(b, float(retry_backoff_s[k]))
+                            continue
+                        place(b, arr)
+            except BaseException:
+                for f in running:
+                    f.cancel()
+                raise
+    except Exception as e:
+        where = (f" {100.0 * done_px / total_px:.0f}% of the samples are cached in "
+                 f"{cache_dir}; the same fetch again resumes from there."
+                 if cache_dir and done_px else "")
+        raise RuntimeError(f"height fetch failed: {e}.{where}") from e
+    finally:
+        if stats is not None:
+            stats.update(counts)
     return out
 
 
@@ -538,6 +701,7 @@ def run_export(
     fetcher: Optional[Fetcher] = None,
     server_url: Optional[str] = None,
     max_fetch_px: int = DEFAULT_MAX_FETCH_PX,
+    workers: int = DEFAULT_FETCH_WORKERS,
     nodata_fill_m: float = 0.0,
     height_min: Optional[float] = None,
     height_max: Optional[float] = None,
@@ -561,13 +725,14 @@ def run_export(
     from . import process as _process
 
     if fetcher is None:
-        fetcher = lambda u, e, sx, sy, nx, ny, sp: export_image_fetch(
-            u, e, sx, sy, nx, ny, sp, source_kind=source_kind)
+        from .fetch import live_height_fetcher
+        fetcher = live_height_fetcher(source_kind)
     if server_url is None:
         server_url = IMAGESERVER[source_kind]
 
     leaf = assemble_region(plan, fetcher, server_url,
-                           max_fetch_px=max_fetch_px, progress=progress)
+                           max_fetch_px=max_fetch_px, progress=progress,
+                           workers=workers)
 
     features = None
     if include_water:

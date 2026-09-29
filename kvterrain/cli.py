@@ -125,6 +125,7 @@ def cmd_fetch(a):
         dest=a.dest,
         source_kind=a.source,
         max_fetch_px=a.max_px,
+        workers=a.fetch_workers,
         include_water=a.water,
         include_main_rivers=not a.no_main_rivers,
         compression=a.compress or ds_mod.DEFAULT_COMPRESSION,
@@ -282,6 +283,7 @@ def cmd_build(a):
     res = core.run_export(plan, a.out, source_kind=a.source,
                           fetcher=fetcher, server_url=server,
                           max_fetch_px=a.max_px,
+                          workers=a.fetch_workers,
                           nodata_fill_m=a.nodata_fill,
                           height_min=a.hmin, height_max=a.hmax,
                           progress=prog,
@@ -632,7 +634,15 @@ def _add_area_args(p):
     p.add_argument("--epsg", type=int, default=None)
     p.add_argument("--source", choices=["DTM", "DOM"], default="DTM")
     p.add_argument("--max-px", type=int, default=core.DEFAULT_MAX_FETCH_PX, dest="max_px",
-                   help="largest exportImage request, in pixels per axis")
+                   help="largest exportImage request, in pixels per axis (a "
+                        "remainder under 1/8 of it is shared out rather than sent "
+                        "as a sliver request of its own)")
+    p.add_argument("--fetch-workers", type=int, default=core.DEFAULT_FETCH_WORKERS,
+                   dest="fetch_workers",
+                   help="exportImage requests in flight at once (default "
+                        f"{core.DEFAULT_FETCH_WORKERS}). A chunk that keeps failing "
+                        "is split in four and retried; `fetch` also caches chunks so "
+                        "an interrupted run resumes when repeated")
     p.add_argument("--demo", action="store_true",
                    help="synthetic surface + synthetic rivers/lakes, no network")
 

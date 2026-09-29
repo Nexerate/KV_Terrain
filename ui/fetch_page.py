@@ -73,7 +73,13 @@ def render() -> None:
         max_fetch_px = st.select_slider(
             "Max fetch px / request", [1024, 2048, 4096, 8192], 2048,
             help="How the region is chunked into exportImage calls. Smaller = more "
-                 "requests but less to lose on a timeout.")
+                 "requests but less to lose on a timeout. A chunk that keeps "
+                 "failing is split in four and retried automatically.")
+        fetch_workers = st.slider(
+            "Parallel requests", 1, 8, core.DEFAULT_FETCH_WORKERS,
+            help="exportImage requests in flight at once. Chunks are cached as they "
+                 "arrive, so a failed or interrupted fetch resumes when you run the "
+                 "same fetch again.")
 
         st.divider()
         st.subheader("Water (NVE)")
@@ -188,8 +194,7 @@ def render() -> None:
                     "sits where you want it.")
         else:
             lat = ds_mod.Lattice.from_plan(plan)
-            chunks = (-(-plan.samples_x // max_fetch_px)
-                      * -(-plan.samples_y // max_fetch_px))
+            chunks = len(core.fetch_chunks(plan, max_fetch_px))
             heights_mb = plan.samples_x * plan.samples_y * 4 / 1e6
 
             # Metric values stay SHORT: st.metric truncates rather than wraps, and
@@ -263,6 +268,7 @@ def render() -> None:
                 root=root,
                 source_kind=source_kind,
                 max_fetch_px=max_fetch_px,
+                workers=fetch_workers,
                 include_water=want_water,
                 include_main_rivers=main_rivers,
                 compression=compression,
