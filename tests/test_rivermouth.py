@@ -11,10 +11,10 @@ LEVEL = 300.0
 C = N // 2                                  # the river runs down column C
 
 
-def _scene(river_depth=2.0):
+def _scene(river_depth=2.0, depth=None):
     """A round lake with a river entering from the north and leaving to the south.
-    The bed is a plain bowl with its 8-connected shore ring on the waterline, as
-    lakebed leaves it."""
+    The bed is a plain bowl (or `depth(r)`) with its 8-connected shore ring on the
+    waterline, as lakebed leaves it."""
     plan = SimpleNamespace(origin_x=0.0, origin_y=0.0, spacing_m=SP,
                            samples_x=N, samples_y=N)
     yy, xx = np.mgrid[0:N, 0:N]
@@ -25,7 +25,8 @@ def _scene(river_depth=2.0):
                                                    water.TYPE_LAND)).astype(np.uint8)
     lake_id = np.where(lake, 1, 0).astype(np.uint16)
     ground = LEVEL + 0.2 * np.maximum(r - 30, 0) * SP + 0.5
-    depth = 8.0 * np.clip((30 - r) / 30, 0, 1)
+    depth = (8.0 * np.clip((30 - r) / 30, 0, 1) if depth is None
+             else np.where(lake, depth(np.hypot(yy - C, xx - C - 15)), 0.0))
     ring = lake & binary_dilation(~lake, structure=np.ones((3, 3), bool))
     depth[ring] = 0.0
     bed = np.where(lake, LEVEL - depth, ground)
@@ -45,12 +46,23 @@ def _scene(river_depth=2.0):
     return plan, bed.astype(np.float32), typ, lake_id, surf, seg, lake, ring
 
 
-def _carve(plan, bed, typ, lake_id, surf, seg, **kw):
+def _carve(plan, bed, typ, lake_id, surf, seg, raised=None, **kw):
     mouths = rivermouth.find_mouths(plan, [seg], bed, surf, spacing_m=SP)
     out, rep = rivermouth.carve_river_mouths(
         bed.copy(), mouths, plan=plan, water_type=typ, lake_id=lake_id,
-        params=rivermouth.MouthParams(**kw))
+        params=rivermouth.MouthParams(**kw), raised_out=raised)
     return out, rep
+
+
+def _highest_on_the_way_out(out, lake):
+    """The height water in the lake must reach to leave it by the south river: the
+    lowest possible highest sample on any path from the lake's deepest point to the
+    bottom edge (a brute-force minimax flood)."""
+    allowed = np.ones_like(lake)
+    r0, c0 = np.unravel_index(np.argmin(np.where(lake, out, np.inf)), out.shape)
+    conn = rivermouth._connect_heights(out.astype(np.float64), allowed,
+                                       np.array([r0]), np.array([c0]))
+    return float(conn[-1, C])
 
 
 def test_an_inflow_runs_into_its_lake_without_a_dry_line():
@@ -67,20 +79,51 @@ def test_an_inflow_runs_into_its_lake_without_a_dry_line():
     assert wet(C - 25) > wet(C - 28) >= 1
 
 
-def test_the_outlet_sill_and_the_shoreline_stay_on_the_waterline():
+def test_an_outlet_is_held_by_a_riffle_on_the_river():
     plan, bed, typ, lake_id, surf, seg, lake, ring = _scene()
-    out, _ = _carve(plan, bed, typ, lake_id, surf, seg)
+    raised = []
+    out, rep = _carve(plan, bed, typ, lake_id, surf, seg, raised=raised)
     changed = out != bed
-    assert not (changed & ~lake).any()                 # land and rivers untouched
-    assert (out <= bed).all()                          # only ever lowers
-    # The only ring samples that moved are the inlet's throat, north of the lake.
+    # Only lake samples are lowered, and the only ring samples that move are the
+    # two throats; the only samples raised are river samples by the outlet.
+    assert not ((out < bed) & ~lake).any()
     rr, _ = np.nonzero(changed & ring)
-    assert rr.size and (rr < C).all()
-    # The outlet is fed by a funnel behind its sill...
-    assert (LEVEL - out[C + 20:C + 28, C]).min() > 1.5
-    # ...and the sill itself is still the waterline.
+    assert rr.size and ((rr < C - 20) | (rr > C + 20)).all()
+    up = out > bed
+    assert up.any() and (typ[up] == water.TYPE_RIVER).all()
+    # The lake runs wet through its outlet into the river...
+    assert (LEVEL - out[C + 20:C + 36, C]).min() > 1.5
+    # ...and the riffle, a river sample 10 cm above the river's own bed, is the
+    # highest point on the way out: the lake's spill, which carries the head.
+    crest = LEVEL - 2.0 + 0.1
+    assert np.allclose(out[up], crest)
+    assert abs(_highest_on_the_way_out(out, lake) - crest) < 1e-4
+    assert rep["outlets_opened"] == 1 and rep["outlets_kept_shut"] == 0
+    (r, c, lvl), = raised
+    assert lvl == LEVEL and set(zip(r, c)) >= set(zip(*np.nonzero(up)))
+
+
+def test_a_riffle_is_shallow_enough_to_keep_the_lake_one_basin():
+    # A shallow lake 1 m deep with a hollow off the river's line, ringed by a
+    # ridge 0.5 m down: a riffle at the river's 2 m would drop the lake below that
+    # ridge and cut the hollow off as a basin of its own.
+    def depth(r):
+        return np.where(r < 5, 3.0, np.where(r < 8, 0.5, 1.0))
+    plan, bed, typ, lake_id, surf, seg, lake, ring = _scene(depth=depth)
+    out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
+    assert rep["riffle_depth_m"]["p50"] == 0.4        # rim 0.5 m, minus the margin
+    assert abs(_highest_on_the_way_out(out, lake) - (LEVEL - 0.4)) < 1e-4
+
+
+def test_an_outlet_stays_shut_when_the_lake_has_no_room_for_a_riffle():
+    def depth(r):
+        return np.where(r < 5, 3.0, np.where(r < 8, 0.05, 1.0))
+    plan, bed, typ, lake_id, surf, seg, lake, ring = _scene(depth=depth)
+    out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
+    assert rep["outlets_kept_shut"] == 1
     south_ring = ring & (np.arange(N)[:, None] > C)
     assert np.array_equal(out[south_ring], bed[south_ring])
+    assert not (out > bed).any()
 
 
 def test_an_inlet_opens_onto_an_enclosed_hollow_beside_its_trench():
@@ -99,7 +142,8 @@ def test_an_inlet_stays_shut_where_the_lake_would_drain_through_it():
     bed[C - 34, C + 1:] = LEVEL - 1.0
     out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
     assert rep["inlets_kept_shut"] == {"map_edge": 1}
-    assert np.array_equal(out[ring], bed[ring])        # every sill on the waterline
+    north_ring = ring & (np.arange(N)[:, None] < C)
+    assert np.array_equal(out[north_ring], bed[north_ring])   # the inlet's sill
     # The channel behind the sill is still cut.
     assert (LEVEL - out[C - 26:C - 20, C]).min() > 1.5
 

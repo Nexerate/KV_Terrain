@@ -54,22 +54,38 @@ window, i.e. finds lower ground. Then the throat goes back on the waterline. On
 Lierne (2026-09-29) 1 488 of 1 573 inlets open (17 shut at the map edge, 68
 unbounded).
 
-OUTLETS stay shut for now (`open_outlets`). An outflow head is read only where a
-node's spill is a RIVER sample (exporter and runtime alike), and the node matched
-to a lake is flooded only to its spill, not spill + head. Cutting an outlet funnel
-to the river's depth breaks both on Lierne: wherever the lake's own bed has a
-ridge shallower than the river at the outlet, that ridge (a lake sample, no head)
-becomes the spill of the lake's main basin (285 lakes `level_above_spill`), and a
-lake shallower than its outlet river lies wholly above its spill and matches no
-node (284). With the ring shut the funnel is cut behind the sill.
+OUTLETS open onto a RIFFLE. A real lake stands above its outlet sill by the depth
+of the water leaving over it, and the depression hierarchy models exactly that:
+a node holds water to spill + outflow head, the head being the river surface at
+the spill minus the spill, read only where the spill is a RIVER sample (exporter
+and runtime alike). So an outlet is shaped for that reading:
 
-Measured on Lierne, median lake depth along the river's line at 0/5/10/15/20 m
-past the mouth: inflows 0/0/1.0/1.4/1.7 m before, 1.5/1.6/1.7/2.4/2.4 m after,
-with the river 1.9 m deep just outside; 71% of inflows are wet all the way from
-the river into the lake. Outlets 0/0/0.5/0.8/1.1 m before, 0/0/1.6/1.7/1.7 m after
-(the zeros are the sill). The water audit: 2 163 ok + 1 held by outflow (was
-2 171 ok), 10 without a node (was 7), 6 above their spill (was 2); the river pits
-it lists drop from 578 to 223 because rivers now run into their lakes.
+  * the throat opens and the funnel behind it holds the river's depth until it
+    meets deeper lake bed (a narrow channel on across a lake shallower than that);
+  * the river samples beside the throat become the riffle: raised, never lowered,
+    to a crest 10 cm above the river's own shallowest first samples, so the riffle
+    is the one highest point on the way out and the lake's spill is a river
+    sample;
+  * the crest is raised further, to the rim of any hollow in the lake bed that a
+    real share of the lake drains into (`hollow_min_*`). Below that rim the hollow
+    would be a basin of its own and the lake would split in the hierarchy;
+  * the river's surface over the riffle is the lake's level (`raised_out`, which
+    process.py writes into the surface raster and the polylines), so the head is
+    exactly level - crest.
+
+An outlet with no room for a riffle (crest within `min_riffle_m` of the level)
+keeps its sill. The lake matching in the water audit (and the runtime's) floods a
+lake's candidate node to spill + head, not the bare spill: a lake shallower than
+its outlet river stands wholly above its riffle and would otherwise match nothing.
+
+Measured on Lierne (2026-09-30), median lake depth along the river's line at
+0/5/10/15/20 m past the mouth: inflows 0/0/1.0/1.4/1.7 m before, 1.5/1.6/2.0/2.4/
+2.5 m after, with the river 1.9 m deep just outside; outlets 0/0/0.5/0.8/1.1 m
+before, 1.8/1.9/1.7/2.1/2.4 m after. 72% of inflows and 52% of outlets are wet
+the whole way from river to lake (0% before). 827 of 1 159 outlets carry a riffle
+(median 1.4 m deep, p10 0.6, p90 2.9); 332 keep their sill. The water audit:
+1 371 ok + 789 held by their outflow (was 2 171 ok), 11 without a node (was 7),
+9 above their spill (was 2); the river pits it lists drop from 578 to 223.
 """
 
 from __future__ import annotations
@@ -77,8 +93,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+import heapq
+from collections import defaultdict
+
+import numba as nb
 import numpy as np
-from scipy.ndimage import binary_dilation, label
+from scipy.ndimage import binary_dilation, find_objects, label, maximum
 from scipy.spatial import cKDTree
 
 INFLOW = "inflow"
@@ -104,15 +124,20 @@ class MouthParams:
     # Open the lake's shore ring across an inlet / an outlet, in the channel's
     # throat only (`throat_cells` past the mouth).
     open_inlets: bool = True
-    # Off until the runtime can carry a lake over an open outlet (the module
-    # docstring has the measurements).
-    open_outlets: bool = False
+    open_outlets: bool = True
     throat_cells: float = 1.5
     # An outlet's funnel is cut this much below the river's first samples, so the
     # river sample, not the funnel, is the lake's spill.
     outlet_margin_m: float = 0.1
     # How far the escape check behind an opened inlet looks (metres).
     check_radius_m: float = 1500.0
+    # A hollow in the lake bed counts toward an outlet's riffle when at least this
+    # many samples, and this share of the lake, drain into it; smaller ones (shore
+    # roughness) are left as basins of their own.
+    hollow_min_samples: int = 25
+    hollow_min_fraction: float = 0.01
+    # A riffle shallower than this is no outlet at all: the sill stays shut.
+    min_riffle_m: float = 0.1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -249,6 +274,173 @@ def _escapes(bed, tr, tc, mo, water_type, lake_id, island, *, radius: int) -> st
     return ""
 
 
+@nb.njit(cache=True)
+def _connect_heights(bed, allowed, seed_r, seed_c):
+    """For every allowed sample, the lowest height water must reach to join it to
+    one of the seeds through allowed samples (8-connected): the highest bed on the
+    best path. Equal to the bed wherever the sample drains to a seed; higher
+    inside a hollow, by exactly the hollow's rim."""
+    H, W = bed.shape
+    out = np.full((H, W), np.inf)
+    done = np.zeros((H, W), np.bool_)
+    heap = [(0.0, np.int64(0))]
+    heap.pop()
+    for k in range(seed_r.shape[0]):
+        r, c = seed_r[k], seed_c[k]
+        out[r, c] = bed[r, c]
+        heapq.heappush(heap, (float(bed[r, c]), np.int64(r * W + c)))
+    while len(heap) > 0:
+        h, i = heapq.heappop(heap)
+        r = i // W
+        c = i - r * W
+        if done[r, c]:
+            continue
+        done[r, c] = True
+        for dr in (-1, 0, 1):
+            rr = r + dr
+            if rr < 0 or rr >= H:
+                continue
+            for dc in (-1, 0, 1):
+                cc = c + dc
+                if cc < 0 or cc >= W or done[rr, cc] or not allowed[rr, cc]:
+                    continue
+                v = max(float(bed[rr, cc]), h)
+                if v < out[rr, cc]:
+                    out[rr, cc] = v
+                    heapq.heappush(heap, (v, np.int64(rr * W + cc)))
+    return out
+
+
+@nb.njit(cache=True)
+def _drainage_counts(bed, allowed):
+    """How many allowed samples drain, by steepest descent through allowed samples
+    (8-connected), into each sample: nonzero only at the pits where descent ends."""
+    H, W = bed.shape
+    recv = np.full(H * W, -1, np.int64)
+    for r in range(H):
+        for c in range(W):
+            if not allowed[r, c]:
+                continue
+            best = bed[r, c]
+            k = -1
+            for dr in (-1, 0, 1):
+                rr = r + dr
+                if rr < 0 or rr >= H:
+                    continue
+                for dc in (-1, 0, 1):
+                    cc = c + dc
+                    if cc < 0 or cc >= W or not allowed[rr, cc]:
+                        continue
+                    if bed[rr, cc] < best:
+                        best = bed[rr, cc]
+                        k = rr * W + cc
+            recv[r * W + c] = k
+    term = np.full(H * W, -1, np.int64)
+    counts = np.zeros(H * W, np.int64)
+    stack = np.empty(H * W, np.int64)
+    for i in range(H * W):
+        if not allowed[i // W, i % W]:
+            continue
+        n = 0
+        j = i
+        while term[j] < 0 and recv[j] >= 0:
+            stack[n] = j
+            n += 1
+            j = recv[j]
+        t = term[j] if term[j] >= 0 else j
+        term[j] = t
+        for q in range(n):
+            term[stack[q]] = t
+        counts[t] += 1
+    return counts.reshape(H, W)
+
+
+def _outlet_riffles(bed, outlets, *, water_type, lake_id, island, p, report,
+                    raised_out) -> None:
+    """Hold every opened outlet with a riffle: raise the river's first samples to
+    the lake's crest, so the lake's spill is a RIVER sample (which carries an
+    outflow head) and the lake's whole bed joins up before it spills. See the
+    module docstring."""
+    from . import water as kvwater
+
+    if not outlets:
+        return
+    H, W = bed.shape
+    lakes_only = np.where(water_type == kvwater.TYPE_LAKE, lake_id, 0)
+    slices = find_objects(lakes_only)
+    del lakes_only
+    by_lake = defaultdict(list)
+    for o in outlets:
+        by_lake[o[0].lake_id].append(o)
+    depths = []
+    shut = 0
+    for lid, outs in by_lake.items():
+        sl = slices[lid - 1] if lid - 1 < len(slices) else None
+        if sl is None:
+            continue
+        r0, r1 = max(sl[0].start - 2, 0), min(sl[0].stop + 2, H)
+        c0, c1 = max(sl[1].start - 2, 0), min(sl[1].stop + 2, W)
+        b = bed[r0:r1, c0:c1]
+        own = ((water_type[r0:r1, c0:c1] == kvwater.TYPE_LAKE)
+               & (lake_id[r0:r1, c0:c1] == lid))
+        if island is not None:
+            own &= ~island[r0:r1, c0:c1]
+        tr = np.concatenate([o[1] for o in outs]) - r0
+        tc = np.concatenate([o[2] for o in outs]) - c0
+        level = float(outs[0][0].level_m)
+        conn = _connect_heights(b.astype(np.float64), own, tr.astype(np.int64),
+                                tc.astype(np.int64))
+        # The lake's crest: the highest rim of any hollow in its bed that a real
+        # share of the lake drains into. Below it, that hollow would be a basin of
+        # its own that joins the outlet only above the riffle, and the lake would
+        # split between it and the outlet. Hollows judged by what drains INTO
+        # them: a bowl whose low centre sits a hand's breadth below its rim holds
+        # few samples under the rim, yet is where the whole lake drains.
+        hollow = own & np.isfinite(conn) & (conn > b + 1e-3)
+        crest = -np.inf
+        lbl, n = label(hollow, structure=np.ones((3, 3), bool))
+        if n:
+            idx = np.arange(1, n + 1)
+            drains = _drainage_counts(b.astype(np.float64), own)
+            catch = np.bincount(lbl.ravel(), weights=drains.ravel(),
+                                minlength=n + 1)[1:]
+            rims = np.asarray(maximum(conn, lbl, idx))
+            big = catch >= max(p.hollow_min_samples,
+                               p.hollow_min_fraction * float(own.sum()))
+            if big.any():
+                crest = float(rims[big].max()) + p.outlet_margin_m
+        for mo, orr, occ, old, d_funnel in outs:
+            # A margin above the river's own bed too, so the riffle is the one
+            # highest sample on the way out and not tied with the channel below.
+            top = max(level - d_funnel + 2.0 * p.outlet_margin_m, crest)
+            if top > level - p.min_riffle_m:
+                bed[orr, occ] = old            # no room for a riffle: stay shut
+                shut += 1
+                continue
+            # The river samples beside this outlet's throat carry the riffle.
+            wr0, wr1 = max(int(orr.min()) - 2, 0), min(int(orr.max()) + 3, H)
+            wc0, wc1 = max(int(occ.min()) - 2, 0), min(int(occ.max()) + 3, W)
+            m = np.zeros((wr1 - wr0, wc1 - wc0), bool)
+            m[orr - wr0, occ - wc0] = True
+            near = (binary_dilation(m, structure=np.ones((3, 3), bool))
+                    & (water_type[wr0:wr1, wc0:wc1] == kvwater.TYPE_RIVER))
+            rr, cc = np.nonzero(near)
+            rr, cc = rr + wr0, cc + wc0
+            low = bed[rr, cc] < top
+            bed[rr[low], cc[low]] = np.asarray(top, dtype=bed.dtype)
+            if raised_out is not None and rr.size:
+                raised_out.append((rr, cc, level))
+            depths.append(level - top)
+            report["riffle_samples"] += int(low.sum())
+    report["outlets_kept_shut"] = shut
+    if depths:
+        d = np.asarray(depths)
+        report["riffle_depth_m"] = {
+            "p10": round(float(np.percentile(d, 10)), 2),
+            "p50": round(float(np.median(d)), 2),
+            "p90": round(float(np.percentile(d, 90)), 2)}
+
+
 def carve_river_mouths(
     bed: np.ndarray,
     mouths: list,
@@ -258,18 +450,27 @@ def carve_river_mouths(
     lake_id: np.ndarray,
     island: Optional[np.ndarray] = None,
     params: Optional[MouthParams] = None,
+    raised_out: Optional[list] = None,
 ) -> tuple[np.ndarray, dict]:
     """
     Lower lake samples along each mouth's path to the channel profile. `bed` is the
     finished lake bed and is modified IN PLACE (and returned). See the module
     docstring for the shape and the shoreline rule.
+
+    The one place this RAISES terrain is an outlet's riffle, on the river samples
+    beside the outlet's throat. For each outlet, (rows, cols, lake level) of those
+    samples is appended to `raised_out` when given, so the caller can carry the
+    riffle into any other copy of the river bed (the polylines' `z`) and stand the
+    river's surface there at the lake's level: water leaving over the riffle is
+    the lake's own, and the outflow head is read from that surface.
     """
     from . import rivernet, water as kvwater
 
     p = params or MouthParams()
     report = {"params": p.to_dict(), "mouths": len(mouths),
               "inflows": 0, "outflows": 0, "carved": 0, "samples_lowered": 0,
-              "max_lowering_m": 0.0, "outlets_opened": 0, "outlets_capped": 0}
+              "max_lowering_m": 0.0, "outlets_opened": 0, "outlets_capped": 0,
+              "riffle_samples": 0}
     if not p.enabled or not mouths:
         return bed, report
 
@@ -278,6 +479,7 @@ def carve_river_mouths(
     lowered = np.zeros(bed.shape, bool)
     max_low = 0.0
     throats = []
+    outlets = []
 
     for mo in mouths:
         report["inflows" if mo.kind == INFLOW else "outflows"] += 1
@@ -312,7 +514,11 @@ def carve_river_mouths(
         pts, s = pts[keep], s[keep]
         if pts.shape[0] < 2:
             continue
-        reach = w0 + flare * float(s[-1])
+        # The mouth widens over the first half of the reach and runs on at that
+        # width: an outlet's channel held across a shallow lake is a channel, not
+        # a funnel growing to swallow the lake.
+        flare_s = 0.5 * L
+        reach = w0 + flare * min(float(s[-1]), flare_s)
 
         rows, cols = rivernet.world_to_grid(plan, pts[:, 0], pts[:, 1])
         pad = int(np.ceil(reach / sp)) + 2
@@ -356,7 +562,7 @@ def carve_river_mouths(
             continue
         rr, cc, dist, k = rr[hit], cc[hit], dist[hit], k[hit]
         sk = s[k]
-        w = w0 + flare * np.maximum(sk, 0.0)
+        w = w0 + flare * np.clip(sk, 0.0, flare_s)
         core = dist <= max(w0, 0.75 * sp)
         # Full depth over the core (the river's own width, and at least the
         # sample nearest the line), smoothstepped out to the flared edge.
@@ -385,6 +591,7 @@ def carve_river_mouths(
         if o.any() and not outlet:
             throats.append((mo, rr[o], cc[o], cur[o].copy()))
         if o.any() and outlet:
+            outlets.append((mo, rr[o], cc[o], cur[o].copy(), d0))
             report["outlets_opened"] += 1
             report["outlets_capped"] += int(mo.capped)
         bed[rr[lower], cc[lower]] = target[lower]
@@ -404,6 +611,9 @@ def carve_river_mouths(
             lowered[tr, tc] = False
             shut[why] = shut.get(why, 0) + 1
     report["inlets_kept_shut"] = shut
+
+    _outlet_riffles(bed, outlets, water_type=water_type, lake_id=lake_id,
+                    island=island, p=p, report=report, raised_out=raised_out)
 
     report["samples_lowered"] = int(lowered.sum())
     report["max_lowering_m"] = round(max_low, 2)

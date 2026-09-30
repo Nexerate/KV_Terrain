@@ -689,9 +689,9 @@ def _add_process_args(p):
     p.add_argument("--river-mouths", action=argparse.BooleanOptionalAction,
                    default=True, dest="river_mouths",
                    help="carry each river's channel on into its lake: a delta at "
-                        "inflows, a funnel behind outlets (default: on; terrain "
-                        "model only). Outlet sills and every shoreline stay on the "
-                        "waterline")
+                        "inflows, a funnel and a riffle at outlets that holds the "
+                        "lake by the river's depth (default: on; terrain model "
+                        "only). Shorelines stay on the waterline")
     p.add_argument("--lake-slope-ratio", type=float, default=None,
                    dest="lake_slope_ratio",
                    help="terrain model: underwater slope at the shore as a fraction "

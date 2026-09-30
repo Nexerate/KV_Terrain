@@ -657,11 +657,16 @@ and leaves the water surface where the ground is:
   the depression hierarchy — except an inlet's throat: the lake backs up the
   inflow's trench until the bed rises above its level, as a real lake does. A
   throat stays shut only if that flood escapes (reaches the map edge, or runs
-  more than 1.5 km), since then the lake would drain. Outlet sills stay shut for
-  now: the runtime reads an outflow head only at a river-sample spill and matches
-  a lake by flooding to its bare spill, and a funnel cut to the river's depth
-  breaks both for ~570 Lierne lakes (see the module docstring). On Lierne 1 488 of
-  1 573 inlets open, and the water audit moves by a handful of small ponds.
+  more than 1.5 km), since then the lake would drain. An outlet opens onto a
+  **riffle**: the river's first samples are raised to a crest just above the
+  river's own bed (and above the rim of any real hollow in the lake bed, so the
+  lake stays one basin), with the lake's level as the river surface over it. The
+  lake's spill is then that river sample, and the depression hierarchy holds the
+  lake at spill + outflow head — the river's depth over the riffle — exactly as a
+  real lake stands above its outlet. The water audit matches a lake by flooding
+  to spill + head for the same reason. On Lierne 1 488 of 1 573 inlets and 827 of
+  1 159 outlets open (riffles a median 1.4 m deep); 789 lakes are now held by
+  their outflow, and the audit otherwise moves by about a dozen small ponds.
 
   `--lake-bed ramp` restores the legacy carve: a straight ramp at
   `--lake-shore-slope` (1.0 m per m) down to `--lake-max-depth` (20 m), flat from

@@ -86,6 +86,27 @@ def test_spill_over_land_has_no_head():
     assert row["status"] == "level_above_spill"
 
 
+def test_a_lake_shallower_than_its_outlet_river_is_matched_through_its_head():
+    # A 13 m lake bed draining into a scour hole at 11.5 behind a riffle at 12 m:
+    # the whole lake stands above its bare spill, held only by the river's depth.
+    h, wg, channel = bowl_with_outlet()
+    h[4:11, 4:11] = 13.0
+    h[7, 10] = 11.5
+    h[7, 11] = 12.0
+    h[7, 12:15] = 11.0
+    wg.lake_table[1]["level_m"] = 13.5
+    plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
+                         tile_cells=14, leaf_tiles_x=1, leaf_tiles_y=1, num_levels=1)
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    H.set_outflow_heads(hier, wg.type == water.TYPE_RIVER, channel)
+    tin, tout = H.subtree_intervals(hier.nodes)
+    row, = wateraudit.audit_lakes(plan, hier, codes, wg, inflow_lakes=set(),
+                                  tin=tin, tout=tout)
+    assert row["status"] == "held_by_outflow" and row["iou"] > 0.95
+    assert abs(row["spill_m"] - 12.0) < 0.02
+
+
 def correction_world(hoyde):
     h = np.full((30, 30), 105.0, np.float32)          # shore at ~105 m
     h[10:20, 10:20] = 100.0                           # flown water surface at 100 m

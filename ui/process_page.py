@@ -110,8 +110,8 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
         river_mouths = st.toggle(
             "Carry rivers into lakes", value=True, disabled=t,
             help="Continue each river's channel into its lake: a delta at inflows, "
-                 "a funnel behind outlets. Shorelines and outlet sills stay on the "
-                 "waterline.")
+                 "a funnel and a riffle at outlets that holds the lake by the "
+                 "river's depth. Shorelines stay on the waterline.")
         lake_slope_ratio = st.slider(
             "Underwater slope ÷ land slope", 0.1, 2.0, float(lbd.slope_ratio), 0.05,
             disabled=t,

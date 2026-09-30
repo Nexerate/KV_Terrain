@@ -477,10 +477,37 @@ def run_process(
             mouths = rivermouth.find_mouths(
                 plan, traced.segments, leaf_bed_uncarved, lake_surf,
                 spacing_m=plan.spacing_m, depth_scale=depth_scale)
+            raised: list = []
             leaf, lake_bed_report["river_mouths"] = rivermouth.carve_river_mouths(
                 leaf, mouths, plan=plan, water_type=water_leaf.type,
                 lake_id=water_leaf.lake_id, island=water_leaf.lake_island,
-                params=mouth_params)
+                params=mouth_params, raised_out=raised)
+            # An outlet's riffle raises river samples. The polylines' `z` is read
+            # from the lake-uncarved snapshot, whose river samples otherwise equal
+            # `leaf`'s, so they must see the riffle too. The water going over it is
+            # the lake's, at the lake's level: that is the surface the outflow
+            # head is read from (exporter and runtime alike).
+            riffle_level = {}
+            for rr, cc, lvl in raised:
+                leaf_bed_uncarved[rr, cc] = leaf[rr, cc]
+                cur = river_surf[rr, cc]
+                river_surf[rr, cc] = np.where(np.isfinite(cur),
+                                              np.maximum(cur, lvl), lvl)
+                for i in (rr * plan.samples_x + cc).tolist():
+                    riffle_level[i] = max(riffle_level.get(i, -np.inf), lvl)
+            # ...and so must the polylines' `level`, which is read from the shaped
+            # profiles rather than back from the raster.
+            if riffle_level and shaped_profiles:
+                for seg in traced.segments:
+                    prof = shaped_profiles.get(seg.seg_id)
+                    if prof is None or not seg.lake_spans:
+                        continue
+                    ri, ci = rivernet._nearest_idx(plan, seg.xy)
+                    flat = ri * plan.samples_x + ci
+                    for k in np.flatnonzero(np.isin(flat, list(riffle_level))):
+                        lv = riffle_level[int(flat[k])]
+                        if not np.isfinite(prof[2][k]) or prof[2][k] < lv:
+                            prof[2][k] = lv
 
         # 4. Unified water surface (lakes = authored level, rivers = the channel
         #    level from step 2), then its water-only pyramid.
@@ -771,13 +798,20 @@ def _lake_bathymetry_block(model: str, rep: dict, snap_report: dict,
         "shoreline_snap": snap_report,
         "islands": "island samples keep their DTM height and count as shore",
         "river_mouths_method": "each river's channel continued into its lake along "
-                               "its polyline: the river's depth at the mouth (capped "
-                               "at its order's modelled depth), widening and fading "
-                               "out over ~12 channel widths, only ever lowering the "
-                               "bed. The shore ring stays on the waterline except an "
-                               "inlet's throat, opened only where a flood check "
-                               "shows the lake cannot spill through it; outlet sills "
-                               "stay shut (see kvterrain/rivermouth.py)",
+                               "its polyline, only ever lowering the lake bed: a "
+                               "delta at inflows (the river's depth, capped at its "
+                               "order's, fading out over ~12 channel widths), a "
+                               "funnel at outlets holding the river's depth until "
+                               "deeper lake bed. The shore ring stays on the "
+                               "waterline except the throats: an inlet's opens "
+                               "unless the flood below the level escapes; an "
+                               "outlet's opens onto a riffle, the river's first "
+                               "samples raised to a crest above the river bed and "
+                               "above the rim of any hollow a real share of the "
+                               "lake drains into, with the lake's level as the "
+                               "river surface there. The lake's spill is then that "
+                               "river sample and its outflow head carries the "
+                               "level (see kvterrain/rivermouth.py)",
         "rationale": "lakes can drain at runtime, so the bed must pass for ground: "
                      "it continues the land around it, never breaks the waterline "
                      "(multiplicative noise cannot move a zero or cross it), and "

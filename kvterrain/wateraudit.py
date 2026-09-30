@@ -21,9 +21,15 @@ For each authored lake with a level L:
    drain to many small pits, and the single pit draining the most can belong to
    a side pocket that spills away from the lake rather than into it.
 2. Walk up from each. At each node N the pool is N's subtree below
-   min(L, spill(N)) — connected by construction, because every merge inside N
-   happened below N's spill. Measure its overlap with the mask (IoU), flooding
-   out from the mask samples with a size cap.
+   min(L, spill(N) + outflow head(N)) — what N holds, since water leaving through
+   an outflow river stands above the spill by the river's depth there. Every
+   sample of N's subtree below that is connected to the mask samples through
+   N's subtree. Measure its overlap with the mask (IoU), flooding out from the
+   mask samples with a size cap. (Before river mouths were carved, every lake's
+   spill was its shore ring on the waterline and the head never mattered here. An
+   outlet riffle holds a lake by its head alone, and a lake shallower than its
+   outlet river lies wholly above its bare spill: flooded only to the spill it
+   matched nothing.)
 3. The best-overlapping node is the lake's node. Climbing stops once the pool
    is far larger than the lake or the root is reached.
 
@@ -329,6 +335,9 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
         cap = int(max(POOL_CAP_FACTOR * cnt, POOL_CAP_MIN))
         buf = np.empty(cap, dtype=np.int64)
         spill_code = nodes["spill_code"]
+        # What each node holds, in codes: its spill plus its outflow head.
+        head_code = nodes["outflow_head_m"].astype(np.float64) / max(step_m, 1e-9)
+        hold_code = spill_code.astype(np.float64) + head_code
         under = level_code - tol_code
         over = level_code + tol_code
         group_n: dict = {}
@@ -339,7 +348,7 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                 continue
             path = []
             top = int(lf)
-            while top not in top_of and float(spill_code[top]) <= over and \
+            while top not in top_of and float(hold_code[top]) <= over and \
                     int(parent[top]) not in (H.ROOT, H.NONE):
                 path.append(top)
                 top = int(parent[top])
@@ -361,8 +370,8 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                 # re-flooding the lake at each of them is what cost the audit its
                 # time.
                 up = int(parent[v])
-                if (float(spill_code[v]) < under and up not in (H.ROOT, H.NONE)
-                        and float(spill_code[up]) < under):
+                if (float(hold_code[v]) < under and up not in (H.ROOT, H.NONE)
+                        and float(hold_code[up]) < under):
                     v = up
                     continue
                 # The pool of v at the lake level, capped at v's own spill, plus the
@@ -370,7 +379,7 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                 # (depth 0), and on a small lake they are most of the mask. Flooding
                 # stays inside v's subtree, so the tolerance cannot leak across the
                 # saddle.
-                eff = min(level_code, float(spill_code[v])) + tol_code
+                eff = min(level_code, float(hold_code[v])) + tol_code
                 # One stamp value per evaluation marks visited samples without ever
                 # clearing the array.
                 stamp_val += 1
@@ -386,7 +395,7 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                 # spilling AT L (within tolerance) is not a wall: parts of one lake
                 # separated by a neck whose shore samples sit exactly on the
                 # waterline merge there, so keep climbing.
-                if float(spill_code[v]) > level_code + tol_code:
+                if float(hold_code[v]) > level_code + tol_code:
                     break
                 v = up
 
