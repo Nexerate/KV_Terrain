@@ -88,7 +88,9 @@ DEFAULT_REGULATED_MARGIN_M = 1.0
 DEFAULT_MIN_IOU = 0.3
 POOL_CAP_FACTOR = 50                # stop climbing once a pool is this many x the mask
 POOL_CAP_MIN = 20000
-FLAT_SEARCH_CELLS = 512
+# How much of a flat the river walk searches for an exit. A trunk river's bed,
+# levelled across N50's width, is a flat of up to ~1 000 samples on Lierne.
+FLAT_SEARCH_CELLS = 8192
 UNEXPLAINED_MIN_DEPTH_M = 2.0
 UNEXPLAINED_MIN_AREA_M2 = 5000.0
 UNEXPLAINED_LIMIT = 500
@@ -190,7 +192,7 @@ def _walk_rivers(codes, corridor, lake, labels, floor_code, spill_code, leaf_max
     status = np.zeros(m, dtype=np.int8)
     stop = np.full(m, -1, dtype=np.int64)
     steps_out = np.zeros(m, dtype=np.int64)
-    flat = np.empty(512, dtype=np.int64)
+    flat = np.empty(FLAT_SEARCH_CELLS, dtype=np.int64)
     inv_sqrt2 = 1.0 / np.sqrt(2.0)
     for s in range(m):
         cur = starts[s]
