@@ -62,6 +62,15 @@ class WidthParams:
         return asdict(self)
 
 
+def _fill_gaps(a: np.ndarray) -> np.ndarray:
+    """NaNs linearly interpolated from their finite neighbours (ends held)."""
+    ok = np.isfinite(a)
+    if ok.all() or not ok.any():
+        return a
+    i = np.arange(a.size)
+    return np.interp(i, i[ok], a[ok])
+
+
 def _running(fn, a: np.ndarray, w: int) -> np.ndarray:
     if w <= 1 or a.size < 2:
         return a.copy()
@@ -78,9 +87,18 @@ def _normals(xy: np.ndarray) -> np.ndarray:
 
 
 def vertex_widths(segments: list, n50: Optional[dict], *,
-                  params: Optional[WidthParams] = None) -> tuple:
+                  params: Optional[WidthParams] = None,
+                  centres: Optional[dict] = None) -> tuple:
     """({seg_id: f32 width per vertex}, report). Segments are traced
-    `rivernet.RiverSegment`s with their modelled `width_m` set."""
+    `rivernet.RiverSegment`s with their modelled `width_m` set.
+
+    `centres`, when a dict is passed, receives {seg_id: offset per vertex}: how
+    far along the vertex's normal the middle of the N50 river area lies, smoothed
+    like the widths and eased to zero over `taper_m` where the area ends; 0 where
+    the width is not an area's. N50's lines run off-centre inside their own areas
+    (Lierne, 2026-09-30: by a median 3 m and up to 75 m), and a width stamped
+    around such a line spills past the near bank by the offset, which
+    `thalweg.snap_segments` removes by moving the line."""
     from shapely import STRtree, LineString, Polygon
     from shapely import points as shp_points, distance as shp_distance
 
@@ -147,7 +165,8 @@ def vertex_widths(segments: list, n50: Optional[dict], *,
             near, which = pidx[0][keep], pidx[1][keep]
             if near.size:
                 meas = np.full(n, np.nan)
-                meas[near] = _measure(xy, near, polys_arr[which], p)
+                mid = np.full(n, np.nan)
+                meas[near], mid[near] = _measure(xy, near, polys_arr[which], p)
                 have = np.isfinite(meas)
                 if have.any():
                     # Smooth over the measured run(s) only.
@@ -170,6 +189,16 @@ def vertex_widths(segments: list, n50: Optional[dict], *,
                     blend = (1.0 - t) * m[near_i] + t * w
                     take = (~inlake) & (d <= p.taper_m)
                     w[take] = blend[take]
+                    if centres is not None:
+                        c = np.zeros(n)
+                        for a, b in _runs(have):
+                            seg = _fill_gaps(mid[a:b])
+                            if not np.isfinite(seg).any():
+                                continue
+                            seg = _running(np.median, seg, p.median_window)
+                            c[a:b] = _running(np.mean, seg, p.mean_window)
+                        c = np.where(take, (1.0 - t) * c[near_i], 0.0)
+                        centres[s.seg_id] = c
                     src[have] = 9
                     widths_measured.append(m[have])
         w = np.maximum(w, 0.5)
@@ -206,12 +235,14 @@ def water_areas(n50: Optional[dict], *, margin_m: float = 0.0):
     return u.buffer(margin_m) if margin_m > 0 else u
 
 
-def _measure(xy: np.ndarray, idx: np.ndarray, polys: np.ndarray, p) -> np.ndarray:
+def _measure(xy: np.ndarray, idx: np.ndarray, polys: np.ndarray, p) -> tuple:
     """Width of `polys[k]` across the centreline at vertex `idx[k]`: the piece of the
     normal through the vertex that lies in the polygon, nearest the vertex. Capped
     at four times the vertex's distance to the bank, so a normal that runs along
     the river at a bend, or out into a confluence, cannot report the river's
-    length as its width."""
+    length as its width. Also returns the signed distance along the normal to that
+    piece's middle, NaN where the width is NaN or was capped (the piece is then
+    not the river's cross-section)."""
     import shapely
     nrm = _normals(xy)[idx]
     c = xy[idx]
@@ -221,6 +252,7 @@ def _measure(xy: np.ndarray, idx: np.ndarray, polys: np.ndarray, p) -> np.ndarra
     inter = shapely.intersection(lines, polys)
     pts = shapely.points(c)
     out = np.full(idx.size, np.nan)
+    mid = np.full(idx.size, np.nan)
     for k, g in enumerate(inter):
         if g is None or g.is_empty:
             continue
@@ -228,6 +260,8 @@ def _measure(xy: np.ndarray, idx: np.ndarray, polys: np.ndarray, p) -> np.ndarra
         best = min(parts, key=lambda q: q.distance(pts[k]))
         if best.distance(pts[k]) <= p.polygon_reach_m and best.length > 0:
             out[k] = best.length
+            ends = np.asarray(best.coords, dtype=np.float64)
+            mid[k] = float(np.dot(0.5 * (ends[0] + ends[-1]) - c[k], nrm[k]))
     # A tributary poking into a big river's polygon is not that river: across its
     # own line the polygon is long (the main river's length), along it short (the
     # main river's width). Keep a measurement only where the polygon runs at least
@@ -247,9 +281,62 @@ def _measure(xy: np.ndarray, idx: np.ndarray, polys: np.ndarray, p) -> np.ndarra
     # ends or beside it, takes the taper from its measured neighbours.
     inside = shapely.contains(polys, pts)
     cap = np.maximum(4.0 * to_bank, 1.0)
-    return np.where(inside, np.minimum(out, cap), np.nan)
+    width = np.where(inside, np.minimum(out, cap), np.nan)
+    mid = np.where(np.isfinite(width) & (out <= cap), mid, np.nan)
+    return width, mid
 
 
 def _runs(mask: np.ndarray) -> list:
     d = np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+
+def fit_to_areas(segments: list, areas, *, margin_m: float = 0.0) -> dict:
+    """Cap each vertex width inside an N50 river area at twice its distance to the
+    area's nearest bank (plus `margin_m`), in place on `vertex_width_m`.
+
+    The runtime stamps a river as circles of the vertex width around the line.
+    A width measured straight across is right for the river, but where the area
+    bends, narrows ahead or has an island, the circle reaches a nearer bank in
+    another direction and spills past it. On Lierne (2026-09-30), even with the
+    lines centred, 4% of the vertices in N50 areas spilled more than 10 m. Run
+    after `thalweg.snap_segments`, on the lines as they will ship.
+    `areas` is `water_areas(...)`, None to do nothing."""
+    import shapely
+    from shapely import STRtree
+
+    rep = {"vertices_capped": 0, "reduction_median_m": 0.0}
+    if areas is None:
+        return rep
+    parts = list(getattr(areas, "geoms", [areas]))
+    tree = STRtree(parts)
+    rings = [shapely.boundary(p) for p in parts]
+    drops = []
+    for s in segments:
+        vw = getattr(s, "vertex_width_m", None)
+        if vw is None or len(vw) != s.n:
+            continue
+        pts = shapely.points(np.asarray(s.xy, dtype=np.float64))
+        pi, pj = tree.query(pts, predicate="within")
+        if pi.size == 0:
+            continue
+        d = np.full(s.n, np.inf)
+        for i, j in zip(pi, pj):
+            d[i] = min(d[i], shapely.distance(pts[i], rings[j]))
+        cap = 2.0 * d + float(margin_m)
+        w = np.asarray(vw, dtype=np.float64)
+        over = w > cap
+        if not over.any():
+            continue
+        # Ease into the cap rather than notching one vertex.
+        capped = np.minimum(w, _running(np.min, np.minimum(w, cap), 5))
+        capped = np.minimum(_running(np.mean, capped, 5), np.minimum(w, cap))
+        changed = capped < w - 1e-6
+        drops.append((w - capped)[changed])
+        rep["vertices_capped"] += int(changed.sum())
+        s.vertex_width_m = capped.astype(np.float32)
+    if drops:
+        dd = np.concatenate(drops)
+        rep["reduction_median_m"] = round(float(np.median(dd)), 2)
+        rep["reduction_max_m"] = round(float(dd.max()), 2)
+    return rep

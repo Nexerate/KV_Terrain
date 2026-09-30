@@ -115,8 +115,20 @@ The sites to change:
   3 m. Elsewhere the two are equal.
 - **The carved channel.** It follows the visual width. The exported river mask for
   a polygon-derived stretch is clipped to N50's river area plus one sample, so it
-  never extends past the mapped banks by more than a sample, even where the
-  per-vertex width bulges at a confluence.
+  never extends past the mapped banks by more than a sample.
+- **A circle of the vertex width stays inside N50's area** (kvterrain at or after
+  2026-09-30). Two exporter changes make a per-vertex circle stamp safe without
+  clipping in the runtime:
+  - Where the width comes from an N50 river area, the vertex in `rivers.bin` is
+    moved to the middle of the area across the river. N50's lines ran a median
+    3 m, and up to 75 m, off-centre, so the stamp spilled past the near bank by
+    that much.
+  - Each width is then capped at twice the vertex's distance to the area's nearest
+    bank plus one sample. That removes the rest: bends, islands and irregular
+    reaches up to 290 m wide.
+  On Lierne no vertex stamp now reaches more than 2.5 m past an N50 bank, where it
+  was up to 68 m. The capped width can underfill a very irregular area; the carved
+  channel and `surface.atlas` still cover the whole area there.
 - **Stamping past the carved channel** onto dry banks is harmless in the runtime,
   as above.
 - **`surface.atlas` and `water_id.atlas`** cover the visual width, so heads, lake

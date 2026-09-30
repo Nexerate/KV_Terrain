@@ -126,6 +126,13 @@ GENTLE_FALL_MAX_GRADE = 0.30
 GENTLE_FALL_CONTEXT_VERTICES = 2
 FALL_WHITE_SLOPE = 0.35
 SUNK_GUARD_M = 10.0
+# A cut deeper than this below the capped ground, for longer than
+# BARRIER_MIN_LENGTH_M, is a ridge the mapped line crosses, not an embankment to
+# breach: the profile is not carried through it (see `_find_barriers`).
+BARRIER_CUT_M = 5.0
+BARRIER_MIN_LENGTH_M = 40.0
+# The ridge's flank is released back to where the cut is this shallow.
+BARRIER_FLANK_CUT_M = 1.0
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
@@ -247,6 +254,76 @@ def _shape_profile(level: np.ndarray, ceiling: np.ndarray, radius: int,
         r = min(r, mean, cap[i])
         surface[i] = r
     return surface
+
+
+def _find_barriers(level: np.ndarray, ceiling: np.ndarray, shaped: np.ndarray,
+                   xy: np.ndarray, lake_spans: list, *,
+                   cut_m: float = BARRIER_CUT_M,
+                   min_length_m: float = BARRIER_MIN_LENGTH_M,
+                   flank_cut_m: float = BARRIER_FLANK_CUT_M) -> list:
+    """Ridges a shaped profile trenches: runs cut more than `cut_m` below the
+    capped ground for more than `min_length_m`, outside lakes. Each is returned as
+    (first, crest): `first` walks upstream while the cut stays over `flank_cut_m`,
+    `crest` is the run's highest capped ground.
+
+    The design doc's rule for embankments (WATER_REDESIGN.md: breach, capped by
+    depth and length). A road across a stream is a few tens of metres wide and is
+    still breached; a mapped line drawn over a 20 m hill is not, because the
+    channel it would need is a canyon (on Lierne, 2026-09-30, up to 28 m deep).
+    """
+    cap = np.minimum(level, ceiling)
+    cut = cap - shaped
+    n = cut.size
+    open_vertex = np.ones(n, dtype=bool)
+    for a, b, _lid in lake_spans:
+        open_vertex[max(int(a), 0):min(int(b) + 1, n)] = False
+    deep = open_vertex & np.isfinite(cut) & (cut > cut_m)
+    if not deep.any():
+        return []
+    step = np.r_[np.hypot(*np.diff(np.asarray(xy, dtype=np.float64), axis=0).T), 0.0]
+    edges = np.flatnonzero(np.diff(np.r_[0, deep.astype(np.int8), 0]))
+    out = []
+    for a, b in zip(edges[0::2], edges[1::2]):
+        a, b = int(a), int(b)
+        if float(step[a:b].sum()) <= min_length_m:
+            continue
+        crest = a + int(np.nanargmax(cap[a:b]))
+        first = a
+        while (first > 0 and open_vertex[first - 1] and np.isfinite(cut[first - 1])
+               and cut[first - 1] > flank_cut_m):
+            first -= 1
+        if out and first <= out[-1][1]:
+            first = out[-1][1] + 1
+        if first < crest:
+            out.append((first, crest))
+    return out
+
+
+def _shape_with_barriers(level: np.ndarray, ceiling: np.ndarray, radius: int,
+                         seed: float, barriers: list) -> np.ndarray:
+    """`_shape_profile`, restarted past each barrier. A barrier's upstream flank
+    keeps its own ground's fall back toward `first` (the water there runs back the
+    way the terrain says); the profile starts afresh at the crest."""
+    level = np.asarray(level, dtype=np.float64)
+    ceiling = np.asarray(ceiling, dtype=np.float64)
+    if not barriers:
+        return _shape_profile(level, ceiling, radius, seed)
+    out = np.empty(level.size, dtype=np.float64)
+    start = 0
+    s = float(seed)
+    for first, crest in barriers:
+        if crest <= start:
+            continue
+        first = max(int(first), start)
+        if first > start:
+            out[start:first] = _shape_profile(level[start:first],
+                                              ceiling[start:first], radius, s)
+        cap = np.minimum(level[first:crest + 1], ceiling[first:crest + 1])
+        out[first:crest + 1] = np.fmin.accumulate(cap[::-1])[::-1]
+        start = crest
+        s = np.inf
+    out[start:] = _shape_profile(level[start:], ceiling[start:], radius, s)
+    return out
 
 
 def _lake_level(wg: kvwater.WaterGrid, lake_id: int) -> Optional[float]:
@@ -550,6 +627,25 @@ def downhill_profiles(
             radius = min(6, max(2, int(np.ceil(
                 half_w / max(plan.spacing_m, 1e-9)))))
             lm = _shape_profile(lvl, ceiling, radius, seed_l)
+            s.barriers = []
+            if wg is not None:
+                # Each restart can reveal the next ridge downstream of it.
+                for _ in range(8):
+                    found = _find_barriers(lvl, ceiling, lm, s.xy, s.lake_spans)
+                    merged = []
+                    for first, crest in sorted(set(s.barriers) | set(found),
+                                               key=lambda fc: (fc[1], fc[0])):
+                        if merged and crest <= merged[-1][1]:
+                            continue
+                        if merged:
+                            first = max(first, merged[-1][1] + 1)
+                        if first < crest:
+                            merged.append((int(first), int(crest)))
+                    if merged == s.barriers:
+                        break
+                    s.barriers = merged
+                    lm = _shape_with_barriers(lvl, ceiling, radius, seed_l,
+                                              s.barriers)
         else:
             # A post-carve bank pass starts with the already accepted profile.
             # Only new dry-bank information may lower it.  Shape that correction
@@ -574,8 +670,13 @@ def downhill_profiles(
             bounded_ceiling = np.where(
                 needs_correction, np.maximum(ceiling, floor), np.inf)
             lm = np.maximum(
-                _shape_profile(previous, bounded_ceiling, radius, seed_l),
+                _shape_with_barriers(previous, bounded_ceiling, radius, seed_l,
+                                     getattr(s, "barriers", [])),
                 floor)
+            for first, crest in getattr(s, "barriers", []):
+                # The floor runs its minimum through the ridge; the flank keeps
+                # the first pass's level.
+                lm[first:crest + 1] = previous[first:crest + 1]
         # The old exporter profile, retained only to report how much this change
         # lowers levels relative to the previous running-minimum implementation.
         old = np.fmin.accumulate(np.concatenate([[seed_old], lvl]))[1:]
@@ -760,8 +861,16 @@ def downhill_profiles(
         if take.any():
             drops.append(np.maximum(d[take], 0.0))
     drop = np.concatenate(drops) if drops else np.zeros(0, dtype=np.float64)
+    barrier_m = 0.0
+    n_barriers = 0
+    for s in segs:
+        for first, crest in getattr(s, "barriers", []):
+            n_barriers += 1
+            barrier_m += float(np.hypot(*np.diff(s.xy[first:crest + 1], axis=0).T).sum())
     return {
         "profiles": out,
+        "barriers_kept": n_barriers,
+        "barrier_flank_m": round(barrier_m, 1),
         "ceilings": ceilings,
         "cyclic_segments": n_cyclic,
         "vertices_no_dry_bank_sample": int(no_bank),
@@ -847,6 +956,12 @@ def downhill_river_bed(
         "gentle_fall_ramp": prof["gentle_fall_ramp"],
         "gentle_fall_ramp_by_order": prof["gentle_fall_ramp_by_order"],
         "local_confluence_repair": prof["local_confluence_repair"],
+        "barriers_kept": prof["barriers_kept"],
+        "barrier_flank_m": prof["barrier_flank_m"],
+        "barrier_rule": (f"a cut over {BARRIER_CUT_M:g} m below the capped ground "
+                         f"for over {BARRIER_MIN_LENGTH_M:g} m is a ridge the "
+                         "mapped line crosses: its upstream flank keeps its own "
+                         "fall and the profile restarts at the crest"),
     }
     for key, drops in (("level", level_drops), ("bed", bed_drops)):
         d = np.concatenate(drops) if drops else np.zeros(0)
@@ -949,6 +1064,15 @@ def _burn_paths(bed, is_river, order, starts, ends, rows, cols, in_lake,
             r1 = rows[v]
             c1 = cols[v]
             lake = in_lake[v]
+            if lake == 2:
+                # A barrier crest: the running minimum starts afresh here.
+                h = bed[rows[v], cols[v]] if (0 <= rows[v] < SY and
+                                              0 <= cols[v] < SX) else np.nan
+                if np.isfinite(h):
+                    run = h
+                pr = r1
+                pc = c1
+                continue
             if pr < 0:
                 steps = 0
             else:
@@ -1007,6 +1131,10 @@ def burn_downhill_paths(plan: core.GridPlan, traced: "rivernet.TracedNetwork",
         m = np.zeros(s.n, dtype=np.uint8)
         for (a, b, _lid) in s.lake_spans:
             m[a:b + 1] = 1
+        # A barrier's flank is carried, not written; its crest restarts the run.
+        for first, crest in getattr(s, "barriers", []):
+            m[first:crest] = np.maximum(m[first:crest], 1)
+            m[crest] = 2
         rows.append(ri); cols.append(ci); lake.append(m)
         starts[i] = acc
         acc += s.n

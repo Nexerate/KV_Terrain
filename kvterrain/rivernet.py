@@ -347,6 +347,9 @@ class RiverSegment:
     vertex_width_m: Optional[np.ndarray] = None
     # Modelled channel depth from discharge (unscaled); None = the order table.
     depth_m: Optional[float] = None
+    # Ridges the downhill bed does not cut through (`riverbed._find_barriers`):
+    # (first, crest) vertex pairs, set by the first profile pass.
+    barriers: list = field(default_factory=list)
     node_id: int = NO_HIERARCHY_NODE
     local_catchment_m2: float = 0.0
     accumulated_catchment_m2: float = 0.0

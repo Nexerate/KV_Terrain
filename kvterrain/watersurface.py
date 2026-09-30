@@ -147,7 +147,8 @@ def _bresenham_path(rc):
 def channel_level(plan: core.GridPlan, feats: kvwater.WaterFeatures,
                   is_river: np.ndarray, ground: np.ndarray,
                   half_width_m: np.ndarray,
-                  bank_tolerance_m: float = kvbathy.DEFAULT_BANK_TOLERANCE_M
+                  bank_tolerance_m: float = kvbathy.DEFAULT_BANK_TOLERANCE_M,
+                  centrelines: Optional[list] = None,
                   ) -> np.ndarray:
     """
     The water LEVEL across each channel: the ground under the channel's own
@@ -191,9 +192,9 @@ def channel_level(plan: core.GridPlan, feats: kvwater.WaterFeatures,
     if not is_river.any():
         return out
 
-    shapes = [(LineString(s.xy), 1)
-              for s in list(feats.rivers) + list(feats.main_rivers)
-              if s.xy.shape[0] >= 2]
+    lines = (centrelines if centrelines is not None else
+             [s.xy for s in list(feats.rivers) + list(feats.main_rivers)])
+    shapes = [(LineString(xy), 1) for xy in lines if np.asarray(xy).shape[0] >= 2]
     if not shapes:
         return out
     centre = np.zeros(is_river.shape, dtype=np.uint8)
@@ -230,6 +231,7 @@ def river_surface_moh(
     width_by_order: Optional[dict] = None,
     width_scale: float = 1.0,
     bank_tolerance_m: float = kvbathy.DEFAULT_BANK_TOLERANCE_M,
+    centrelines: Optional[list] = None,
 ) -> np.ndarray:
     """
     Per-pixel river water-surface elevation (m.o.h.), float32, NaN off-river.
@@ -263,7 +265,8 @@ def river_surface_moh(
     `bank_tolerance_m` above any sample's own ground).
 
     `height_uncarved` is the LEAF (finest) DTM (SY,SX), void-repaired but not yet river-carved.
-    `feats` supplies the centrelines. `lake_surface` (from WaterGrid.lake_surface_moh), when
+    `feats` supplies the centrelines, unless `centrelines` (a list of (N,2) xy
+    arrays: the traced segments after `thalweg.snap_segments`) replaces them. `lake_surface` (from WaterGrid.lake_surface_moh), when
     given, RAISES river pixels adjacent to a lake to the lake's surface — never lowers them —
     so the two agree at a flooded inlet/outlet without leaving a dry seam at every other one.
     """
@@ -283,7 +286,7 @@ def river_surface_moh(
         wg.weight, is_river, plan.spacing_m, width_by_order, width_scale,
         width_m=wg.width_m)
     out = channel_level(plan, feats, is_river, height_uncarved, half_w,
-                        bank_tolerance_m=bank_tolerance_m)
+                        bank_tolerance_m=bank_tolerance_m, centrelines=centrelines)
 
     # Lake tie-in: a river pixel adjacent to a lake is RAISED to that lake's surface where
     # the lake stands higher, so the two meet exactly at a flooded inlet/outlet.

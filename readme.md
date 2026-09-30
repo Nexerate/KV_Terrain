@@ -255,7 +255,7 @@ default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
 `--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
 `--(no-)lake-surveys`, `--(no-)river-mouths`, `--(no-)lake-shoreline`,
-`--(no-)river-n50-widths`, `--river-depth-model`, the ramp model's `--lake-max-depth` and
+`--(no-)river-n50-widths`, `--(no-)river-thalweg-snap`, `--river-depth-model`, the ramp model's `--lake-max-depth` and
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
@@ -720,7 +720,23 @@ and leaves the water surface where the ground is:
   mouths all use it, and it ships per vertex in `river_widths.bin` beside an
   unchanged `rivers.bin`, whose `width_m` stays the hydraulic width. The runtime
   needs `docs/runtime-spec-river-widths.md` to draw it; without it the wide
-  channels are carved but stamped at the hydraulic width.
+  channels are carved but stamped at the hydraulic width. Where the width comes
+  from an N50 area the line is moved to the middle of that area, and each width is
+  capped so a circle of it stays inside the area, so the runtime's stamp never
+  spills past a mapped bank by more than a few metres.
+
+  **Streams are moved onto the channel the scan shows** (`--river-thalweg-snap`,
+  on by default; `kvterrain/thalweg.py`). NVE's lines come from N50 (position
+  accuracy about 20 m) and often run a few metres up a valley side. The downhill
+  bed then had to drop the water to the lower bank and trench the hillside to
+  hold it: on Lierne 1 000 km of channel sat more than 1 m below the ground under
+  its own line. Each vertex now moves up to 15 m sideways, along the line's
+  normal, to where the ground stands least above its lower bank, as a smooth
+  shortest path per segment, with junctions kept joined and lake and wide-river
+  vertices left alone. That leaves 300 km over 1 m, and the median drop of the
+  water below the ground under its line goes from 0.43 m to 0.13 m.
+  `rivers.bin` carries the moved vertices; `geom_hash` still identifies the
+  mapped run.
 
 - **Bank-capped downhill river profile** (`--downhill-river-bed`, on by default).
   Before the river carve, each densified centreline samples the lowest dry bank
@@ -744,6 +760,11 @@ and leaves the water surface where the ground is:
   (owner's decision, 2026-09-17). On Lierne: the level and bed were lowered at
   1.45 M of 4.48 M vertices (median 0.07 m, max 59 m); rises along the polylines'
   own samples went from 21.0 % of open-channel steps to 1 step in 3.28 M.
+  A ridge is not cut through: where the profile would run more than 5 m below
+  the ground for more than 40 m (a line drawn over a hill, not a road
+  embankment), the ridge's upstream flank keeps its own fall and the profile
+  starts afresh at its crest. That leaves a pit behind the ridge instead of a
+  canyon through it (Lierne: 20 ridges; the deepest cut went from 28 m to 14 m).
 - **Lakes ramp up at the map edge** (`--lake-edge-is-shore`, on by default). The
   lake carve's distance-to-shore used to see only shore inside the array, so a
   lake the export boundary cuts through was at full depth right at the edge

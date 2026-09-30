@@ -70,6 +70,7 @@ def _water_opts(a) -> dict:
         "river_mouths": a.river_mouths,
         "lake_shoreline": a.lake_shoreline,
         "river_n50_widths": a.river_n50_widths,
+        "river_thalweg_snap": a.river_thalweg_snap,
         "river_depth_model": a.river_depth_model,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
@@ -711,8 +712,7 @@ def _add_process_args(p):
     p.add_argument("--river-depth-model", choices=["discharge", "order"],
                    default="discharge", dest="river_depth_model",
                    help="how deep a river channel is carved: 'discharge' (default) "
-                        "0.3*Q^0.4 m clamped to 0.5-4 m, the depth half of the width "
-                        "model; 'order' is the legacy table by stream order (1.5 m to "
+                        "2.0*Q^0.3 m clamped to 0.5-5 m; 'order' is the legacy table by stream order (1.5 m to "
                         "11 m). Both times --river-depth-scale")
     p.add_argument("--river-n50-widths", action=argparse.BooleanOptionalAction,
                    default=True, dest="river_n50_widths",
@@ -720,6 +720,11 @@ def _add_process_args(p):
                         "has them: the mapped river areas of wide rivers, width "
                         "classes elsewhere; writes river_widths.bin (default: on). "
                         "The hydraulic width in rivers.bin is unchanged")
+    p.add_argument("--river-thalweg-snap", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_thalweg_snap",
+                   help="move each stream's line up to 15 m sideways onto the "
+                        "valley bottom the scan shows, instead of trenching the "
+                        "valley side where the mapped line runs (default: on)")
     p.add_argument("--lake-shoreline", action=argparse.BooleanOptionalAction,
                    default=True, dest="lake_shoreline",
                    help="let the scan decide where each lake's water ends: scanned "

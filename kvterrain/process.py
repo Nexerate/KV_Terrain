@@ -156,7 +156,7 @@ def run_process(
     lake beds are then synthetic everywhere, and the manifest says so.
     """
     from . import (water, bathymetry, watersurface, waterid, rivernet, riverbed,
-                   lakebed, rivermouth, shoreline, riverwidth)
+                   lakebed, rivermouth, shoreline, riverwidth, thalweg)
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -189,6 +189,8 @@ def run_process(
     shores = None
     width_params = None
     width_report: dict = {}
+    snap_params = None
+    thalweg_report: dict = {}
     river_depth_model = "discharge"
     depth_by_order_compat = None
     snap_report: dict = {}
@@ -253,6 +255,8 @@ def run_process(
             enabled=bool(opts.pop("lake_shoreline", True)))
         width_params = riverwidth.WidthParams(
             enabled=bool(opts.pop("river_n50_widths", True)))
+        snap_params = thalweg.SnapParams(
+            enabled=bool(opts.pop("river_thalweg_snap", True)))
         if survey_layers is None:
             survey_layers = opts.pop("bathymetry", None)
         else:
@@ -365,14 +369,24 @@ def run_process(
         # 2'. The VISUAL width per vertex: N50's river areas and width classes where
         #     the dataset has them, the modelled width elsewhere (see riverwidth).
         #     The hydraulic width stays on the segment for rivers.bin.
+        centres: dict = {}
         vertex_w, width_report = riverwidth.vertex_widths(
-            traced.segments, n50_layer, params=width_params)
+            traced.segments, n50_layer, params=width_params, centres=centres)
         for s in traced.segments:
             s.vertex_width_m = vertex_w.get(s.seg_id)
+        # 2''. Each stream onto the channel the scan shows: NVE's lines are N50's,
+        #      often a valley side away from the bottom (see thalweg). Everything
+        #      below — raster, level, profiles, rivers.bin — follows the moved lines.
+        thalweg_report = thalweg.snap_segments(
+            plan, traced.segments, leaf_uncarved, water_leaf, params=snap_params,
+            centres=centres)
+        # 2'''. No width stamped around a line may spill past its N50 area.
+        areas = riverwidth.water_areas(n50_layer) if width_params.enabled else None
+        width_report["fit_to_areas"] = riverwidth.fit_to_areas(
+            traced.segments, areas, margin_m=plan.spacing_m)
         water.rerasterize_rivers(plan, water_leaf, traced.segments,
-                                 clip_water=riverwidth.water_areas(
-                                     n50_layer, margin_m=plan.spacing_m)
-                                 if width_params.enabled else None)
+                                 clip_water=(areas.buffer(plan.spacing_m)
+                                             if areas is not None else None))
 
         # 2a. THE RIVER WATER LEVEL, from the uncarved ground: the lowest ground
         #    across each channel, levelled over that channel's own width, then
@@ -385,7 +399,9 @@ def run_process(
             plan, features, water_leaf, leaf_uncarved,
             width_by_order=raster_opts.get("width_by_order"),
             width_scale=raster_opts.get("width_scale", 1.0),
-            bank_tolerance_m=bank_tol_m)
+            bank_tolerance_m=bank_tol_m,
+            centrelines=([s.xy for s in traced.segments]
+                         if snap_params.enabled or centres else None))
         lake_tie = watersurface.lake_tie_in(water_leaf, lake_surf)
         # The level as it was before any downhill enforcement. The carve's bank
         # taper measures against THIS, so lowering a level cannot switch the
@@ -766,6 +782,18 @@ def run_process(
                       "the polygon plus one sample), N50 width class 2 caps the "
                       "hydraulic width at 3 m and class 3 holds it to 3-15 m, "
                       "elsewhere the hydraulic width; written to river_widths.bin",
+        }
+        wsurf["thalweg_snap"] = {
+            **thalweg_report,
+            "method": "each stream vertex moved along its normal, at most "
+                      "max_offset_m, to where the ground stands least above its "
+                      "lower bank; a shortest path per segment with costs for "
+                      "offset and sideways change, downstream-first so "
+                      "confluences stay joined; lake vertices and rivers wider "
+                      "than 2*max_half_width_m are moved to the middle of their "
+                      "N50 river area instead. rivers.bin "
+                      "carries the moved vertices; geom_hash still identifies "
+                      "the mapped run",
         }
         wsurf["lake_bathymetry"] = _lake_bathymetry_block(
             lake_bed_model, lake_bed_report, snap_report, water_params) \
