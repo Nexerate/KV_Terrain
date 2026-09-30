@@ -220,6 +220,7 @@ class RiverSeg:
     # Optional full width per vertex (the visual width, `riverwidth`); overrides
     # width_m piece by piece where given.
     vertex_width_m: Optional[np.ndarray] = None
+    depth_m: Optional[float] = None     # modelled channel depth (unscaled)
     part_index: int = 0                # part number within a MultiLineString
     feature_index: int = -1             # index of the parent GeoJSON feature in the
                                         # RAW layer (before repeated copies are dropped)
@@ -287,6 +288,9 @@ class WaterGrid:
     # Full modelled width on river samples.  This is an intermediate used by the
     # surface/carve; the runtime reads the same per-segment width from rivers.bin.
     width_m: np.ndarray = None         # f4, 0 off-river
+    # Modelled channel depth from discharge on river samples (unscaled); 0 off-river
+    # and wherever a segment has none (the order table then applies).
+    depth_m: np.ndarray = None         # f4
 
     def lake_level(self, info: dict):
         """
@@ -1328,7 +1332,8 @@ def rasterize_water(
                 poly = base if local is None else wide.intersection(local).union(base)
             if poly.is_empty:
                 continue
-            weight_shapes.append((poly, int(seg.order), float(piece_w)))
+            weight_shapes.append((poly, int(seg.order), float(piece_w),
+                                  float(getattr(seg, "depth_m", None) or 0.0)))
 
     # Burn larger rivers LAST so they win (rasterize is last-write per pixel).
     order_sort = np.asarray(sorted(
@@ -1336,6 +1341,7 @@ def rasterize_water(
         key=lambda i: (weight_shapes[i][2], weight_shapes[i][1], i)), dtype=int)
     weight_arr = np.zeros(shape, dtype=np.uint8)
     width_arr = np.zeros(shape, dtype=np.float32)
+    depth_arr = np.zeros(shape, dtype=np.float32)
     if len(order_sort):
         w_sorted = [(weight_shapes[i][0], weight_shapes[i][1]) for i in order_sort]
         width_sorted = [(weight_shapes[i][0], weight_shapes[i][2]) for i in order_sort]
@@ -1343,6 +1349,10 @@ def rasterize_water(
                   all_touched=all_touched_rivers, merge_alg=_replace())
         rasterize(width_sorted, out=width_arr, transform=transform,
                   all_touched=all_touched_rivers, merge_alg=_replace())
+        if any(weight_shapes[i][3] > 0 for i in order_sort):
+            depth_sorted = [(weight_shapes[i][0], weight_shapes[i][3]) for i in order_sort]
+            rasterize(depth_sorted, out=depth_arr, transform=transform,
+                      all_touched=all_touched_rivers, merge_alg=_replace())
 
     type_arr = np.where(weight_arr > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
 
@@ -1410,7 +1420,8 @@ def rasterize_water(
 
     return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table,
                      weight_raw=weight_raw, lake_island=island_mask,
-                     width_m=width_arr)
+                     width_m=width_arr,
+                     depth_m=depth_arr if depth_arr.any() else None)
 
 
 def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
@@ -1425,7 +1436,8 @@ def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
     """
     feats = WaterFeatures(rivers=[RiverSeg(
         xy=s.xy, order=int(s.order), width_m=float(s.width_m),
-        vertex_width_m=getattr(s, "vertex_width_m", None)) for s in segments])
+        vertex_width_m=getattr(s, "vertex_width_m", None),
+        depth_m=getattr(s, "depth_m", None)) for s in segments])
     river_only = rasterize_water(
         plan, feats, all_touched_rivers=all_touched_rivers,
         fill_lake_holes=False, clip_water=clip_water)
@@ -1436,6 +1448,9 @@ def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
     wg.weight[~lake] = river_only.weight_raw[~lake]
     wg.width_m = river_only.width_m
     wg.width_m[lake] = 0.0
+    wg.depth_m = river_only.depth_m
+    if wg.depth_m is not None:
+        wg.depth_m[lake] = 0.0
 
 
 def _replace():

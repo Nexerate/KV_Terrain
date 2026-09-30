@@ -189,6 +189,8 @@ def run_process(
     shores = None
     width_params = None
     width_report: dict = {}
+    river_depth_model = "discharge"
+    depth_by_order_compat = None
     snap_report: dict = {}
     emit_geojson = False
     hier = None
@@ -257,6 +259,12 @@ def run_process(
             opts.pop("bathymetry", None)
         lake_snap_px = int(opts.pop("lake_snap_px", water.DEFAULT_LAKE_SNAP_PX))
         depth_scale = float(opts.pop("river_depth_scale", 1.0))
+        # How deep a river channel is: from its modelled discharge (default), or
+        # the legacy table by stream order.
+        river_depth_model = str(opts.pop("river_depth_model", "discharge"))
+        if river_depth_model not in ("discharge", "order"):
+            raise ValueError("river_depth_model must be 'discharge' or 'order', "
+                             f"not {river_depth_model!r}")
         bank_tol_m = float(opts.pop("river_bank_tolerance_m",
                                     bathymetry.DEFAULT_BANK_TOLERANCE_M))
         ocean_level_m = float(opts.pop("ocean_level_m", waterid.DEFAULT_OCEAN_LEVEL_M))
@@ -352,7 +360,8 @@ def run_process(
             vertex_stride_m=vertex_stride_m, progress=stages.within)
         hydrology_report = rivernet.assign_discharge_and_width(
             traced, effective_runoff_m_per_year=runoff_m_per_year,
-            width_scale=raster_opts.get("width_scale", 1.0))
+            width_scale=raster_opts.get("width_scale", 1.0),
+            depth_from_q=(river_depth_model == "discharge"))
         # 2'. The VISUAL width per vertex: N50's river areas and width classes where
         #     the dataset has them, the modelled width elsewhere (see riverwidth).
         #     The hydraulic width stays on the segment for rivers.bin.
@@ -421,6 +430,7 @@ def run_process(
                 width_by_order=raster_opts.get("width_by_order"),
                 width_scale=raster_opts.get("width_scale", 1.0),
                 width_m=water_leaf.width_m,
+                depth_m=water_leaf.depth_m,
             )
 
             if downhill_bed:
@@ -587,6 +597,31 @@ def run_process(
             "max_m": rivernet.DEFAULT_MAX_WIDTH_M,
             "scale": raster_opts.get("width_scale", 1.0),
         }
+        if river_depth_model == "discharge":
+            river_net.report["depth_model"] = {
+                "formula": "depth_m = clamp(c * discharge_m3_s^f, min_m, max_m) * scale",
+                "quantity": "channel carve depth below the river's water level",
+                "units": "metres",
+                "c": rivernet.DEFAULT_DEPTH_COEFFICIENT,
+                "f": rivernet.DEFAULT_DEPTH_EXPONENT,
+                "min_m": rivernet.DEFAULT_MIN_DEPTH_M,
+                "max_m": rivernet.DEFAULT_MAX_DEPTH_M,
+                "scale": depth_scale,
+                "note": "f equals the runtime's DEPTH_EXPONENT (0.4). "
+                        "water_surface.river_carve_depth_by_order_m now holds the "
+                        "median of this depth per stream order, for readers that "
+                        "still look depth up by order.",
+            }
+            by_order: dict = {}
+            for s in traced.segments:
+                if s.depth_m:
+                    by_order.setdefault(min(max(int(s.order), 1), 8), []).append(s.depth_m)
+            depth_by_order_compat = {
+                str(o): round(float(np.median(by_order[o])) * depth_scale, 3)
+                if o in by_order else round(rivernet.DEFAULT_MIN_DEPTH_M * depth_scale, 3)
+                for o in range(1, 9)}
+        else:
+            depth_by_order_compat = None
         del leaf_uncarved, leaf_bed_uncarved, bed_target, river_surf_measured, shaped_profiles
 
         # 7. THE DEPRESSION HIERARCHY, on the heights exactly as they will be
@@ -618,6 +653,7 @@ def run_process(
         water_params = {
             "river_width_scale": raster_opts.get("width_scale", 1.0),
             "river_depth_scale": depth_scale,
+            "river_depth_model": river_depth_model,
             "river_bank_tolerance_m": bank_tol_m,
             "river_vertex_stride_m": vertex_stride_m,
             "river_effective_runoff_m_per_year": runoff_m_per_year,
@@ -717,6 +753,9 @@ def run_process(
         wsurf["lake_levels"] = level_report
         wsurf["discharge"] = river_net.report.get("hydrology", {})
         wsurf["width_model"] = river_net.report.get("width_model", {})
+        if depth_by_order_compat is not None:
+            wsurf["river_carve_depth_by_order_m"] = depth_by_order_compat
+            wsurf["depth_model"] = river_net.report.get("depth_model", {})
         wsurf["visual_widths"] = {
             **width_report,
             "dataset_has_n50": n50_layer is not None,

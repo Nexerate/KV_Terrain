@@ -98,7 +98,7 @@ def test_an_outlet_is_held_by_a_riffle_on_the_river():
     crest = LEVEL - 2.0 + 0.1
     assert np.allclose(out[up], crest)
     assert abs(_highest_on_the_way_out(out, lake) - crest) < 1e-4
-    assert rep["outlets_opened"] == 1 and rep["outlets_kept_shut"] == 0
+    assert rep["outlets_opened"] == 1 and rep["outlets_kept_shut"] == {}
     (r, c, lvl), = raised
     assert lvl == LEVEL and set(zip(r, c)) >= set(zip(*np.nonzero(up)))
 
@@ -120,7 +120,7 @@ def test_an_outlet_stays_shut_when_the_lake_has_no_room_for_a_riffle():
         return np.where(r < 5, 3.0, np.where(r < 8, 0.05, 1.0))
     plan, bed, typ, lake_id, surf, seg, lake, ring = _scene(depth=depth)
     out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
-    assert rep["outlets_kept_shut"] == 1
+    assert rep["outlets_kept_shut"] == {"no_room": 1}
     south_ring = ring & (np.arange(N)[:, None] > C)
     assert np.array_equal(out[south_ring], bed[south_ring])
     assert not (out > bed).any()
@@ -162,3 +162,17 @@ def test_mouths_can_be_switched_off():
     plan, bed, typ, lake_id, surf, seg, lake, ring = _scene()
     out, rep = _carve(plan, bed, typ, lake_id, surf, seg, enabled=False)
     assert np.array_equal(out, bed) and rep["carved"] == 0
+
+
+def test_an_outlet_stays_shut_where_its_banks_stand_below_the_riffle():
+    # The ground either side of the outlet river lies below where the riffle must
+    # stand: the lake would run round it, so the sill holds it instead.
+    plan, bed, typ, lake_id, surf, seg, lake, ring = _scene()
+    yy, xx = np.mgrid[0:N, 0:N]
+    banks = (typ == water.TYPE_LAND) & (np.abs(xx - C) <= 3) & (yy > C + 28) & (yy < C + 36)
+    bed[banks] = LEVEL - 2.5
+    out, rep = _carve(plan, bed, typ, lake_id, surf, seg)
+    assert rep["outlets_kept_shut"] == {"low_banks": 1}
+    south_ring = ring & (np.arange(N)[:, None] > C)
+    assert np.array_equal(out[south_ring], bed[south_ring])
+    assert not (out > bed).any()

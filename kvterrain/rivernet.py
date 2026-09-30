@@ -70,7 +70,7 @@ import numpy as np
 from . import core
 from . import water as kvwater
 from . import waterid as kvid
-from .bathymetry import DEFAULT_RIVER_DEPTH_BY_ORDER, depth_for_order
+from .bathymetry import DEFAULT_RIVER_DEPTH_BY_ORDER, depth_for_order, segment_depth
 from .watersurface import _fill_nan_1d, _bresenham_path
 
 RIVERS_BIN_FILE = "rivers.bin"
@@ -93,6 +93,17 @@ WIDTHS_VERSION = 1
 # explicit effective-runoff assumption rather than an unlabeled rainfall knob.
 DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR = 1.0
 SECONDS_PER_MEAN_YEAR = 365.25 * 24.0 * 60.0 * 60.0
+
+# Channel depth from discharge, the depth half of the same hydraulic geometry
+# (Leopold & Maddock 1953: depth ~ Q^0.4, which is the runtime's DEPTH_EXPONENT):
+# depth = clamp(c * Q^f). It replaced a table by stream order (1.5 m for a
+# headwater stream to 11 m for an order-8 trunk) that made a 6 m wide river 5.5 m
+# deep and a 21 m wide one 9 m (owner, 2026-09-30: "too deep to be realistic").
+# The floor keeps the smallest streams reading as water.
+DEFAULT_DEPTH_COEFFICIENT = 0.3
+DEFAULT_DEPTH_EXPONENT = 0.4
+DEFAULT_MIN_DEPTH_M = 0.5
+DEFAULT_MAX_DEPTH_M = 4.0
 
 # Hydraulic geometry shared with the runtime: full width = clamp(a * Q^b).
 DEFAULT_WIDTH_COEFFICIENT = 8.0
@@ -330,6 +341,8 @@ class RiverSegment:
     # The VISUAL full width per vertex (`riverwidth`): N50 where it knows, else
     # width_m. None until set. `width_m` stays the hydraulic width in rivers.bin.
     vertex_width_m: Optional[np.ndarray] = None
+    # Modelled channel depth from discharge (unscaled); None = the order table.
+    depth_m: Optional[float] = None
     node_id: int = NO_HIERARCHY_NODE
     local_catchment_m2: float = 0.0
     accumulated_catchment_m2: float = 0.0
@@ -511,6 +524,18 @@ def width_from_discharge(discharge_m3_s, *,
     return width
 
 
+def depth_from_discharge(discharge_m3_s, *,
+                         coefficient: float = DEFAULT_DEPTH_COEFFICIENT,
+                         exponent: float = DEFAULT_DEPTH_EXPONENT,
+                         min_depth_m: float = DEFAULT_MIN_DEPTH_M,
+                         max_depth_m: float = DEFAULT_MAX_DEPTH_M):
+    """Modelled channel depth in metres (before `--river-depth-scale`) from
+    discharge in m³/s."""
+    q = np.maximum(np.asarray(discharge_m3_s, dtype=np.float64), 0.0)
+    depth = float(coefficient) * np.power(q, float(exponent))
+    return np.clip(depth, float(min_depth_m), float(max_depth_m))
+
+
 def assign_discharge_and_width(
     traced: TracedNetwork,
     *,
@@ -520,8 +545,12 @@ def assign_discharge_and_width(
     min_width_m: float = DEFAULT_MIN_WIDTH_M,
     max_width_m: float = DEFAULT_MAX_WIDTH_M,
     width_scale: float = 1.0,
+    depth_from_q: bool = True,
 ) -> dict:
     """Put modelled mean-annual Q and its matching hydraulic width on the graph.
+
+    With `depth_from_q` each segment also gets `depth_m` from `depth_from_discharge`
+    (unscaled); without it `depth_m` stays None and the legacy order table rules.
 
     ELVIS carries each local REGINE unit's area, not accumulated segment
     catchments.  A unit's area is therefore apportioned once across its emitted
@@ -610,6 +639,8 @@ def assign_discharge_and_width(
             s.discharge_m3_s, coefficient=width_coefficient,
             exponent=width_exponent, min_width_m=min_width_m,
             max_width_m=max_width_m, scale=width_scale)))
+        s.depth_m = (float(np.float32(depth_from_discharge(s.discharge_m3_s)))
+                     if depth_from_q else None)
 
     sinks = [s for s in segments if s.downstream is None or s.downstream not in by_id]
     sink_area = float(sum(accumulated[s.seg_id] for s in sinks) +
@@ -638,6 +669,8 @@ def assign_discharge_and_width(
         "width_min_m": float(widths.min()) if widths.size else 0.0,
         "width_median_m": float(np.median(widths)) if widths.size else 0.0,
         "width_max_m": float(widths.max()) if widths.size else 0.0,
+        "depth_median_m": (float(np.median([s.depth_m for s in segments]))
+                           if segments and depth_from_q else None),
         "method": "For each vassdragsnr, the median finite positive NVE REGINE "
                   "unit area is apportioned once across "
                   "its emitted ELVIS segments by in-export polyline length, then "
@@ -734,7 +767,7 @@ def build_river_network(
         # Fallback surface: the trench floor plus the depth that was carved to
         # make it, i.e. the ground the channel was cut from. Overwritten below
         # wherever the raster actually carries a surface at this vertex.
-        level = z + depth_for_order(s.order, depth_by_order, depth_scale)
+        level = z + segment_depth(s, depth_by_order, depth_scale)
 
         if shaped_profiles is not None and s.seg_id in shaped_profiles:
             shaped = np.asarray(shaped_profiles[s.seg_id][2], dtype=np.float64)
@@ -1436,6 +1469,8 @@ def export_river_network(
     if hydro:
         man["rivers"]["discharge"] = hydro
         man["rivers"]["width_model"] = net.report["width_model"]
+        if "depth_model" in net.report:
+            man["rivers"]["depth_model"] = net.report["depth_model"]
         man["rivers"]["hierarchy_attachment"] = net.report.get(
             "hierarchy_attachment", {})
     if emit_geojson:

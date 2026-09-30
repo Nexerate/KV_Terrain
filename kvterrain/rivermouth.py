@@ -73,8 +73,10 @@ and runtime alike). So an outlet is shaped for that reading:
     process.py writes into the surface raster and the polylines), so the head is
     exactly level - crest.
 
-An outlet with no room for a riffle (crest within `min_riffle_m` of the level)
-keeps its sill. The lake matching in the water audit (and the runtime's) floods a
+An outlet keeps its sill where there is no room for a riffle (crest within
+`min_riffle_m` of the level), or where the banks beside the riffle stand lower
+than it would have to — a lake whose authored level stands well above its scanned
+water, whose outlet valley the lake would otherwise run round it into. The lake matching in the water audit (and the runtime's) floods a
 lake's candidate node to spill + head, not the bare spill: a lake shallower than
 its outlet river stands wholly above its riffle and would otherwise match nothing.
 
@@ -216,8 +218,7 @@ def find_mouths(plan, segments, bed: np.ndarray, lake_surface: np.ndarray, *,
                 river = [m - step * k for k in (1, 2, 3) if 0 <= m - step * k < n]
                 d = level - bed[ri[river], ci[river]]
                 d = d[np.isfinite(d)]
-                order_depth = bathymetry.depth_for_order(int(s.order), table,
-                                                         depth_scale)
+                order_depth = bathymetry.segment_depth(s, table, depth_scale)
                 capped = False
                 if kind == INFLOW:
                     # The river's depth over the three vertices before the mouth.
@@ -376,7 +377,7 @@ def _outlet_riffles(bed, outlets, *, water_type, lake_id, island, p, report,
     for o in outlets:
         by_lake[o[0].lake_id].append(o)
     depths = []
-    shut = 0
+    shut: dict = {}
     for lid, outs in by_lake.items():
         sl = slices[lid - 1] if lid - 1 < len(slices) else None
         if sl is None:
@@ -418,15 +419,28 @@ def _outlet_riffles(bed, outlets, *, water_type, lake_id, island, p, report,
             top = max(level - d_funnel + 2.0 * p.outlet_margin_m, crest)
             if top > level - p.min_riffle_m:
                 bed[orr, occ] = old            # no room for a riffle: stay shut
-                shut += 1
+                shut["no_room"] = shut.get("no_room", 0) + 1
                 continue
             # The river samples beside this outlet's throat carry the riffle.
-            wr0, wr1 = max(int(orr.min()) - 2, 0), min(int(orr.max()) + 3, H)
-            wc0, wc1 = max(int(occ.min()) - 2, 0), min(int(occ.max()) + 3, W)
+            wr0, wr1 = max(int(orr.min()) - 3, 0), min(int(orr.max()) + 4, H)
+            wc0, wc1 = max(int(occ.min()) - 3, 0), min(int(occ.max()) + 4, W)
             m = np.zeros((wr1 - wr0, wc1 - wc0), bool)
             m[orr - wr0, occ - wc0] = True
-            near = (binary_dilation(m, structure=np.ones((3, 3), bool))
+            k8 = np.ones((3, 3), bool)
+            near = (binary_dilation(m, structure=k8)
                     & (water_type[wr0:wr1, wc0:wc1] == kvwater.TYPE_RIVER))
+            # The riffle must stand below the banks beside it, or the lake runs
+            # round it over dry ground. Where the scan puts those banks lower than
+            # the riffle has to be (a lake whose authored level stands well above
+            # its scanned water), the outlet stays shut: its sill holds the lake.
+            banks = (binary_dilation(near | m, structure=k8)
+                     & (water_type[wr0:wr1, wc0:wc1] == kvwater.TYPE_LAND))
+            if banks.any():
+                bank_min = float(np.nanmin(bed[wr0:wr1, wc0:wc1][banks]))
+                if bank_min - p.outlet_margin_m < top:
+                    bed[orr, occ] = old
+                    shut["low_banks"] = shut.get("low_banks", 0) + 1
+                    continue
             rr, cc = np.nonzero(near)
             rr, cc = rr + wr0, cc + wc0
             low = bed[rr, cc] < top

@@ -70,6 +70,7 @@ def _water_opts(a) -> dict:
         "river_mouths": a.river_mouths,
         "lake_shoreline": a.lake_shoreline,
         "river_n50_widths": a.river_n50_widths,
+        "river_depth_model": a.river_depth_model,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
@@ -707,6 +708,12 @@ def _add_process_args(p):
                         "inflows, a funnel and a riffle at outlets that holds the "
                         "lake by the river's depth (default: on; terrain model "
                         "only)")
+    p.add_argument("--river-depth-model", choices=["discharge", "order"],
+                   default="discharge", dest="river_depth_model",
+                   help="how deep a river channel is carved: 'discharge' (default) "
+                        "0.3*Q^0.4 m clamped to 0.5-4 m, the depth half of the width "
+                        "model; 'order' is the legacy table by stream order (1.5 m to "
+                        "11 m). Both times --river-depth-scale")
     p.add_argument("--river-n50-widths", action=argparse.BooleanOptionalAction,
                    default=True, dest="river_n50_widths",
                    help="draw rivers at Kartverket N50's widths where the dataset "

@@ -153,6 +153,15 @@ def depth_for_order(order: int, table: dict, scale: float = 1.0) -> float:
     return float(table[o]) * float(scale)
 
 
+def segment_depth(seg, table: dict, scale: float = 1.0) -> float:
+    """A river segment's carve depth: its discharge depth (`depth_m`) where it has
+    one, else the order table's, scaled."""
+    d = getattr(seg, "depth_m", None)
+    if d is not None and np.isfinite(d) and d > 0:
+        return float(d) * float(scale)
+    return depth_for_order(int(seg.order), table, scale)
+
+
 def channel_half_width_m(order: np.ndarray, mask: np.ndarray, spacing_m: float,
                          width_by_order: dict | None = None,
                          width_scale: float = 1.0,
@@ -852,13 +861,16 @@ def carve_river_beds(
     width_by_order: dict | None = None,
     width_scale: float = 1.0,
     width_m: np.ndarray | None = None,
+    depth_m: np.ndarray | None = None,
     bed_target: np.ndarray | None = None,
     surface_target: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Cut a trench under every river pixel: deepest along the channel's middle,
     feathering to nearly nothing at the banks, with the maximum depth set by that
-    pixel's Strahler order (`DEFAULT_RIVER_DEPTH_BY_ORDER`, scaled).
+    pixel's Strahler order (`DEFAULT_RIVER_DEPTH_BY_ORDER`, scaled) — or, where
+    `depth_m` is given (the per-pixel discharge depth, `rivernet.depth_from_discharge`),
+    by that, scaled.
 
     WHY THIS EXISTS. The river water surface is the terrain height under the
     channel (`watersurface.river_surface_moh`), and the runtime derives
@@ -948,6 +960,11 @@ def carve_river_beds(
     for o in np.unique(orders[is_river]):
         depth_max[is_river & (orders == o)] = depth_for_order(
             int(o), depth_by_order, depth_scale)
+    if depth_m is not None:
+        # Per-pixel discharge depth (WaterGrid.depth_m) wins where it is set.
+        dm = np.asarray(depth_m, dtype=np.float32)
+        have = is_river & (dm > 0)
+        depth_max[have] = dm[have] * float(depth_scale)
     half_w = channel_half_width_m(orders, is_river, spacing_m,
                                   width_by_order, width_scale, width_m=width_m)
 

@@ -255,7 +255,7 @@ default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
 `--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
 `--(no-)lake-surveys`, `--(no-)river-mouths`, `--(no-)lake-shoreline`,
-`--(no-)river-n50-widths`, the ramp model's `--lake-max-depth` and
+`--(no-)river-n50-widths`, `--river-depth-model`, the ramp model's `--lake-max-depth` and
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
@@ -696,8 +696,13 @@ and leaves the water surface where the ground is:
   `--lake-shore-slope` (1.0 m per m) down to `--lake-max-depth` (20 m), flat from
   there inward, sized only so the renderer reads the water as opaque.
 - **Rivers** get a trench under the channel, deepest along the middle and feathering
-  out at the banks, scaled by stream order (1.5 m for a headwater stream to 11 m for
-  an order-8 trunk, × `--river-depth-scale`) and by the modelled channel width. It
+  out at the banks, as deep as the river's modelled discharge says —
+  `0.3 · Q^0.4` m, clamped to 0.5–4 m, × `--river-depth-scale` (the depth half of
+  the hydraulic geometry whose width half the runtime shares; `f = 0.4` is the
+  runtime's own depth exponent) — and as wide as its channel. On Lierne nearly
+  every river is 0.5–0.7 m deep. `--river-depth-model order` restores the legacy
+  table by stream order (1.5 m for a headwater stream to 11 m for an order-8 trunk),
+  which made a 6 m wide river 5.5 m deep. It
   is cut in full only within `--river-bank-tolerance` of the water level and tapers
   to nothing at twice that, so terrain that will never hold water — a bank, a cliff
   face the buffer lapped onto — is left alone rather than notched.

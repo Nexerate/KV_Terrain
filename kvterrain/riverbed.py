@@ -519,7 +519,7 @@ def downhill_profiles(
         row, col = rivernet.world_to_grid(plan, s.xy[:, 0], s.xy[:, 1])
         g = rivernet._fill_nan_1d(rivernet._bilinear(ground, row, col))
         lvl = g
-        depth = kvbathy.depth_for_order(s.order, depth_by_order, depth_scale)
+        depth = kvbathy.segment_depth(s, depth_by_order, depth_scale)
         bed = g - depth
         half_w = _segment_half_width(
             s.order, plan.spacing_m, width_by_order, width_scale, s.width_m)
@@ -608,8 +608,7 @@ def downhill_profiles(
                 if lake_level is None:
                     continue
                 first = spans[si - 1][1] + 1 if si > 0 else 0
-                depth = kvbathy.depth_for_order(
-                    s.order, depth_by_order, depth_scale)
+                depth = kvbathy.segment_depth(s, depth_by_order, depth_scale)
                 reached_first = _grade_tail(
                     lm, ceiling, s.xy, first, a - 1, lake_level,
                     half_widths[sid] + plan.spacing_m, confluence_grade, depth,
@@ -636,8 +635,7 @@ def downhill_profiles(
                     if b < u.n - 1:
                         first = max(first, b + 1)
                 touch = half_widths[sid] + half_widths[uid] + plan.spacing_m
-                depth = kvbathy.depth_for_order(
-                    u.order, depth_by_order, depth_scale)
+                depth = kvbathy.segment_depth(u, depth_by_order, depth_scale)
                 reached_first = _grade_tail(
                     ulm, ceilings[uid], u.xy, first, u.n - 1,
                     main_level, touch, confluence_grade, depth,
@@ -654,8 +652,7 @@ def downhill_profiles(
                 if sid not in out:
                     continue
                 s = by_id[sid]
-                depth = kvbathy.depth_for_order(
-                    s.order, depth_by_order, depth_scale)
+                depth = kvbathy.segment_depth(s, depth_by_order, depth_scale)
                 tilted = 0
                 if sid not in backwater_at_start and not s.lake_spans:
                     tilted = _tilt_flat_runs(
@@ -710,8 +707,7 @@ def downhill_profiles(
                         continue
                     before = ulm.copy()
                     touch = half_widths[sid] + half_widths[uid] + plan.spacing_m
-                    depth = kvbathy.depth_for_order(
-                        u.order, depth_by_order, depth_scale)
+                    depth = kvbathy.segment_depth(u, depth_by_order, depth_scale)
                     dynamic_taper = max(
                         GRADE_TAPER_VERTICES,
                         int(np.ceil(depth / max(
@@ -748,7 +744,7 @@ def downhill_profiles(
 
         # Tie-ins and fall ramps changed surfaces after the first bed calculation.
         for sid, values in out.items():
-            depth = kvbathy.depth_for_order(by_id[sid].order, depth_by_order, depth_scale)
+            depth = kvbathy.segment_depth(by_id[sid], depth_by_order, depth_scale)
             out[sid] = (values[0], values[1], values[2], values[2] - depth)
 
     no_bank = sum(int((~np.isfinite(ceilings[s.seg_id])).sum()) for s in segs)
@@ -903,6 +899,10 @@ def downhill_river_bed(
     for o in np.unique(orders[is_river]):
         depth_px[is_river & (orders == o)] = kvbathy.depth_for_order(
             int(o), depth_by_order, depth_scale)
+    if getattr(wg, "depth_m", None) is not None:
+        dm = np.asarray(wg.depth_m, dtype=np.float32)
+        have = is_river & (dm > 0)
+        depth_px[have] = dm[have] * float(depth_scale)
 
     have = near & np.isfinite(level_out)
     changed = have & (np.abs(spread_l - level_out) > 1e-6)
