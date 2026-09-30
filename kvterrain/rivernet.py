@@ -704,6 +704,11 @@ def attach_hierarchy_nodes(plan: core.GridPlan, net: RiverNetwork, hier) -> dict
     return counts
 
 
+# A vertex level and the exported surface at its sample further apart than this
+# belong to different rivers sharing the sample.
+SAME_RIVER_M = 2.0
+
+
 def build_river_network(
     plan: core.GridPlan,
     feats: kvwater.WaterFeatures,
@@ -764,6 +769,7 @@ def build_river_network(
     ws = None if water_surface is None else np.asarray(water_surface)
     dg = None if drawn_ground is None else np.asarray(drawn_ground)
     raised_to_surface = 0
+    matched_to_surface = 0
 
     for s in segments:
         xy = s.xy
@@ -830,6 +836,28 @@ def build_river_network(
             if low.any():
                 level[low] = ras[low]
                 raised_to_surface += int(low.sum())
+            # And on the channel itself the vertex carries the surface the terrain
+            # was carved to. Each sample holds the lowest vertex that lands in it,
+            # so on a steep stream the vertex above stood up to a step higher and
+            # the runtime drew it that much deeper than the preview (26k vertices
+            # over 0.5 m on Lierne). Only ever lowered, and walked from downstream
+            # up so a vertex never drops below the one after it: the sample's value
+            # can come from a vertex further on, or from another segment. A gap
+            # over SAME_RIVER_M is another river sharing the sample.
+            same = (open_vertex & (wg.type[ri, ci] == kvwater.TYPE_RIVER)
+                    & np.isfinite(ras) & (ras < level - 1e-6)
+                    & (level - ras <= SAME_RIVER_M))
+            if same.any():
+                before = level.copy()
+                nxt = np.inf
+                for i in range(s.n - 1, -1, -1):
+                    if not open_vertex[i]:
+                        nxt = np.inf
+                        continue
+                    if same[i]:
+                        level[i] = min(level[i], max(ras[i], nxt))
+                    nxt = level[i]
+                matched_to_surface += int((level < before - 1e-6).sum())
 
         s.z = z.astype(np.float32)
         s.level = level.astype(np.float32)
@@ -841,6 +869,7 @@ def build_river_network(
         "segments": len(segments),
         "vertices": int(sum(s.n for s in segments)),
         "levels_raised_to_surface_above_ground": int(raised_to_surface),
+        "levels_matched_to_surface": int(matched_to_surface),
         "vertex_stride_m": stride,
         "junctions": len(junctions),
         "lakes": len(lakes),

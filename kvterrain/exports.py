@@ -730,7 +730,19 @@ def check_hierarchy(exp: Export) -> dict:
         expected_head = np.maximum(expected_head, 0.0).astype(np.float32)
         probe = nodes.copy()
         probe["outflow_head_m"] = expected_head
-        expected_head, _capped = H.capped_heads(probe)
+        own = None
+        lakes_file = (exp.manifest.get("water_vector", {}).get("lakes", {})
+                      .get("file"))
+        if lakes_file and os.path.exists(os.path.join(exp.root, lakes_file)):
+            with open(os.path.join(exp.root, lakes_file)) as f:
+                rows = json.load(f)
+            rows = rows.get("lakes", rows)
+            levels = {int(r["lake_id"]): r.get("authored_level_m") for r in rows
+                      if "lake_id" in r}
+            lake_of = np.where(water_id >= WID.LAKE_ID_BASE,
+                               water_id.astype(np.int64) - WID.LAKE_ID_BASE, 0)
+            own = H.lake_sample_levels(nodes, lflat, lake_of, levels)
+        expected_head, _capped = H.capped_heads(probe, own)
         actual_head = nodes["outflow_head_m"]
         exact = actual_head.view("<u4") == expected_head.view("<u4")
         mismatch = ~exact

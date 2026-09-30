@@ -537,12 +537,38 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
     nodes["outflow_head_m"] = np.maximum(head, 0.0).astype(np.float32)
 
 
-def lowest_authored_level_below(nodes: np.ndarray) -> np.ndarray:
-    """Per node, the lowest `authored_level_m` of any authored lake in its subtree
-    (itself excluded), +inf where there is none. Relies on a non-root parent's id
-    being greater than its children's."""
+def lake_sample_levels(nodes: np.ndarray, labels_flat: np.ndarray,
+                       lake_of_sample: np.ndarray, level_by_lake: dict) -> np.ndarray:
+    """Per node, the lowest level of the authored lakes whose samples it labels
+    itself (+inf where none). `lake_of_sample` is the local lake id per sample, 0
+    off the lakes: `water_id - 16` where `water_id >= 16`."""
     n = nodes.shape[0]
     low = np.full(n, np.inf)
+    ids = np.asarray(lake_of_sample).ravel()
+    m = ids > 0
+    if not m.any() or not level_by_lake:
+        return low
+    table = np.full(int(max(int(ids[m].max()), max(level_by_lake))) + 1, np.nan)
+    for lid, lv in level_by_lake.items():
+        if lv is not None and np.isfinite(lv):
+            table[int(lid)] = float(lv)
+    lv = table[ids[m].astype(np.int64)]
+    lab = np.asarray(labels_flat).ravel()[m].astype(np.int64)
+    ok = np.isfinite(lv) & (lab > 0) & (lab < n)
+    np.minimum.at(low, lab[ok], lv[ok])
+    return low
+
+
+def lowest_authored_level_below(nodes: np.ndarray,
+                                own: Optional[np.ndarray] = None) -> np.ndarray:
+    """Per node, the lowest level of an authored lake inside its subtree: of any
+    authored lake NODE below it, and of any authored lake whose samples it or its
+    descendants label (`own`, from `lake_sample_levels`); +inf where none. A lake's
+    samples can lie in a basin that is not the lake's node's ancestor, and a basin
+    beside a lake's outlet can hold some of them. Relies on a non-root parent's id
+    being greater than its children's."""
+    n = nodes.shape[0]
+    low = np.full(n, np.inf) if own is None else np.asarray(own, np.float64).copy()
     parent = nodes["parent"].astype(np.int64)
     authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
     level = nodes["authored_level_m"].astype(np.float64)
@@ -558,11 +584,12 @@ def lowest_authored_level_below(nodes: np.ndarray) -> np.ndarray:
     return low
 
 
-def capped_heads(nodes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def capped_heads(nodes: np.ndarray, own: Optional[np.ndarray] = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
     """(head, capped): `outflow_head_m` with every node that is not an authored lake
     held no higher than the lowest authored lake inside it, and where that bit."""
     head = nodes["outflow_head_m"].astype(np.float64)
-    low = lowest_authored_level_below(nodes)
+    low = lowest_authored_level_below(nodes, own)
     authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
     room = np.maximum(low - nodes["spill_m"].astype(np.float64), 0.0)
     capped = (~authored) & np.isfinite(low) & (head > room)
@@ -570,7 +597,8 @@ def capped_heads(nodes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return head, capped
 
 
-def cap_heads_below_lakes(h: Hierarchy) -> dict:
+def cap_heads_below_lakes(h: Hierarchy, lake_of_sample: Optional[np.ndarray] = None,
+                          level_by_lake: Optional[dict] = None) -> dict:
     """
     A node that is not an authored lake may not hold water above an authored lake
     inside it: the runtime fills a node's whole subtree to the highest level on its
@@ -583,9 +611,15 @@ def cap_heads_below_lakes(h: Hierarchy) -> dict:
     ancestors then held up to 2.9 m above the lakes below them, and the runtime
     drew 392 lakes too high. Run after the lakes are matched (FLAG_AUTHORED_LAKE).
     Marks every capped node FLAG_HEAD_CAPPED.
+
+    With `lake_of_sample` and `level_by_lake`, a lake's own samples count wherever
+    they are labelled, not only under the lake's node: that left 24.9k lake samples
+    drawn high in basins beside their lakes (runtime re-audit, 2026-09-30).
     """
     nodes = h.nodes
-    head, capped = capped_heads(nodes)
+    own = (lake_sample_levels(nodes, h.labels, lake_of_sample, level_by_lake)
+           if lake_of_sample is not None and level_by_lake else None)
+    head, capped = capped_heads(nodes, own)
     before = nodes["outflow_head_m"].astype(np.float64)
     nodes["outflow_head_m"] = head
     nodes["flags"][capped] |= FLAG_HEAD_CAPPED

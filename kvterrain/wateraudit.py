@@ -637,7 +637,9 @@ def run_audit(plan: core.GridPlan, h: H.Hierarchy, codes: np.ndarray,
               if j.kind == rivernet.JUNCTION_INFLOW}
     lakes = audit_lakes(plan, h, codes, wg, inflow_lakes=inflow, tin=tin, tout=tout)
     if river_surface is not None:
-        head_report = H.cap_heads_below_lakes(h)
+        head_report = H.cap_heads_below_lakes(
+            h, np.where(wg.type == kvwater.TYPE_LAKE, wg.lake_id, 0),
+            {lid: wg.lake_level(info) for lid, info in (wg.lake_table or {}).items()})
     if river_net is not None and river_net.segments:
         rivers, walked, minor_pits = audit_rivers(plan, h, codes, wg,
                                                   river_net.segments)

@@ -152,16 +152,42 @@ Runtime change needed: wherever a head is recomputed for a node that is not an
 authored lake (`DepressionEditor.OutflowHead` on rebuilt nodes), apply the same cap:
 
 ```
-lowest(u) = min authored_level_m over authored lakes strictly inside u's subtree
+lowest(u) = min of
+    authored_level_m over authored lake NODES strictly inside u's subtree, and
+    authored_level_m (lakes.json) over lakes with a sample (water_id >= 16) that
+    u or a descendant labels (labels.atlas)
 if (!authored(u) && lowest(u) is finite)
     head = min(head, max(lowest(u) - spill_m(u), 0))
 ```
+
+The second term (added after the runtime's re-audit) catches a basin that holds
+some of a lake's samples without being the lake node's ancestor: a basin beside
+the lake, or a small one at its outlet. It left 24.9k lake samples drawn high.
+`hierarchy.lake_sample_levels` and `lowest_authored_level_below` are the reference.
 
 Without it, an edit that rebuilds such a node brings the old head back. Unedited
 nodes need nothing: the level table reads the stored head.
 
 `validate-hierarchy` recomputes heads from `surface.atlas` and applies the same cap
 before comparing.
+
+## Fourth rule (runtime only): cap the whole hold
+
+A head cap cannot help where a node spills on bare ground **above** an authored
+lake inside it with no head at all. The scan's rim there stands higher than
+NVE's level (Kroktjønna, Gristjønnin, Småtjønnin and others: 24.7k lake samples).
+The authored level is taken as right, so the runtime caps the hold itself:
+
+```
+hold(u) = spill_m(u) + head(u)
+if (!authored(u) && lowest(u) is finite)
+    hold(u) = min(hold(u), lowest(u))
+```
+
+The exporter does not open those rims. Most have no mapped outlet river at the
+spill, so opening them would carve channels into terrain where nothing is mapped.
+Nothing in the export changes for this rule. `outflow_head_m` stays the physical
+head (after the third rule), so `validate-hierarchy` needs no change.
 
 ## What does not change
 
