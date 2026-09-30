@@ -22,11 +22,14 @@ interior, within `plane_tol_m`):
     the land around the lake within `shore_band_m` of the outline — the strip where
     outline and scan disagree — it stops being lake (`TYPE_LAND`, no lake id): the
     shoreline is the land's contour at the level, not the outline's staircase.
-    Further in, dry scan that rises `island_min_m` above the level somewhere is an
-    island (`lake_island`), which the bed rises to meet. Lower dry bumps in there
-    are vegetation on a boggy lake, where the laser hit reeds and sedge rather than
-    water (owner, 2026-09-30: a bog lake full of dry holes looks more wrong than a
-    shallow one), and are treated as the plane.
+    Dry scan in the strip not joined to the shore is an island (`lake_island`)
+    where it rises `island_min_m` above the level somewhere, and water otherwise:
+    vegetation on a boggy lake, where the laser hit reeds and sedge (owner,
+    2026-09-30: a bog lake full of dry holes looks more wrong than a shallow one).
+    BEYOND the strip nothing is read from the scan: it is all plane. Kept as
+    scanned, interior noise — waves, flight-strip steps, filled data gaps — stood
+    as shoals 0.35 m under water in 40 m deep lakes and as flat, straight-edged
+    islands hundreds of metres from shore (the owner's first export, 2026-09-30).
   * GROUND, scan < L and not the plane: real ground the scan saw dry (the lake stood
     lower when flown), now under water. Untouched, flooded.
   * PLANE: the scanned water. Only here does the lake bed model build a bed, and it
@@ -71,12 +74,12 @@ class ShoreParams:
     # water, whatever its height. A big lake's water is not one plane: flight
     # strips and wind put patches of it most of a metre off the lake's median.
     flat_tol_m: float = 0.05
-    # Only land this close to the outline can stop being lake: the strip where the
-    # outline and the scan disagree.
+    # Only this strip along the outline — where outline and scan disagree — is
+    # read from the scan (land, ground, islands). Further in everything is plane.
     shore_band_m: float = 15.0
-    # Further in, dry scan is an island only where it stands this far above the
-    # level somewhere; lower bumps are vegetation on a boggy lake (reeds, sedge,
-    # floating mats), and are water.
+    # In the strip, dry scan not joined to the shore is an island only where it
+    # stands this far above the level somewhere (a rock); lower bumps are
+    # vegetation on a boggy lake (reeds, sedge, floating mats), and are water.
     island_min_m: float = 1.0
     # Scanned land outside the outline but below the level joins the lake when
     # the low patch is enclosed within this distance of the outline and no larger
@@ -215,6 +218,15 @@ def split_shores(wg, ground: np.ndarray, *, spacing_m: float = 5.0,
                 sizes = np.bincount(lbl_p.ravel())
                 sizes[0] = 0
                 pl &= sizes[lbl_p] >= p.min_plane_samples
+        # Only the edge strip is read from the scan. Further in, a lake's scan is
+        # its water — waves, flight-strip steps, filled data gaps — and anything
+        # there that is neither flat nor at the plane's height is noise on it, not
+        # ground: kept as scanned it stood as shoals and flat islands out in the
+        # middle of deep lakes (Lierne, 2026-09-30). Real islands are the
+        # outline's holes. So the interior is all plane.
+        from_edge = distance_transform_edt(m | isl) * spacing_m
+        band = from_edge <= p.shore_band_m
+        pl |= m & ~band
         land = m & ~pl & (s >= L)
         gnd = m & ~pl & (s < L)
         # Land joining the shore: connected, through land, to a sample that is not
@@ -233,10 +245,9 @@ def split_shores(wg, ground: np.ndarray, *, spacing_m: float = 5.0,
             lbl2, _ = label(land, structure=K8)
             on_edge = np.unique(lbl2[land & edge])
             to_shore |= land & np.isin(lbl2, on_edge[on_edge > 0])
-        from_edge = distance_transform_edt(m | isl) * spacing_m
-        to_shore &= from_edge <= p.shore_band_m
-        # The rest of the dry scan: an island where it rises clearly out of the
-        # water somewhere, else vegetation on the water, which is water.
+        # The rest of the dry scan in the strip: an island where it rises clearly out
+        # of the water somewhere (a rock off the shore), else vegetation on the
+        # water, which is water.
         rest = land & ~to_shore
         to_island = np.zeros_like(rest)
         wet = np.zeros_like(rest)

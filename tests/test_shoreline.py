@@ -51,12 +51,24 @@ def test_a_plane_above_the_level_is_anchored_below_the_waterline():
     assert np.allclose(sh.anchor[sh.plane], LEVEL - 0.3)
 
 
-def test_scanned_land_inside_the_lake_is_an_island():
+def test_a_rock_off_the_shore_is_an_island():
     wg, ground, outline = _world()
-    ground[C - 1:C + 2, C - 1:C + 2] = LEVEL + 1.0     # a rock the outline missed
-    ground[C, C] = LEVEL + 2.0
+    ground[C, C - 14] = LEVEL + 2.0                     # 10 m off the west shore
+    ground[C, C - 13] = LEVEL + 1.0
     shoreline.split_shores(wg, ground)
-    assert wg.lake_island[C, C] and wg.type[C, C] == water.TYPE_LAKE
+    assert wg.lake_island[C, C - 14] and wg.type[C, C - 14] == water.TYPE_LAKE
+
+
+def test_scan_noise_far_from_shore_is_water():
+    # Out in the lake, a lump of scan above the level and a patch below the plane
+    # (waves, a flight-strip step, a filled gap) are the water's, not ground.
+    wg, ground, outline = _world()
+    ground[C - 1:C + 2, C - 1:C + 2] = LEVEL + 1.0
+    ground[C, C] = LEVEL + 2.0
+    ground[C + 4:C + 7, C + 4:C + 7] = LEVEL - 0.1 + 0.3 * np.arange(3)
+    sh = shoreline.split_shores(wg, ground)
+    assert not wg.lake_island[C - 1:C + 2, C - 1:C + 2].any()
+    assert sh.plane[C - 1:C + 2, C - 1:C + 2].all() and sh.plane[C + 4:C + 7, C + 4:C + 7].all()
 
 
 def test_flat_water_off_the_lakes_median_height_stays_lake():
