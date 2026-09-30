@@ -607,7 +607,8 @@ def run_process(
                 "min_m": rivernet.DEFAULT_MIN_DEPTH_M,
                 "max_m": rivernet.DEFAULT_MAX_DEPTH_M,
                 "scale": depth_scale,
-                "note": "f equals the runtime's DEPTH_EXPONENT (0.4). "
+                "note": "f differs from the runtime's DEPTH_EXPONENT (0.4) on "
+                        "purpose: a steeper curve over this tile's discharge range. "
                         "water_surface.river_carve_depth_by_order_m now holds the "
                         "median of this depth per stream order, for readers that "
                         "still look depth up by order.",

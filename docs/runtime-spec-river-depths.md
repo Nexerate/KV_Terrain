@@ -15,12 +15,15 @@ of the hydraulic geometry whose width half the runtime already shares:
 
 ```
 depth_m = clamp(c * Q^f, min_m, max_m) * scale
-c = 0.3, f = 0.4, min_m = 0.5, max_m = 4.0, scale = --river-depth-scale (1.0)
+c = 2.0, f = 0.3, min_m = 0.5, max_m = 5.0, scale = --river-depth-scale (1.0)
 ```
 
-- `f = 0.4` is the runtime's own `DEPTH_EXPONENT`.
-- On Lierne nearly every river is 0.5–0.7 m deep. The floor keeps small streams
-  reading as water.
+- On Lierne a headwater stream stays at the 0.5 m floor, a lake inlet or outlet
+  (0.1–0.5 m³/s) is 1–1.6 m deep and the largest rivers (about 13 m³/s) about 4 m.
+- `f = 0.3` is not the runtime's `DEPTH_EXPONENT` (0.4). The textbook
+  `0.3 * Q^0.4` was tried first and left nearly every river 0.5–0.8 m deep, since
+  modelled discharge on a 40 km tile stays small. Read `c`, `f`, `min_m`, `max_m`
+  from the manifest rather than hard-coding them.
 
 The manifest carries the model twice, with the same content:
 - `water_vector.rivers.depth_model`
@@ -30,9 +33,10 @@ The manifest carries the model twice, with the same content:
 
 `water_surface.river_carve_depth_by_order_m`, which `RiverWidthModel.DepthByOrderM`
 reads, is still written. It now holds the median modelled depth of each order's
-segments: 0.5 m for orders 1–7 and 0.7 m for order 8 on Lierne. So `DepthM(order)`
+segments. On Lierne that is 0.5, 0.6, 0.9, 1.4, 1.6, 2.7, 2.5 and 3.8 m for orders
+1–8. So `DepthM(order)`
 in `DerivedRiverSystem` already returns depths that match the carved channels.
-Without this, reroutes and springs would have used depths 3–15 times too large.
+Without this, reroutes and springs would have used depths 2–3 times too large.
 
 ## Recommended change
 
@@ -52,6 +56,10 @@ The call sites:
   `pow(pow(D, 1/DEPTH_EXPONENT) + added, DEPTH_EXPONENT)`. With the model this is
   simply `DepthM(CurrentQ(seg, s) + addedQ)`, the same form as the width beside it.
 
+Note the runtime's added-flow formula assumes `DEPTH_EXPONENT = 0.4`. With the
+model it should use the manifest's `f` instead, or better, evaluate `DepthM(q)`
+directly as above.
+
 This makes a river's depth follow its flow the way its width already does. A
 reach that gains water from an edit deepens, and one that loses it gets
 shallower. The order table becomes a fallback for exports without `depth_model`.
@@ -59,8 +67,8 @@ shallower. The order table becomes a fallback for exports without `depth_model`.
 ## How to verify
 
 1. Load a Lierne export from kvterrain at or after this change. `HasDepths` is
-   true, and `DepthM(order)` returns 0.5–0.7 m.
-2. Reroute a river into a dry valley. The derived channel is carved about 0.5–1 m
+   true, and `DepthM(order)` returns 0.5–3.8 m, rising with order.
+2. Reroute a river into a dry valley. The derived channel is carved about 0.5–2 m
    deep, not 2–10 m.
 3. With the recommended change, dig a diversion off a river. The remaining reach's
    depth drops with its flow, and so does the diversion's.

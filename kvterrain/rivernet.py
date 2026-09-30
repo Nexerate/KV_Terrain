@@ -94,16 +94,20 @@ WIDTHS_VERSION = 1
 DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR = 1.0
 SECONDS_PER_MEAN_YEAR = 365.25 * 24.0 * 60.0 * 60.0
 
-# Channel depth from discharge, the depth half of the same hydraulic geometry
-# (Leopold & Maddock 1953: depth ~ Q^0.4, which is the runtime's DEPTH_EXPONENT):
-# depth = clamp(c * Q^f). It replaced a table by stream order (1.5 m for a
-# headwater stream to 11 m for an order-8 trunk) that made a 6 m wide river 5.5 m
-# deep and a 21 m wide one 9 m (owner, 2026-09-30: "too deep to be realistic").
-# The floor keeps the smallest streams reading as water.
-DEFAULT_DEPTH_COEFFICIENT = 0.3
-DEFAULT_DEPTH_EXPONENT = 0.4
+# Channel depth from discharge: depth = clamp(c * Q^f). It replaced a table by
+# stream order (1.5 m for a headwater stream to 11 m for an order-8 trunk) that
+# made a 6 m wide river 5.5 m deep and a 21 m wide one 9 m (owner, 2026-09-30:
+# "too deep to be realistic"). The textbook depth half of the hydraulic geometry
+# (Leopold & Maddock 1953: 0.3 * Q^0.4) was then too harsh: modelled discharge on
+# a 40 km tile tops out near 13 m³/s, so nearly every river came out 0.5-0.8 m and
+# lake inlets and outlets vanished under the water's opacity (owner, same day:
+# "something in between"). These values keep a headwater stream at the 0.5 m
+# floor, put a lake inlet (0.1-0.5 m³/s) at 1-1.6 m and a trunk river (10+ m³/s)
+# at about 4 m, which is also roughly what real rivers of those widths measure.
+DEFAULT_DEPTH_COEFFICIENT = 2.0
+DEFAULT_DEPTH_EXPONENT = 0.3
 DEFAULT_MIN_DEPTH_M = 0.5
-DEFAULT_MAX_DEPTH_M = 4.0
+DEFAULT_MAX_DEPTH_M = 5.0
 
 # Hydraulic geometry shared with the runtime: full width = clamp(a * Q^b).
 DEFAULT_WIDTH_COEFFICIENT = 8.0

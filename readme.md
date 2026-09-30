@@ -697,10 +697,11 @@ and leaves the water surface where the ground is:
   there inward, sized only so the renderer reads the water as opaque.
 - **Rivers** get a trench under the channel, deepest along the middle and feathering
   out at the banks, as deep as the river's modelled discharge says —
-  `0.3 · Q^0.4` m, clamped to 0.5–4 m, × `--river-depth-scale` (the depth half of
-  the hydraulic geometry whose width half the runtime shares; `f = 0.4` is the
-  runtime's own depth exponent) — and as wide as its channel. On Lierne nearly
-  every river is 0.5–0.7 m deep. `--river-depth-model order` restores the legacy
+  `2.0 · Q^0.3` m, clamped to 0.5–5 m, × `--river-depth-scale` — and as wide as its
+  channel. On Lierne a headwater stream stays at the 0.5 m floor, a lake inlet or
+  outlet (0.1–0.5 m³/s) is 1–1.6 m deep and the largest rivers (about 13 m³/s)
+  about 4 m. The textbook `0.3 · Q^0.4` left nearly every river 0.5–0.8 m deep,
+  too shallow to read through the water. `--river-depth-model order` restores the legacy
   table by stream order (1.5 m for a headwater stream to 11 m for an order-8 trunk),
   which made a 6 m wide river 5.5 m deep. It
   is cut in full only within `--river-bank-tolerance` of the water level and tapers
