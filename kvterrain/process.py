@@ -155,7 +155,7 @@ def run_process(
     lake beds are then synthetic everywhere, and the manifest says so.
     """
     from . import (water, bathymetry, watersurface, waterid, rivernet, riverbed,
-                   lakebed, rivermouth)
+                   lakebed, rivermouth, shoreline)
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -184,6 +184,8 @@ def run_process(
     lake_bed_params = None
     lake_bed_report: dict = {}
     mouth_params = None
+    shore_params = None
+    shores = None
     snap_report: dict = {}
     emit_geojson = False
     hier = None
@@ -242,6 +244,8 @@ def run_process(
         lake_bed_params = lbp
         mouth_params = rivermouth.MouthParams(
             enabled=bool(opts.pop("river_mouths", True)))
+        shore_params = shoreline.ShoreParams(
+            enabled=bool(opts.pop("lake_shoreline", True)))
         if survey_layers is None:
             survey_layers = opts.pop("bathymetry", None)
         else:
@@ -323,6 +327,16 @@ def run_process(
             island=water_leaf.lake_island, perimeter_cap=perimeter_cap,
             max_above_shore_m=max_above_shore)
         lake_surf = water_leaf.lake_surface_moh()
+
+        # 1d. THE SHORELINE: the scan decides where the water ends. Lake samples the
+        #     scan puts above the level become land (or islands); only the scanned
+        #     water plane gets a modelled bed. Terrain model only, and before the
+        #     rivers, so everything downstream sees the lake as it will ship.
+        if lake_bed_model == lakebed.MODEL_TERRAIN:
+            shores = shoreline.split_shores(water_leaf, leaf_uncarved,
+                                            spacing_m=plan.spacing_m,
+                                            params=shore_params)
+            lake_surf = water_leaf.lake_surface_moh()
 
         # 2. TRACE the polylines, attach modelled mean-annual discharge to the
         #    authored graph, and re-rasterise ONLY the rivers at w=f(Q). Lakes,
@@ -454,9 +468,13 @@ def run_process(
             )
         else:
             surveys = lakebed.parse_surveys(survey_layers, step_m=plan.spacing_m)
+            # The model builds the scanned water plane only, from its anchor; the
+            # rest of each lake is scanned ground and keeps its height.
+            plane_type = np.where(shores.plane, water.TYPE_LAKE,
+                                  water.TYPE_LAND).astype(water_leaf.type.dtype)
             leaf, lake_bed_report = lakebed.build_lake_beds(
-                leaf, water_leaf.type, plan.spacing_m,
-                surface_moh=lake_surf,
+                leaf, plane_type, plan.spacing_m,
+                surface_moh=shores.anchor,
                 ground_m=leaf_uncarved,
                 lake_id=water_leaf.lake_id,
                 lake_table=water_leaf.lake_table,
@@ -469,6 +487,12 @@ def run_process(
                 progress=stages.within,
             )
             lake_bed_report["dataset_has_bathymetry"] = survey_layers is not None
+            del plane_type
+            # The lake's own ring no longer sits on the waterline; hold it there
+            # only where the lake would otherwise drain (see shoreline).
+            shores.report["sealed_samples"] = shoreline.seal_shores(
+                leaf, water_leaf, lake_surf, edge_is_shore=lake_edge_is_shore)
+            lake_bed_report["shoreline"] = shores.report
 
             # 3b. Carry each river's channel on into its lake: the bed just built
             #     treats a mouth as shore, which left a line on the waterline right
@@ -591,6 +615,8 @@ def run_process(
                          if lake_bed_model == lakebed.MODEL_TERRAIN else None),
             "river_mouths": (mouth_params.to_dict()
                              if lake_bed_model == lakebed.MODEL_TERRAIN else None),
+            "lake_shoreline": (shore_params.to_dict()
+                               if lake_bed_model == lakebed.MODEL_TERRAIN else None),
             "lake_snap_px": lake_snap_px,
             "lake_holes_filled": fill_lake_holes,
             "ocean_level_m": ocean_level_m,

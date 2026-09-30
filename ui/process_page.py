@@ -111,7 +111,12 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "Carry rivers into lakes", value=True, disabled=t,
             help="Continue each river's channel into its lake: a delta at inflows, "
                  "a funnel and a riffle at outlets that holds the lake by the "
-                 "river's depth. Shorelines stay on the waterline.")
+                 "river's depth.")
+        lake_shoreline = st.toggle(
+            "Shoreline from the scan", value=True, disabled=t,
+            help="Scanned land above the lake's level stays land, scanned ground "
+                 "below it is flooded as it is, and only the scanned water gets a "
+                 "modelled bed, with no line of zero depth at its edge.")
         lake_slope_ratio = st.slider(
             "Underwater slope ÷ land slope", 0.1, 2.0, float(lbd.slope_ratio), 0.05,
             disabled=t,
@@ -247,6 +252,7 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_bed_model": lake_bed_model,
             "lake_surveys": lake_surveys,
             "river_mouths": river_mouths,
+            "lake_shoreline": lake_shoreline,
             "lake_slope_ratio": lake_slope_ratio,
             "lake_bed_curvature": lake_bed_curvature,
             "lake_bed_noise": lake_bed_noise,

@@ -68,6 +68,7 @@ def _water_opts(a) -> dict:
         "lake_bed_model": a.lake_bed,
         "lake_surveys": a.lake_surveys,
         "river_mouths": a.river_mouths,
+        "lake_shoreline": a.lake_shoreline,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
@@ -691,7 +692,14 @@ def _add_process_args(p):
                    help="carry each river's channel on into its lake: a delta at "
                         "inflows, a funnel and a riffle at outlets that holds the "
                         "lake by the river's depth (default: on; terrain model "
-                        "only). Shorelines stay on the waterline")
+                        "only)")
+    p.add_argument("--lake-shoreline", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_shoreline",
+                   help="let the scan decide where each lake's water ends: scanned "
+                        "land above the level stays land, scanned ground below it "
+                        "is flooded as it is, and only the scanned water gets a "
+                        "modelled bed, with no line of zero depth at its edge "
+                        "(default: on; terrain model only)")
     p.add_argument("--lake-slope-ratio", type=float, default=None,
                    dest="lake_slope_ratio",
                    help="terrain model: underwater slope at the shore as a fraction "

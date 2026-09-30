@@ -2,7 +2,9 @@
 
 **For:** the Unity runtime, `Assets/Terraform/WaterHierarchy/DepressionLakeMatch.cs`
 **From:** kvterrain `2273841` ("open lake outlets onto riffles held by the outflow head"), 2026-09-30
-**Size:** one rule, applied at three places in `MatchOne`. No file format changes.
+**Size:** two rules in `MatchOne`: fill to spill + head (three places), and do not
+pick a basin that spills into its own lake (see "Second rule"). No file format
+changes.
 
 ## Why
 
@@ -91,6 +93,44 @@ The exporter's head is `set_outflow_heads`: the float64 difference, stored as
 float32. `OutflowHead` computes the same difference and returns it as a float, so
 both sides see the same float32 value. Keep the division (not a multiplication by
 a reciprocal) so that `holdCode` matches the exporter bit for bit.
+
+## Second rule: a basin that spills into its own lake is not the lake
+
+Added with kvterrain's shoreline change (the commit after `4c64c40`).
+
+**Why.** Lake edges no longer sit exactly on the level. A narrow neck of a lake now
+lies about 30 cm under water, so the depression hierarchy sees the lake as two basins
+that join at the neck, below the level. The walk evaluates both:
+- the basin on one side of the neck, and
+- its parent, which holds the whole lake.
+
+The parent's pool often also covers an inflow trench the lake backs up into, which
+lowers its IoU. The one-sided basin can then win the IoU contest. It is reported as
+`level_above_spill`, although its water only spills into the other half of the same
+lake. On Lierne this caused about 30 false findings.
+
+**The rule.** During the walk, a node `v` whose saddle lies inside its own lake is
+not eligible as the lake's node, provided some other node on the walk is eligible.
+A node's saddle lies inside the lake when all of these hold:
+- `holdCode(v) < levelCode − tolCode`;
+- its `SpillCell` is one of this lake's samples (lake class, this lake id, not an
+  island);
+- its `OutletCell` is also one of this lake's samples.
+
+Keep evaluating such a node, and keep climbing past it. Only pick it if the walk
+finds no other candidate. The exporter keeps two bests, `best` and `fallback`, and
+uses `best if best is not None else fallback`. See `audit_lakes` in
+`kvterrain/wateraudit.py`. A cell is "one of this lake's samples" exactly when the
+exporter's audit mask says so: water class lake, the lake's id, and not an island.
+
+**Effect on Lierne**, together with the shoreline change:
+
+| Audit status | Count |
+|---|---|
+| `ok` | 1,227 |
+| `held_by_outflow` | 945 |
+| `no_node` | 4 |
+| `level_above_spill` | 4 |
 
 ## What does not change
 

@@ -284,6 +284,13 @@ def _walk_rivers(codes, corridor, lake, labels, floor_code, spill_code, leaf_max
 # Lakes                                                                        #
 # --------------------------------------------------------------------------- #
 
+def _in_lake(cell, mask_flat, ids_flat, lid) -> bool:
+    """Whether a saddle sample (flat index, H.NONE for none) is one of lake `lid`'s."""
+    cell = int(cell)
+    return (cell != H.NONE and 0 <= cell < mask_flat.size and bool(mask_flat[cell])
+            and int(ids_flat[cell]) == lid)
+
+
 def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                 *, inflow_lakes: set, tin, tout,
                 spill_tol_m: float = DEFAULT_SPILL_TOL_M,
@@ -297,6 +304,8 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
               else np.zeros(wg.type.shape, dtype=bool))
     lake_id = wg.lake_id
     mask = (wg.type == kvwater.TYPE_LAKE) & ~island
+    mask_flat = mask.ravel()
+    ids_flat = lake_id.ravel()
     idx = np.flatnonzero(mask)
     ids = lake_id.ravel()[idx]
     order = np.argsort(ids, kind="stable")
@@ -362,6 +371,7 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
         starts = [start] + ([leaf] if leaf != start else [])
 
         best = None
+        fallback = None
         for v in starts:
             while v != H.ROOT and v != H.NONE:
                 # A node spilling below the level has a parent whose pool contains
@@ -387,7 +397,18 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                     codes, labels, tin, tout, v, eff, cells, lake_id, np.uint16(lid),
                     island, stamp, np.int32(stamp_val), cap, buf)
                 iou = inter / max(n + cnt - inter, 1)
-                if best is None or iou > best[1]:
+                # A node that spills below the level INTO ITS OWN LAKE — both saddle
+                # samples are the lake's — is a basin of the lake, not the lake: its
+                # water runs on into the rest of the lake, which the level holds. A
+                # neck of the bed a little under the waterline makes one. It is
+                # taken only if no node on the walk leaves the lake.
+                inside = (float(hold_code[v]) < under and
+                          _in_lake(nodes["spill_cell"][v], mask_flat, ids_flat, lid) and
+                          _in_lake(nodes["outlet_cell"][v], mask_flat, ids_flat, lid))
+                if inside:
+                    if fallback is None or iou > fallback[1]:
+                        fallback = (v, iou, n, inter, capped)
+                elif best is None or iou > best[1]:
                     best = (v, iou, n, inter, capped)
                 if capped or n > POOL_CAP_FACTOR * cnt:
                     break
@@ -399,7 +420,7 @@ def audit_lakes(plan, h: H.Hierarchy, codes: np.ndarray, wg: kvwater.WaterGrid,
                     break
                 v = up
 
-        v, iou, n, inter, capped = best
+        v, iou, n, inter, capped = best if best is not None else fallback
         spill_m = float(nodes["spill_m"][v])
         floor_m = float(nodes["floor_m"][v])
         rec.update({"node_id": int(v), "iou": round(float(iou), 4),

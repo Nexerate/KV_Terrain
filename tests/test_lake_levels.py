@@ -107,6 +107,34 @@ def test_a_lake_shallower_than_its_outlet_river_is_matched_through_its_head():
     assert abs(row["spill_m"] - 12.0) < 0.02
 
 
+def test_a_basin_spilling_into_its_own_lake_is_not_the_lake():
+    # One lake (level 12) whose bed is two basins joined by a neck 0.3 m under
+    # water, the right one draining through a sill into a big low patch outside the
+    # outline. The left basin alone overlaps the lake best, but its water only runs
+    # on into the other half of the same lake.
+    h = np.full((20, 20), 20.0)
+    h[5:10, 2:8] = 10.0                        # left basin, 30 samples
+    h[5:10, 8] = 11.7                          # the neck
+    h[5:10, 9:13] = 10.0                       # right basin
+    h[11:17, 2:17] = 11.0                      # low ground outside the outline
+    h[10, 10] = 11.0                           # joined to the right basin
+    t = np.zeros(h.shape, np.uint8)
+    t[5:10, 2:13] = water.TYPE_LAKE
+    wg = water.WaterGrid(type=t, weight=np.zeros(h.shape, np.uint8),
+                         lake_id=np.where(t == water.TYPE_LAKE, 1, 0).astype(np.uint16),
+                         lake_table={1: {"level_m": 12.0}}, weight_raw=None,
+                         lake_island=np.zeros(h.shape, bool))
+    plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
+                         tile_cells=19, leaf_tiles_x=1, leaf_tiles_y=1, num_levels=1)
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    tin, tout = H.subtree_intervals(hier.nodes)
+    row, = wateraudit.audit_lakes(plan, hier, codes, wg, inflow_lakes=set(),
+                                  tin=tin, tout=tout)
+    assert row["status"] == "ok", row
+    assert row["spill_m"] > 12.0
+
+
 def correction_world(hoyde):
     h = np.full((30, 30), 105.0, np.float32)          # shore at ~105 m
     h[10:20, 10:20] = 100.0                           # flown water surface at 100 m

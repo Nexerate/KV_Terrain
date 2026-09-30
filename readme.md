@@ -646,6 +646,22 @@ and leaves the water surface where the ground is:
   `--lake-bed-max-depth` is an optional ceiling (none by default). On Lierne the
   deepest bed is Tunnsjøen at 225 m; the median body is a 2 m pond.
 
+  **The scan decides where the water ends** (`--lake-shoreline`, on by default;
+  `kvterrain/shoreline.py`). The NVE outline and the LiDAR disagree at every shore,
+  and holding every outline sample on the waterline drew a line of zero depth all
+  round each lake. Now each lake sample is sorted by the scan. Scanned water — flat,
+  or level with flat water beside it — gets the modelled bed, its rim at least
+  30 cm under the level. Scanned ground below the level is flooded as it is, and
+  enclosed low ground just outside the outline joins the lake. Scanned land above
+  the level within 15 m of the outline stops being lake, so the shore follows the
+  land's contour instead of the outline's staircase; further in, dry scan rising a
+  metre above the level is an island and lower bumps (reeds and sedge on a boggy
+  lake) are water. A sample is held on the waterline only where the lake would
+  otherwise drain: beside ground below the level, a river, another lake or the map
+  edge. On Lierne about 1.2% of the lake area becomes shore (the median lake loses
+  10% of its outline, nearly all in the edge strip), and the water audit improves:
+  4 lakes without a node and 4 above their spill.
+
   **Rivers run on into their lakes** (`--river-mouths`, on by default;
   `kvterrain/rivermouth.py`). The bed above treats a river mouth as shore, which
   left a line on the waterline across every channel and a lake shallower than the
@@ -1058,6 +1074,9 @@ and offsets, so the same placement logic applies.
   channel, stopping at the waterline, plus the legacy straight-ramp lake carve.
 - `kvterrain/lakebed.py` — lake beds: the terrain-continuation model, NVE surveys
   (contours, spot depths, max/mean) and world-anchored noise.
+- `kvterrain/shoreline.py` — lets the scan decide where each lake's water ends
+  (land, flooded ground, scanned water) and seals the lake only where it would
+  drain.
 - `kvterrain/rivermouth.py` — continues each river's channel into its lake: delta
   at inflows, funnel behind outlets, with the leak check that decides which inlets
   may open.
