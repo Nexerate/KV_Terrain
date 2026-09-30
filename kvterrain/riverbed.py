@@ -210,8 +210,10 @@ def _bank_ceiling(plan: core.GridPlan, xy: np.ndarray, ground: np.ndarray,
     normal = _vertex_normals(xy)
     ceiling = np.full(xy.shape[0], np.inf, dtype=np.float64)
     spacing = float(plan.spacing_m)
-    strip_edge = (max(float(half_width_m), 0.5 * spacing) +
+    # `half_width_m` is a scalar, or one value per vertex (the visual width).
+    strip_edge = (np.maximum(np.asarray(half_width_m, dtype=np.float64), 0.5 * spacing) +
                   MASK_EDGE_DIAGONAL_CELLS * spacing)
+    strip_edge = np.broadcast_to(strip_edge, (xy.shape[0],))[:, None]
     for side in (-1.0, 1.0):
         # The runtime-profile check reads the first dry mesh vertex half a sample
         # beyond the stamp.  Include that exact position, not just the two points
@@ -521,8 +523,16 @@ def downhill_profiles(
         bed = g - depth
         half_w = _segment_half_width(
             s.order, plan.spacing_m, width_by_order, width_scale, s.width_m)
+        vw = getattr(s, "vertex_width_m", None)
+        if vw is not None and len(vw) == s.n:
+            # The visual width: the bank is read where the channel really ends.
+            bank_half = np.maximum(0.5 * np.asarray(vw, np.float64),
+                                   0.5 * float(plan.spacing_m))
+            half_w = float(np.median(bank_half))
+        else:
+            bank_half = half_w
         half_widths[sid] = half_w
-        ceiling = (_bank_ceiling(plan, s.xy, bank_ground, wg.type, half_w)
+        ceiling = (_bank_ceiling(plan, s.xy, bank_ground, wg.type, bank_half)
                    if wg is not None else np.full(g.shape, np.inf, dtype=np.float64))
         ceilings[sid] = ceiling
         safety_floors[sid] = (

@@ -224,10 +224,11 @@ def run_fetch(
     # ---- phase 2: the NVE vectors ------------------------------------------ #
     rivers = main_rivers = lakes = []
     bathymetry = None
+    n50_rivers = None
     seconds_water = 0.0
     if include_water:
         t0 = time.time()
-        n_layers = (3 if include_main_rivers else 2) + 1
+        n_layers = (3 if include_main_rivers else 2) + 2
         state = {"i": 0, "label": "water"}
 
         def on_layer(i, n, label):
@@ -254,9 +255,14 @@ def run_fetch(
             rivers, main_rivers, lakes = kvwater.fetch_water_geojson(
                 plan, include_main_rivers=include_main_rivers, session=session,
                 progress=water_progress, on_layer=on_layer)
-            on_layer(n_layers - 1, n_layers, "lake surveys")
+            on_layer(n_layers - 2, n_layers, "lake surveys")
             bathymetry = kvwater.fetch_bathymetry_geojson(
                 plan, session=session, progress=water_progress)
+            on_layer(n_layers - 1, n_layers, "N50 river widths")
+            from . import n50 as kvn50
+            n50_rivers = kvn50.fetch_n50_rivers(
+                plan, session=session,
+                progress=lambda f, msg: water_progress(0, 0, msg))
         seconds_water = time.time() - t0
     emit(0.97, "writing dataset")
 
@@ -290,6 +296,7 @@ def run_fetch(
         demo=demo,
         rivers=rivers, main_rivers=main_rivers, lakes=lakes,
         bathymetry=bathymetry,
+        n50=n50_rivers,
         include_water=include_water,
         include_main_rivers=include_main_rivers,
         compression=compression,
@@ -342,6 +349,20 @@ def fetch_bathymetry_into(ds: ds_mod.Dataset, *, session=None,
     bathy = kvwater.fetch_bathymetry_geojson(ds.plan(), session=session,
                                              progress=water_progress)
     out = ds_mod.write_bathymetry(ds, bathy)
+    if progress:
+        progress(1.0, "done")
+    return out
+
+
+def fetch_n50_into(ds: ds_mod.Dataset, *, session=None,
+                   progress: Optional[Progress] = None) -> ds_mod.Dataset:
+    """Fetch Kartverket's N50 river layer for an existing dataset's region and add
+    it, leaving everything else untouched. For datasets fetched before N50 was part
+    of a fetch; a fresh fetch already includes it."""
+    from . import n50 as kvn50
+
+    raw = kvn50.fetch_n50_rivers(ds.plan(), session=session, progress=progress)
+    out = ds_mod.write_n50(ds, raw)
     if progress:
         progress(1.0, "done")
     return out

@@ -82,6 +82,13 @@ BIN_MAGIC = b"KVRIVER2"
 BIN_VERSION = 2
 NO_HIERARCHY_NODE = 0xFFFFFFFF
 
+# The visual width per vertex, beside rivers.bin rather than inside it: rivers.bin
+# v2 stays byte-for-byte what the runtime reads today, and a runtime that does not
+# know this file simply keeps stamping the hydraulic width.
+RIVER_WIDTHS_FILE = "river_widths.bin"
+WIDTHS_MAGIC = b"KVRWIDT1"
+WIDTHS_VERSION = 1
+
 # Modelled mean-annual flow.  One metre/year is 31.688 L/s/km², a deliberately
 # explicit effective-runoff assumption rather than an unlabeled rainfall knob.
 DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR = 1.0
@@ -320,6 +327,9 @@ class RiverSegment:
     lake_spans: list = field(default_factory=list)   # (start_idx, end_idx, local_lake_id)
     discharge_m3_s: float = 0.0
     width_m: Optional[float] = None
+    # The VISUAL full width per vertex (`riverwidth`): N50 where it knows, else
+    # width_m. None until set. `width_m` stays the hydraulic width in rivers.bin.
+    vertex_width_m: Optional[np.ndarray] = None
     node_id: int = NO_HIERARCHY_NODE
     local_catchment_m2: float = 0.0
     accumulated_catchment_m2: float = 0.0
@@ -1368,6 +1378,44 @@ def write_junctions_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> d
             "inflow": inflow, "outflow": len(net.junctions) - inflow}
 
 
+def write_river_widths_bin(net: RiverNetwork, path: str) -> dict:
+    """
+    The visual full width at every vertex, in rivers.bin's segment and vertex
+    order: header `<8sIII` (magic, version, segment_count, vertex_count), then per
+    segment `<II` (seg_id, vertex_count) and vertex_count f32 widths in metres. A
+    segment without visual widths repeats its hydraulic width_m.
+    """
+    total = 0
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<8sIII", WIDTHS_MAGIC, WIDTHS_VERSION,
+                             len(net.segments), net.total_vertices()))
+        for s in net.segments:
+            vw = getattr(s, "vertex_width_m", None)
+            if vw is None or len(vw) != s.n:
+                vw = np.full(s.n, float(s.width_m or 0.0))
+            fh.write(struct.pack("<II", int(s.seg_id), int(s.n)))
+            fh.write(np.asarray(vw, dtype="<f4").tobytes())
+            total += s.n
+    return {
+        "file": os.path.basename(path),
+        "format": "kvterrain-river-widths/1",
+        "magic": WIDTHS_MAGIC.decode("ascii"),
+        "version": WIDTHS_VERSION,
+        "byte_order": "little_endian",
+        "header_layout": "<8sIII (magic, version, segment_count, vertex_count)",
+        "segment_layout": "<II (seg_id, vertex_count), then vertex_count * f32 width_m",
+        "segments": len(net.segments),
+        "vertices": int(total),
+        "bytes": os.path.getsize(path),
+        "quantity": "full VISUAL channel width in metres at each rivers.bin vertex, "
+                    "same segment and vertex order",
+        "note": "What the export rasterised, carved and levelled the river to: "
+                "Kartverket N50's river areas and width classes where they exist, "
+                "the hydraulic width (rivers.bin width_m, from discharge) elsewhere. "
+                "width_m stays the hydraulic width for the solver.",
+    }
+
+
 def export_river_network(
     net: RiverNetwork, plan: core.GridPlan, out_dir: str, *,
     emit_geojson: bool = False,
@@ -1381,6 +1429,9 @@ def export_river_network(
             net, plan, os.path.join(out_dir, JUNCTIONS_FILE)),
         "validation": net.report,
     }
+    if any(getattr(s, "vertex_width_m", None) is not None for s in net.segments):
+        man["river_widths"] = write_river_widths_bin(
+            net, os.path.join(out_dir, RIVER_WIDTHS_FILE))
     hydro = net.report.get("hydrology")
     if hydro:
         man["rivers"]["discharge"] = hydro

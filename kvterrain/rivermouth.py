@@ -206,10 +206,13 @@ def find_mouths(plan, segments, bed: np.ndarray, lake_surface: np.ndarray, *,
             if lvl.size == 0:
                 continue
             level = float(np.median(lvl))
-            half_w = 0.5 * float(s.width_m or spacing_m)
+            vw = getattr(s, "vertex_width_m", None)
             for kind, m, step in ((INFLOW, a, 1), (OUTFLOW, b, -1)):
                 if (kind == INFLOW and a == 0) or (kind == OUTFLOW and b == n - 1):
                     continue            # the polyline starts/ends inside the lake
+                # The channel's own (visual) width just outside the mouth.
+                half_w = 0.5 * float(vw[m - step] if vw is not None and len(vw) == n
+                                     else (s.width_m or spacing_m))
                 river = [m - step * k for k in (1, 2, 3) if 0 <= m - step * k < n]
                 d = level - bed[ri[river], ci[river]]
                 d = d[np.isfinite(d)]

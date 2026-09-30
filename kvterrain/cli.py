@@ -69,6 +69,7 @@ def _water_opts(a) -> dict:
         "lake_surveys": a.lake_surveys,
         "river_mouths": a.river_mouths,
         "lake_shoreline": a.lake_shoreline,
+        "river_n50_widths": a.river_n50_widths,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
@@ -173,6 +174,19 @@ def cmd_fetch_bathymetry(a):
     c = d.manifest["water"]["bathymetry"]["counts"]
     print(f"dataset {d.name!r}: {c['surveys']} lake surveys, {c['contours']} depth "
           f"contours, {c['points']} spot depths, {c['shores']} surveyed shorelines")
+
+
+def cmd_fetch_n50(a):
+    """Add Kartverket N50 river widths to a dataset fetched before they were part of
+    a fetch."""
+    from . import fetch as kvfetch
+
+    d = _resolve_dataset(a.dataset, a.root)
+    d = kvfetch.fetch_n50_into(d, progress=_bar("N50"))
+    print()
+    n = d.manifest["water"]["n50"]
+    print(f"dataset {d.name!r}: {n['count']} N50 river features {n['counts']} from "
+          f"{', '.join(m[1] for m in n['municipalities'])}")
 
 
 def cmd_calibrate_lake_beds(a):
@@ -693,6 +707,12 @@ def _add_process_args(p):
                         "inflows, a funnel and a riffle at outlets that holds the "
                         "lake by the river's depth (default: on; terrain model "
                         "only)")
+    p.add_argument("--river-n50-widths", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_n50_widths",
+                   help="draw rivers at Kartverket N50's widths where the dataset "
+                        "has them: the mapped river areas of wide rivers, width "
+                        "classes elsewhere; writes river_widths.bin (default: on). "
+                        "The hydraulic width in rivers.bin is unchanged")
     p.add_argument("--lake-shoreline", action=argparse.BooleanOptionalAction,
                    default=True, dest="lake_shoreline",
                    help="let the scan decide where each lake's water ends: scanned "
@@ -854,6 +874,14 @@ def main(argv=None):
     fb.add_argument("--dataset", required=True)
     fb.add_argument("--root", default=None)
     fb.set_defaults(func=cmd_fetch_bathymetry)
+
+    fn = sub.add_parser("fetch-n50",
+                        help="add Kartverket N50 river widths to a dataset fetched "
+                             "before they were part of every fetch (heights are not "
+                             "refetched)")
+    fn.add_argument("--dataset", required=True)
+    fn.add_argument("--root", default=None)
+    fn.set_defaults(func=cmd_fetch_n50)
 
     dl = sub.add_parser("datasets", help="list the datasets already fetched")
     dl.add_argument("--root", default=None)

@@ -112,6 +112,11 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             help="Continue each river's channel into its lake: a delta at inflows, "
                  "a funnel and a riffle at outlets that holds the lake by the "
                  "river's depth.")
+        river_n50_widths = st.toggle(
+            "River widths from N50", value=True, disabled=d,
+            help="Wide rivers take the width of Kartverket's mapped river areas, "
+                 "and streams their N50 width class, where the dataset has N50 "
+                 "(`kvterrain fetch-n50 --dataset ...` adds it).")
         lake_shoreline = st.toggle(
             "Shoreline from the scan", value=True, disabled=t,
             help="Scanned land above the lake's level stays land, scanned ground "
@@ -253,6 +258,7 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_surveys": lake_surveys,
             "river_mouths": river_mouths,
             "lake_shoreline": lake_shoreline,
+            "river_n50_widths": river_n50_widths,
             "lake_slope_ratio": lake_slope_ratio,
             "lake_bed_curvature": lake_bed_curvature,
             "lake_bed_noise": lake_bed_noise,

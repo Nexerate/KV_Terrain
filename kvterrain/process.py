@@ -134,6 +134,7 @@ def run_process(
     *,
     features=None,
     survey_layers: Optional[dict] = None,
+    n50_layer: Optional[dict] = None,
     source_kind: str = "DTM",
     nodata_fill_m: float = 0.0,
     height_min: Optional[float] = None,
@@ -155,7 +156,7 @@ def run_process(
     lake beds are then synthetic everywhere, and the manifest says so.
     """
     from . import (water, bathymetry, watersurface, waterid, rivernet, riverbed,
-                   lakebed, rivermouth, shoreline)
+                   lakebed, rivermouth, shoreline, riverwidth)
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -186,6 +187,8 @@ def run_process(
     mouth_params = None
     shore_params = None
     shores = None
+    width_params = None
+    width_report: dict = {}
     snap_report: dict = {}
     emit_geojson = False
     hier = None
@@ -246,6 +249,8 @@ def run_process(
             enabled=bool(opts.pop("river_mouths", True)))
         shore_params = shoreline.ShoreParams(
             enabled=bool(opts.pop("lake_shoreline", True)))
+        width_params = riverwidth.WidthParams(
+            enabled=bool(opts.pop("river_n50_widths", True)))
         if survey_layers is None:
             survey_layers = opts.pop("bathymetry", None)
         else:
@@ -348,7 +353,17 @@ def run_process(
         hydrology_report = rivernet.assign_discharge_and_width(
             traced, effective_runoff_m_per_year=runoff_m_per_year,
             width_scale=raster_opts.get("width_scale", 1.0))
-        water.rerasterize_rivers(plan, water_leaf, traced.segments)
+        # 2'. The VISUAL width per vertex: N50's river areas and width classes where
+        #     the dataset has them, the modelled width elsewhere (see riverwidth).
+        #     The hydraulic width stays on the segment for rivers.bin.
+        vertex_w, width_report = riverwidth.vertex_widths(
+            traced.segments, n50_layer, params=width_params)
+        for s in traced.segments:
+            s.vertex_width_m = vertex_w.get(s.seg_id)
+        water.rerasterize_rivers(plan, water_leaf, traced.segments,
+                                 clip_water=riverwidth.water_areas(
+                                     n50_layer, margin_m=plan.spacing_m)
+                                 if width_params.enabled else None)
 
         # 2a. THE RIVER WATER LEVEL, from the uncarved ground: the lowest ground
         #    across each channel, levelled over that channel's own width, then
@@ -702,6 +717,16 @@ def run_process(
         wsurf["lake_levels"] = level_report
         wsurf["discharge"] = river_net.report.get("hydrology", {})
         wsurf["width_model"] = river_net.report.get("width_model", {})
+        wsurf["visual_widths"] = {
+            **width_report,
+            "dataset_has_n50": n50_layer is not None,
+            "method": "per-vertex visual width: the N50 river polygon's width across "
+                      "the centreline where one exists (median- and mean-smoothed "
+                      "along the river, tapered back over taper_m, mask clipped to "
+                      "the polygon plus one sample), N50 width class 2 caps the "
+                      "hydraulic width at 3 m and class 3 holds it to 3-15 m, "
+                      "elsewhere the hydraulic width; written to river_widths.bin",
+        }
         wsurf["lake_bathymetry"] = _lake_bathymetry_block(
             lake_bed_model, lake_bed_report, snap_report, water_params) \
             if lake_bed_model == "terrain" else {
@@ -892,6 +917,7 @@ def process_dataset(
         plan, ds.heights(), out_dir,
         features=features,
         survey_layers=ds.bathymetry_geojson() if include_water else None,
+        n50_layer=ds.n50_rivers() if include_water else None,
         source_kind=ds.source_kind,
         nodata_fill_m=nodata_fill_m,
         height_min=height_min, height_max=height_max,

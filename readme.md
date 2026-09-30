@@ -223,6 +223,9 @@ python -m kvterrain.cli process --dataset lierne --out ./out \
 # add NVE lake surveys to a dataset fetched before they were part of a fetch
 python -m kvterrain.cli fetch-bathymetry --dataset lierne
 
+# add Kartverket N50 river widths to a dataset fetched before they were part of a fetch
+python -m kvterrain.cli fetch-n50 --dataset lierne
+
 # score the synthetic lake bed against NVE-surveyed lakes (cached after first run)
 python -m kvterrain.cli calibrate-lake-beds --n 130
 
@@ -251,7 +254,8 @@ else is a `process` flag and is free to re-run: `--river-width-scale`,
 default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
 `--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
-`--(no-)lake-surveys`, `--(no-)river-mouths`, the ramp model's `--lake-max-depth` and
+`--(no-)lake-surveys`, `--(no-)river-mouths`, `--(no-)lake-shoreline`,
+`--(no-)river-n50-widths`, the ramp model's `--lake-max-depth` and
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
@@ -283,6 +287,10 @@ data/datasets/<slug>/
   water/bathymetry.geojson.gz  NVE lake surveys — {surveys, contours, points,
                                shores}, RAW GeoJSON features (absent in datasets
                                fetched before 2026-09-29; `fetch-bathymetry` adds it)
+  water/n50_rivers.geojson.gz  Kartverket N50 river centrelines (width class) and
+                               river-area polygons for the region, from every
+                               municipality under it (absent before 2026-09-30;
+                               `fetch-n50` adds it)
 ```
 
 ### How the lattice is stored
@@ -694,6 +702,20 @@ and leaves the water surface where the ground is:
   to nothing at twice that, so terrain that will never hold water — a bank, a cliff
   face the buffer lapped onto — is left alone rather than notched.
 
+  **River widths come from N50 where it has them** (`--river-n50-widths`, on by
+  default; `kvterrain/riverwidth.py`, data fetched by `kvterrain/n50.py`). The
+  discharge model is right for streams and made the trunk rivers a uniform 5–15 m
+  ribbon where Kartverket's N50 maps them as 15–57 m wide water areas (Lierne,
+  median 28 m). Each river vertex now gets a visual width: across N50's river area
+  where there is one (smoothed along the river, tapered back where the area ends,
+  and the mask clipped to the area so a confluence cannot spill past the banks), the
+  discharge width held to N50's width class on its centrelines (under 3 m, or
+  3–15 m), and the discharge width elsewhere. The river mask, carve, level and
+  mouths all use it, and it ships per vertex in `river_widths.bin` beside an
+  unchanged `rivers.bin`, whose `width_m` stays the hydraulic width. The runtime
+  needs `docs/runtime-spec-river-widths.md` to draw it; without it the wide
+  channels are carved but stamped at the hydraulic width.
+
 - **Bank-capped downhill river profile** (`--downhill-river-bed`, on by default).
   Before the river carve, each densified centreline samples the lowest dry bank
   at the runtime-visible carved-strip edge and one texel beyond. That edge is
@@ -1077,6 +1099,10 @@ and offsets, so the same placement logic applies.
 - `kvterrain/shoreline.py` — lets the scan decide where each lake's water ends
   (land, flooded ground, scanned water) and seals the lake only where it would
   drain.
+- `kvterrain/n50.py` — fetches Kartverket N50 river centrelines and river areas for
+  a region, municipality by municipality.
+- `kvterrain/riverwidth.py` — a visual width for every river vertex from N50, the
+  discharge width where N50 has none.
 - `kvterrain/rivermouth.py` — continues each river's channel into its lake: delta
   at inflows, funnel behind outlets, with the leak check that decides which inlets
   may open.

@@ -217,7 +217,10 @@ class RiverSeg:
     vnrnfelt: Optional[str] = None      # parent catchment's vassdragsnr
     regine_area_km2: Optional[float] = None  # local REGINE unit area, not accumulated
     width_m: Optional[float] = None     # optional hydraulic width override
-    part_index: int = 0                 # part number within a MultiLineString
+    # Optional full width per vertex (the visual width, `riverwidth`); overrides
+    # width_m piece by piece where given.
+    vertex_width_m: Optional[np.ndarray] = None
+    part_index: int = 0                # part number within a MultiLineString
     feature_index: int = -1             # index of the parent GeoJSON feature in the
                                         # RAW layer (before repeated copies are dropped)
 
@@ -1239,8 +1242,12 @@ def rasterize_water(
     plan: core.GridPlan, feats: WaterFeatures, *,
     width_by_order: Optional[dict] = None, width_scale: float = 1.0,
     all_touched_rivers: bool = True, fill_lake_holes: bool = True,
+    clip_water=None,
 ) -> WaterGrid:
     """
+    `clip_water` (a shapely geometry, see `riverwidth.water_areas`) holds any river
+    piece drawn wider than its segment's own width to that area.
+
     Rasterise rivers (buffered by size) and lakes onto the leaf (SY,SX) grid.
     Priority at overlaps is lake > river; among rivers the larger (higher order)
     wins, and its weight (stream order) is the one kept.
@@ -1278,6 +1285,11 @@ def rasterize_water(
     # river upgrades the order of the pixels it shares with its elvenett twin.
     # Only `feats.rivers` is serialised as polylines — see WaterFeatures.
     weight_shapes = []   # (polygon, order, full width metres)
+    clip_tree = clip_parts = None
+    if clip_water is not None and not clip_water.is_empty:
+        import shapely
+        clip_parts = np.asarray(getattr(clip_water, "geoms", [clip_water]), dtype=object)
+        clip_tree = shapely.STRtree(clip_parts)
     for seg in list(feats.rivers) + list(feats.main_rivers):
         xy = seg.xy
         if xy.shape[0] < 2:
@@ -1288,15 +1300,35 @@ def rasterize_water(
                       order_to_width_m(seg.order, width_by_order, width_scale))
         half = 0.5 * full_width
         half = max(half, 0.51 * plan.spacing_m)  # ensure at least ~1 sample wide
+        vw = getattr(seg, "vertex_width_m", None)
+        if vw is not None and len(vw) != xy.shape[0]:
+            vw = None
         for k in range(xy.shape[0] - 1):
             (x0, y0), (x1, y1) = xy[k], xy[k + 1]
             if x0 == x1 and y0 == y1:
                 continue
-            poly = LineString([(x0, y0), (x1, y1)]).buffer(
-                half, cap_style=2, join_style=2)  # flat caps, mitre joins
+            piece_w = full_width
+            if vw is not None:
+                piece_w = float(max(vw[k], vw[k + 1]))
+            piece_half = max(0.5 * piece_w, 0.51 * plan.spacing_m)
+            line = LineString([(x0, y0), (x1, y1)])
+            poly = line.buffer(piece_half, cap_style=2, join_style=2)  # flat caps
+            if clip_tree is not None and piece_w > full_width:
+                # A width taken from N50's river areas stays inside them (plus a
+                # margin), whatever a confluence or a bend did to the measurement;
+                # the modelled channel is always kept.
+                # Our centreline need not run down the middle of N50's river area,
+                # so reach the full width out on EACH side and let the area itself
+                # decide where the banks are.
+                wide = line.buffer(2.0 * piece_half, cap_style=2, join_style=2)
+                hits = clip_tree.query(wide)
+                local = (clip_parts[hits[0]] if len(hits) == 1 else
+                         shapely.union_all(clip_parts[hits]) if len(hits) else None)
+                base = line.buffer(half, cap_style=2, join_style=2)
+                poly = base if local is None else wide.intersection(local).union(base)
             if poly.is_empty:
                 continue
-            weight_shapes.append((poly, int(seg.order), float(full_width)))
+            weight_shapes.append((poly, int(seg.order), float(piece_w)))
 
     # Burn larger rivers LAST so they win (rasterize is last-write per pixel).
     order_sort = np.asarray(sorted(
@@ -1382,8 +1414,9 @@ def rasterize_water(
 
 
 def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
-                       *, all_touched_rivers: bool = True) -> None:
-    """Replace only the river footprint with hydraulically sized segments.
+                       *, all_touched_rivers: bool = True, clip_water=None) -> None:
+    """Replace only the river footprint with hydraulically sized segments — or, per
+    vertex, with their visual width where `vertex_width_m` is set (`riverwidth`).
 
     Lake ids, snapped shore pixels, resolved levels and island cells stay exactly
     as they are.  The provisional order-width raster exists only to recover the
@@ -1391,10 +1424,11 @@ def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
     final river mask used by the surface and carve.
     """
     feats = WaterFeatures(rivers=[RiverSeg(
-        xy=s.xy, order=int(s.order), width_m=float(s.width_m)) for s in segments])
+        xy=s.xy, order=int(s.order), width_m=float(s.width_m),
+        vertex_width_m=getattr(s, "vertex_width_m", None)) for s in segments])
     river_only = rasterize_water(
         plan, feats, all_touched_rivers=all_touched_rivers,
-        fill_lake_holes=False)
+        fill_lake_holes=False, clip_water=clip_water)
     lake = wg.lake_id > 0
     wg.weight_raw = river_only.weight_raw
     wg.type[~lake] = np.where(
