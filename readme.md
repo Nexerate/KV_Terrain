@@ -854,7 +854,7 @@ one 52-byte little-endian record per node:
 | 36 | `spill_m` | f32 | NaN on the root |
 | 40 | `authored_level_m` | f32 | the matched lake's level, NaN if none |
 | 44 | `lake_id` | u16 | `lakes.json` lake id, 0 = none |
-| 46 | `flags` | u16 | leaf, has_spill, spills_off_map, outlet_ocean, authored_lake, minor |
+| 46 | `flags` | u16 | leaf, has_spill, spills_off_map, outlet_ocean, authored_lake, minor, head_capped (bit 7; bit 6 is the runtime's) |
 | 48 | `outflow_head_m` | f32 | depth the outflow river carries over the spill; the node holds water up to `spill_m + outflow_head_m` |
 
 Ids: 0 root, 1…leaf_count leaves (raster order of their first sample), then
@@ -954,7 +954,12 @@ therefore carries `outflow_head_m`, the exported river surface at its spill
 minus the spill (0 where the spill is on land), and holds water up to
 `spill_m + outflow_head_m`. The authored level is taken as right: a matched lake
 standing within that head gets its node's head raised to `authored_level_m −
-spill_m`, so the node reproduces it exactly.
+spill_m`, so the node reproduces it exactly. And a node that is not an authored
+lake never holds above the lowest authored lake inside it: its head is capped at
+that level (`head_capped`). The head there was read on a river sample at the saddle
+that did not carry water out of the node, usually an inflow's carved trench, and
+it drew whole lakes up to 2.9 m above their shores in the runtime (Lierne: 356
+heads capped, median 0.11 m).
 
 **Lierne, all defaults:** 2 173 of 2 180 lakes `ok`, 1 regulated, 2 with no
 node, 4 above spill + head (two by 5 m and 9 m over land, two over a neighbouring

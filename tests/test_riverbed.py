@@ -284,8 +284,9 @@ def test_lake_inlet_is_graded_down_and_lake_expands_into_low_mouth():
     depth = bathymetry.DEFAULT_RIVER_DEPTH_BY_ORDER[1]
     assert np.max(ungraded["profiles"][0][2] - level) <= depth + 1e-9
 
-    # At an inlet the lake wins over a lower bank and expands into the mouth.
-    ground2 = np.full_like(ground, 92.0)
+    # At an inlet the lake expands into a mouth whose banks stand within a metre
+    # of its level, even over the river's own lower ground...
+    ground2 = np.full_like(ground, 94.5)
     ground2[ROW, :] = 85.0
     wg.lake_table = {1: {"level_m": 95.0}}
     prof2 = riverbed.downhill_profiles(plan, traced([s]), ground2, wg=wg)
@@ -293,22 +294,29 @@ def test_lake_inlet_is_graded_down_and_lake_expands_into_low_mouth():
     assert np.allclose(level2[:15], 95.0)
     assert np.all(np.diff(level2) <= 1e-9)
 
+    # ...but not over banks far below it: that would stand the water in the air.
+    ground3 = np.full_like(ground, 92.0)
+    ground3[ROW, :] = 85.0
+    prof3 = riverbed.downhill_profiles(plan, traced([s]), ground3, wg=wg)
+    assert np.all(prof3["profiles"][0][2][:15] <= 92.0 + 1e-9)
 
-def test_backwater_is_flat_even_past_a_low_bank():
+
+def test_backwater_is_flat_to_banks_near_the_lake_and_stops_at_a_low_one():
     surface = np.array([89.0, 88.0, 87.0])
     ceiling = np.array([90.0, 94.0, 96.0])
     xy = np.stack([np.arange(3) * 5.0, np.zeros(3)], axis=1)
-    riverbed._grade_tail(
+    reached = riverbed._grade_tail(
         surface, ceiling, xy, 0, 2, junction_level=95.0, touch_m=0.0,
         max_grade=riverbed.CONFLUENCE_MAX_GRADE, max_lowering_m=1.5,
         backwater=True)
-    assert np.allclose(surface, 95.0)
-    assert np.all(np.diff(surface) <= 1e-12)
+    # 94 is within a metre of the lake: flooded. 90 is five below: not.
+    assert np.allclose(surface, [89.0, 95.0, 95.0])
+    assert not reached
 
 
 def test_lake_backwater_propagates_across_upstream_links():
     plan, ground, wg = world()
-    ground = np.full_like(ground, 85.0)
+    ground = np.full_like(ground, 94.5)
     wg.lake_table = {1: {"level_m": 95.0}}
     upstream = seg(0, range(2, 9))
     main = seg(1, range(8, 23), lake_spans=[(8, 14, 1)])

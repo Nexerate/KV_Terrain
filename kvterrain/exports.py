@@ -728,6 +728,9 @@ def check_hierarchy(exp: Export) -> dict:
             candidate = np.where(np.isfinite(level), level - spill_m[ok], 0.0)
             expected_head[ok] = np.maximum(expected_head[ok], candidate)
         expected_head = np.maximum(expected_head, 0.0).astype(np.float32)
+        probe = nodes.copy()
+        probe["outflow_head_m"] = expected_head
+        expected_head, _capped = H.capped_heads(probe)
         actual_head = nodes["outflow_head_m"]
         exact = actual_head.view("<u4") == expected_head.view("<u4")
         mismatch = ~exact

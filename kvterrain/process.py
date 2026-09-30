@@ -598,7 +598,7 @@ def run_process(
         river_net = rivernet.build_river_network(
             plan, features, water_leaf, leaf_bed_uncarved,
             water_surface=water_surface,
-            shaped_profiles=shaped_profiles,
+            shaped_profiles=shaped_profiles, drawn_ground=leaf,
             vertex_stride_m=vertex_stride_m, depth_scale=depth_scale,
             traced=traced, progress=stages.within)
         river_net.report["hydrology"] = hydrology_report

@@ -133,6 +133,12 @@ BARRIER_CUT_M = 5.0
 BARRIER_MIN_LENGTH_M = 40.0
 # The ridge's flank is released back to where the cut is this shallow.
 BARRIER_FLANK_CUT_M = 1.0
+# A lake's backwater raises a river only where the river's lower bank stands
+# within this much of the lake's level. Further out the river is not the lake's
+# drowned mouth but a channel the data runs uphill into it (a reversed line, or a
+# level that disagrees with the scan): raising it stood water up to 9 m above the
+# ground (Lierne, 2026-09-30: seg 5294 into lake 1614).
+BACKWATER_MAX_OVER_BANK_M = 1.0
 
 
 def _segment_half_width(order: int, spacing_m: float, width_by_order: Optional[dict],
@@ -393,9 +399,12 @@ def _grade_tail(surface: np.ndarray, ceiling: np.ndarray, xy: np.ndarray,
     # the result is a deeper, flat backwater mouth rather than a river surface
     # hidden below the lake or an uphill step into it.  The unchanged upstream
     # point is already >= lake level, so replacing the tail cannot introduce a
-    # downstream rise.
+    # downstream rise. It stops where the bank falls more than
+    # BACKWATER_MAX_OVER_BANK_M below the lake: past that point the channel is not
+    # the lake's mouth.
     k = last
-    while k >= first and surface[k] < junction_level - 1e-9:
+    while (k >= first and surface[k] < junction_level - 1e-9
+           and not ceiling[k] < junction_level - BACKWATER_MAX_OVER_BANK_M):
         k -= 1
     surface[k + 1:last + 1] = float(junction_level)
     return k < first
@@ -591,6 +600,56 @@ def downhill_profiles(
         high_ground = maximum_filter(np.asarray(ground), size=5)
     else:
         high_ground = None
+
+    def release_tail(uid: int, hops: int = 8) -> None:
+        # A ridge's flank that reaches a segment's first vertex goes on up the
+        # segments above it: their tails, trenched into the same flank, keep their
+        # own fall too, or the junction steps up by the whole cut.
+        if uid not in out or hops <= 0:
+            return
+        u = by_id[uid]
+        lvl_u, lm_u = out[uid][0], out[uid][2]
+        cap = np.minimum(lvl_u, ceilings[uid])
+        n = lm_u.size
+        open_vertex = np.ones(n, dtype=bool)
+        for a, b, _lid in u.lake_spans:
+            open_vertex[max(int(a), 0):min(int(b) + 1, n)] = False
+        cut = cap - lm_u
+        k = n - 1
+        if not (open_vertex[k] and np.isfinite(cut[k]) and cut[k] > BARRIER_FLANK_CUT_M):
+            return
+        while (k > 0 and open_vertex[k - 1] and np.isfinite(cut[k - 1])
+               and cut[k - 1] > BARRIER_FLANK_CUT_M):
+            k -= 1
+        prior = [(f, c) for f, c in getattr(u, "barriers", []) if c < k]
+        lm_u[k:] = np.fmin.accumulate(cap[k:][::-1])[::-1]
+        u.barriers = prior + [(int(k), int(n - 1))]
+        if k == 0:
+            for uu in u.upstream:
+                release_tail(uu, hops - 1)
+
+    # A river never runs above a lake it has flowed out of. Per vertex, the lowest
+    # authored level among the lakes upstream of it (+inf where none): the lakes of
+    # earlier spans in its own segment and everything its upstream segments left.
+    # Without it an outlet whose ground stands above its lake's authored level
+    # started above the lake, a step of water at the outlet (Lierne, 2026-09-30:
+    # 16 outlets by more than 0.5 m, up to 3.7 m).
+    lake_caps: dict = {}
+    if wg is not None:
+        cap_out: dict = {}
+        for sid in order:
+            s = by_id[sid]
+            c = min([cap_out[u] for u in s.upstream if u in cap_out], default=np.inf)
+            arr = np.full(s.n, c, dtype=np.float64)
+            for a, b, lid in sorted(s.lake_spans):
+                lv = _lake_level(wg, lid)
+                if lv is not None and b + 1 < s.n:
+                    arr[b + 1:] = np.minimum(arr[b + 1:], lv)
+                if lv is not None:
+                    c = min(c, lv)
+            lake_caps[sid] = arr
+            cap_out[sid] = c
+
     for sid in order:
         s = by_id[sid]
         row, col = rivernet.world_to_grid(plan, s.xy[:, 0], s.xy[:, 1])
@@ -646,6 +705,9 @@ def downhill_profiles(
                     s.barriers = merged
                     lm = _shape_with_barriers(lvl, ceiling, radius, seed_l,
                                               s.barriers)
+                if s.barriers and s.barriers[0][0] == 0:
+                    for uid in s.upstream:
+                        release_tail(uid)
         else:
             # A post-carve bank pass starts with the already accepted profile.
             # Only new dry-bank information may lower it.  Shape that correction
@@ -677,6 +739,8 @@ def downhill_profiles(
                 # The floor runs its minimum through the ridge; the flank keeps
                 # the first pass's level.
                 lm[first:crest + 1] = previous[first:crest + 1]
+        if sid in lake_caps:
+            lm = np.fmin(lm, lake_caps[sid])
         # The old exporter profile, retained only to report how much this change
         # lowers levels relative to the previous running-minimum implementation.
         old = np.fmin.accumulate(np.concatenate([[seed_old], lvl]))[1:]
@@ -708,6 +772,7 @@ def downhill_profiles(
                 lake_level = _lake_level(wg, lid)
                 if lake_level is None:
                     continue
+                lake_level = min(lake_level, float(lake_caps[sid][a - 1]))
                 first = spans[si - 1][1] + 1 if si > 0 else 0
                 depth = kvbathy.segment_depth(s, depth_by_order, depth_scale)
                 reached_first = _grade_tail(
@@ -737,12 +802,13 @@ def downhill_profiles(
                         first = max(first, b + 1)
                 touch = half_widths[sid] + half_widths[uid] + plan.spacing_m
                 depth = kvbathy.segment_depth(u, depth_by_order, depth_scale)
+                join_level = min(float(main_level), float(lake_caps[uid][-1]))
                 reached_first = _grade_tail(
                     ulm, ceilings[uid], u.xy, first, u.n - 1,
-                    main_level, touch, confluence_grade, depth,
+                    join_level, touch, confluence_grade, depth,
                     backwater=lake_backwater)
                 if reached_first and first == 0 and lake_backwater:
-                    backwater_at_start[uid] = float(main_level)
+                    backwater_at_start[uid] = join_level
 
         fall_report = {"candidates": 0, "ramped": 0,
                        "ground_step": 0, "bank_step": 0,
@@ -832,6 +898,8 @@ def downhill_profiles(
                     if a <= 0:
                         continue
                     lake_level = _lake_level(wg, lid)
+                    if lake_level is not None:
+                        lake_level = min(lake_level, float(lake_caps[sid][a - 1]))
                     if lake_level is None or lm[a - 1] >= lake_level - 1e-9:
                         continue
                     first = 0
@@ -839,7 +907,9 @@ def downhill_profiles(
                         if pb < a:
                             first = max(first, pb + 1)
                     k = a - 1
-                    while k >= first and lm[k] < lake_level - 1e-9:
+                    ceiling = ceilings[sid]
+                    while (k >= first and lm[k] < lake_level - 1e-9
+                           and not ceiling[k] < lake_level - BACKWATER_MAX_OVER_BANK_M):
                         k -= 1
                     lm[k + 1:a] = float(lake_level)
 

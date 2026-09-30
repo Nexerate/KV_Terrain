@@ -136,6 +136,9 @@ FLAG_SPILLS_OFF_MAP = 1 << 2
 FLAG_OUTLET_OCEAN = 1 << 3
 FLAG_AUTHORED_LAKE = 1 << 4
 FLAG_MINOR = 1 << 5
+# This node's outflow head was capped by `cap_heads_below_lakes`. (Bit 6 is the
+# runtime's own FLAG_EDITED_ESCAPE.)
+FLAG_HEAD_CAPPED = 1 << 7
 
 FLAG_NAMES = {
     "leaf": FLAG_LEAF,
@@ -144,6 +147,7 @@ FLAG_NAMES = {
     "outlet_ocean": FLAG_OUTLET_OCEAN,
     "authored_lake": FLAG_AUTHORED_LAKE,
     "minor": FLAG_MINOR,
+    "head_capped": FLAG_HEAD_CAPPED,
 }
 
 # Below either threshold a node is flagged MINOR: kept in the tree (a runtime walk
@@ -531,6 +535,64 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
         cand = np.where(np.isfinite(lv), lv - spill[ok], 0.0)
         head[ok] = np.maximum(head[ok], cand)
     nodes["outflow_head_m"] = np.maximum(head, 0.0).astype(np.float32)
+
+
+def lowest_authored_level_below(nodes: np.ndarray) -> np.ndarray:
+    """Per node, the lowest `authored_level_m` of any authored lake in its subtree
+    (itself excluded), +inf where there is none. Relies on a non-root parent's id
+    being greater than its children's."""
+    n = nodes.shape[0]
+    low = np.full(n, np.inf)
+    parent = nodes["parent"].astype(np.int64)
+    authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
+    level = nodes["authored_level_m"].astype(np.float64)
+    for v in range(1, n):
+        p = parent[v]
+        if p == ROOT or p == NONE or p >= n:
+            continue
+        mine = low[v]
+        if authored[v] and np.isfinite(level[v]):
+            mine = min(mine, level[v])
+        if mine < low[p]:
+            low[p] = mine
+    return low
+
+
+def capped_heads(nodes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(head, capped): `outflow_head_m` with every node that is not an authored lake
+    held no higher than the lowest authored lake inside it, and where that bit."""
+    head = nodes["outflow_head_m"].astype(np.float64)
+    low = lowest_authored_level_below(nodes)
+    authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
+    room = np.maximum(low - nodes["spill_m"].astype(np.float64), 0.0)
+    capped = (~authored) & np.isfinite(low) & (head > room)
+    head = np.where(capped, room, head).astype(np.float32)
+    return head, capped
+
+
+def cap_heads_below_lakes(h: Hierarchy) -> dict:
+    """
+    A node that is not an authored lake may not hold water above an authored lake
+    inside it: the runtime fills a node's whole subtree to the highest level on its
+    ancestor path, so such a node floods that lake past its mapped shore.
+
+    The head that did it is read at a river sample on the saddle, and on Lierne
+    (2026-09-30) that sample was mostly not the river carrying water OUT of the
+    node: an inflow's carved trench on the lake's rim, or a stray river sample
+    beside a lake carrying a nearby river's higher surface. 195 unmatched
+    ancestors then held up to 2.9 m above the lakes below them, and the runtime
+    drew 392 lakes too high. Run after the lakes are matched (FLAG_AUTHORED_LAKE).
+    Marks every capped node FLAG_HEAD_CAPPED.
+    """
+    nodes = h.nodes
+    head, capped = capped_heads(nodes)
+    before = nodes["outflow_head_m"].astype(np.float64)
+    nodes["outflow_head_m"] = head
+    nodes["flags"][capped] |= FLAG_HEAD_CAPPED
+    cut = before[capped] - head[capped]
+    return {"heads_capped_below_a_lake": int(capped.sum()),
+            "cap_median_m": round(float(np.median(cut)), 3) if cut.size else 0.0,
+            "cap_max_m": round(float(cut.max()), 3) if cut.size else 0.0}
 
 
 def hypsometry_axis(floor_code: int, spill_code: int, max_code: int) -> np.ndarray:

@@ -132,6 +132,37 @@ exporter's audit mask says so: water class lake, the lake's id, and not an islan
 | `no_node` | 4 |
 | `level_above_spill` | 4 |
 
+## Third rule: no node holds above an authored lake inside it
+
+**From:** kvterrain, 2026-09-30, after the runtime's river audit.
+
+The exporter now caps `outflow_head_m` on every node that is **not** an authored
+lake, so that `spill_m + outflow_head_m` never exceeds the lowest
+`authored_level_m` of an authored lake in its subtree. Such nodes carry the new
+flag `FLAG_HEAD_CAPPED = 1 << 7` (bit 6 stays the runtime's `FLAG_EDITED_ESCAPE`).
+
+Why: the head is read at the saddle's river samples, and for these nodes that
+sample was not the river carrying water out. It was an inflow's carved trench on
+the lake's rim, or a stray river sample beside the lake carrying a nearby river's
+higher surface. The level table fills a subtree to the highest level on its
+ancestor path, so 392 lakes were drawn above their shores. The runtime's
+`inflow_heads_check.py` reports 0 cases on an export with this change (195 before).
+
+Runtime change needed: wherever a head is recomputed for a node that is not an
+authored lake (`DepressionEditor.OutflowHead` on rebuilt nodes), apply the same cap:
+
+```
+lowest(u) = min authored_level_m over authored lakes strictly inside u's subtree
+if (!authored(u) && lowest(u) is finite)
+    head = min(head, max(lowest(u) - spill_m(u), 0))
+```
+
+Without it, an edit that rebuilds such a node brings the old head back. Unedited
+nodes need nothing: the level table reads the stored head.
+
+`validate-hierarchy` recomputes heads from `surface.atlas` and applies the same cap
+before comparing.
+
 ## What does not change
 
 - **`OutflowHead`** still reads heads only at river samples. The riffle is a river

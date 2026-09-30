@@ -629,12 +629,15 @@ def run_audit(plan: core.GridPlan, h: H.Hierarchy, codes: np.ndarray,
               river_surface: Optional[np.ndarray] = None) -> dict:
     """`river_surface` is the water surface as exported (only its river samples are
     read); without it every outflow head is 0."""
+    head_report = {}
     if river_surface is not None:
         H.set_outflow_heads(h, wg.type == kvwater.TYPE_RIVER, river_surface)
     tin, tout = H.subtree_intervals(h.nodes)
     inflow = {j.lake_id for j in (river_net.junctions if river_net else [])
               if j.kind == rivernet.JUNCTION_INFLOW}
     lakes = audit_lakes(plan, h, codes, wg, inflow_lakes=inflow, tin=tin, tout=tout)
+    if river_surface is not None:
+        head_report = H.cap_heads_below_lakes(h)
     if river_net is not None and river_net.segments:
         rivers, walked, minor_pits = audit_rivers(plan, h, codes, wg,
                                                   river_net.segments)
@@ -665,6 +668,7 @@ def run_audit(plan: core.GridPlan, h: H.Hierarchy, codes: np.ndarray,
         "river_pits_below_list_depth": int(minor_pits),
         "unexplained_depressions": dep_total,
         "depressions_joining_a_lake": dep_joins,
+        "outflow_heads": head_report,
     }
     return {
         "format": "kvterrain-water-audit/1",

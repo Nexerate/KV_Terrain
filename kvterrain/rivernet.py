@@ -716,6 +716,7 @@ def build_river_network(
     depth_scale: float = 1.0,
     traced: Optional[TracedNetwork] = None,
     shaped_profiles: Optional[dict] = None,
+    drawn_ground: Optional[np.ndarray] = None,
     progress: Optional[Callable[[float, str], None]] = None,
 ) -> RiverNetwork:
     """
@@ -761,6 +762,8 @@ def build_river_network(
                   for lid, info in (wg.lake_table or {}).items()}
 
     ws = None if water_surface is None else np.asarray(water_surface)
+    dg = None if drawn_ground is None else np.asarray(drawn_ground)
+    raised_to_surface = 0
 
     for s in segments:
         xy = s.xy
@@ -810,6 +813,24 @@ def build_river_network(
             take = np.isfinite(ras)
             level[take] = ras[take]
 
+        # The runtime draws `level - ground` on the terrain as shipped. Where an
+        # open vertex's level sits below that ground but the exported surface
+        # carries water there (a lake's level at a mouth, the tie-in raise beside
+        # one), take the surface: otherwise the river runs
+        # under the terrain there in the runtime, which the preview never shows
+        # (Lierne, 2026-09-30: 660 vertices, 251 by more than 0.5 m).
+        if ws is not None and dg is not None:
+            ri, ci = _nearest_idx(plan, xy)
+            ras = ws[ri, ci].astype(np.float64)
+            open_vertex = np.ones(s.n, dtype=bool)
+            for a, b, _lid in s.lake_spans:
+                open_vertex[a:b + 1] = False
+            low = (open_vertex & np.isfinite(ras) & (level < dg[ri, ci] - 0.02)
+                   & (ras > level))
+            if low.any():
+                level[low] = ras[low]
+                raised_to_surface += int(low.sum())
+
         s.z = z.astype(np.float32)
         s.level = level.astype(np.float32)
 
@@ -819,6 +840,7 @@ def build_river_network(
     report = {
         "segments": len(segments),
         "vertices": int(sum(s.n for s in segments)),
+        "levels_raised_to_surface_above_ground": int(raised_to_surface),
         "vertex_stride_m": stride,
         "junctions": len(junctions),
         "lakes": len(lakes),
