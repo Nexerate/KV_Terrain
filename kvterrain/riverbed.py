@@ -562,6 +562,45 @@ def _tilt_flat_runs(surface: np.ndarray, raw: np.ndarray, ceiling: np.ndarray,
     return changed
 
 
+def tie_branches(out: dict, by_id: dict, wg: kvwater.WaterGrid) -> int:
+    """
+    A side channel's level (`riverbranch`), in place on the shaped profiles: from
+    its river's final level at the split, falling evenly by arc length to the
+    river's level where it rejoins, or to the lake's where a delta channel enters
+    it, and the lake's on from there. Run after every other shaping, so the levels
+    it starts and ends at are the ones that ship. Its own ground does not shape it:
+    N50 says the channel holds water, so where the ground stands above the ramp
+    the carve takes it down. Returns the number of channels tied.
+    """
+    tied = 0
+    for sid, s in by_id.items():
+        b = getattr(s, "branch_of", None)
+        if b is None or sid not in out or b.parent not in out:
+            continue
+        start = float(out[b.parent][2][b.parent_vertex])
+        if b.rejoin >= 0 and b.rejoin in out:
+            end = float(out[b.rejoin][2][b.rejoin_vertex])
+        elif b.lake_id:
+            lv = _lake_level(wg, int(b.lake_id))
+            end = float(lv) if lv is not None else np.nan
+        else:
+            continue
+        if not (np.isfinite(start) and np.isfinite(end)):
+            continue
+        end = min(end, start)
+        lm = out[sid][2]
+        n = lm.size
+        a = min([int(sp[0]) for sp in s.lake_spans], default=n - 1)
+        a = max(a, 1)
+        seg = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(s.xy[:a + 1], axis=0).T))])
+        t = seg / seg[-1] if seg[-1] > 0 else np.linspace(0.0, 1.0, a + 1)
+        lm[:a + 1] = start + (end - start) * t
+        lm[a + 1:] = end
+        s.barriers = []
+        tied += 1
+    return tied
+
+
 def downhill_profiles(
     plan: core.GridPlan,
     traced: "rivernet.TracedNetwork",
@@ -912,6 +951,8 @@ def downhill_profiles(
                            and not ceiling[k] < lake_level - BACKWATER_MAX_OVER_BANK_M):
                         k -= 1
                     lm[k + 1:a] = float(lake_level)
+
+        tie_branches(out, by_id, wg)
 
         # Tie-ins and fall ramps changed surfaces after the first bed calculation.
         for sid, values in out.items():

@@ -255,7 +255,8 @@ default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-bed-curvature`, `--lake-ring-fraction`, `--lake-bed-noise`,
 `--lake-bed-noise-wavelength`, `--lake-bed-seed`, `--lake-bed-max-depth` and
 `--(no-)lake-surveys`, `--(no-)river-mouths`, `--(no-)lake-shoreline`,
-`--(no-)river-n50-widths`, `--(no-)river-thalweg-snap`, `--river-depth-model`, the ramp model's `--lake-max-depth` and
+`--(no-)river-n50-widths`, `--(no-)river-thalweg-snap`, `--(no-)river-side-channels`,
+`--river-depth-model`, the ramp model's `--lake-max-depth` and
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
@@ -737,6 +738,26 @@ and leaves the water surface where the ground is:
   water below the ground under its line goes from 0.43 m to 0.13 m.
   `rivers.bin` carries the moved vertices; `geom_hash` still identifies the
   mapped run.
+
+  **Side channels from N50's river areas** (`--river-side-channels`, on by
+  default; `kvterrain/riverbranch.py`). NVE maps one line per river, so where a
+  river splits round islands or fans into a lake over several mouths, the line
+  follows one channel and N50's area holds them all. Ågardselva narrowed to a
+  third of its width 230 m above Skjeldbreivatnet, where two of its three mouths
+  left it, and 18% of Lierne's N50 river area was undrawn. Each undrawn piece
+  that leaves a drawn river and rejoins it (a side arm), or ends in the lake that
+  river runs into (a delta channel), gets a line down its middle: the cheapest
+  path through the piece at 1 m, with a cost that falls with the distance to its
+  banks, smoothed, joined to the river as a Y, and as wide at each vertex as the
+  piece. It is a segment of its own with no graph links, carrying `branch_of`
+  (`river_branches.bin`): the segment and vertex it leaves, its share
+  `w_b² / (w_b² + w_t²)` of that segment's flow, and where it rejoins. Its level
+  runs evenly from the river's at the split to the river's at the rejoin, or the
+  lake's. On Lierne: 92 side arms and 2 delta channels, 25.4 km, and the undrawn
+  share of the N50 river area falls from 18% to 13%. Pieces with one
+  contact (bulges, backwaters, pools) are not traced yet. The runtime needs
+  `docs/runtime-spec-river-branches.md` for a side channel to dry with its
+  river; without it a side channel keeps its exported flow.
 
 - **Bank-capped downhill river profile** (`--downhill-river-bed`, on by default).
   Before the river carve, each densified centreline samples the lowest dry bank

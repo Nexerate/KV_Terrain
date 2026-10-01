@@ -71,6 +71,7 @@ def _water_opts(a) -> dict:
         "lake_shoreline": a.lake_shoreline,
         "river_n50_widths": a.river_n50_widths,
         "river_thalweg_snap": a.river_thalweg_snap,
+        "river_side_channels": a.river_side_channels,
         "river_depth_model": a.river_depth_model,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
@@ -725,6 +726,11 @@ def _add_process_args(p):
                    help="move each stream's line up to 15 m sideways onto the "
                         "valley bottom the scan shows, instead of trenching the "
                         "valley side where the mapped line runs (default: on)")
+    p.add_argument("--river-side-channels", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_side_channels",
+                   help="trace a line down the side arms and extra delta mouths "
+                        "N50 maps as river area but no mapped line runs through; "
+                        "writes river_branches.bin (default: on)")
     p.add_argument("--lake-shoreline", action=argparse.BooleanOptionalAction,
                    default=True, dest="lake_shoreline",
                    help="let the scan decide where each lake's water ends: scanned "

@@ -350,6 +350,9 @@ class RiverSegment:
     # Ridges the downhill bed does not cut through (`riverbed._find_barriers`):
     # (first, crest) vertex pairs, set by the first profile pass.
     barriers: list = field(default_factory=list)
+    # A side channel traced from N50's river area (`riverbranch.BranchOf`); None
+    # for a mapped line.
+    branch_of: Optional[object] = None
     node_id: int = NO_HIERARCHY_NODE
     local_catchment_m2: float = 0.0
     accumulated_catchment_m2: float = 0.0
@@ -862,6 +865,8 @@ def build_river_network(
         s.z = z.astype(np.float32)
         s.level = level.astype(np.float32)
 
+    branch_ends_retied = _retie_branch_ends(segments)
+
     junctions = _detect_junctions(segments, wg)
     lakes = build_lake_records(plan, wg)
 
@@ -870,6 +875,7 @@ def build_river_network(
         "vertices": int(sum(s.n for s in segments)),
         "levels_raised_to_surface_above_ground": int(raised_to_surface),
         "levels_matched_to_surface": int(matched_to_surface),
+        "side_channel_ends_retied": int(branch_ends_retied),
         "vertex_stride_m": stride,
         "junctions": len(junctions),
         "lakes": len(lakes),
@@ -905,6 +911,36 @@ def build_river_network(
 
     return RiverNetwork(segments=segments, junctions=junctions, lakes=lakes,
                         report=report, vertex_stride_m=stride)
+
+
+def _retie_branch_ends(segments: list) -> int:
+    """
+    A side channel (`riverbranch`) starts at its river's level and ends at the
+    level where it rejoins. The profiles tied it so, but the vertex levels above
+    are adjusted afterwards, a river's included. Take each end's gap out again,
+    spread linearly along the channel short of any lake, so the runtime meets one
+    level at a split and at a rejoin. Returns the number of ends moved.
+    """
+    by_id = {s.seg_id: s for s in segments}
+    moved = 0
+    for s in segments:
+        b = getattr(s, "branch_of", None)
+        if b is None or b.parent not in by_id or s.level is None:
+            continue
+        lv = s.level.astype(np.float64)
+        ds = float(by_id[b.parent].level[b.parent_vertex]) - lv[0]
+        de = 0.0
+        if b.rejoin >= 0 and b.rejoin in by_id:
+            de = float(by_id[b.rejoin].level[b.rejoin_vertex]) - lv[-1]
+        a = min([int(sp[0]) for sp in s.lake_spans], default=s.n - 1)
+        a = max(a, 1)
+        d = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(s.xy[:a + 1], axis=0).T))])
+        t = d / d[-1] if d[-1] > 0 else np.linspace(0.0, 1.0, a + 1)
+        if abs(ds) > 1e-6 or abs(de) > 1e-6:
+            lv[:a + 1] += ds * (1.0 - t) + de * t
+            moved += int(abs(ds) > 1e-6) + int(abs(de) > 1e-6)
+            s.level = lv.astype(np.float32)
+    return moved
 
 
 def _runs_of_lake(
@@ -1523,6 +1559,10 @@ def export_river_network(
     if any(getattr(s, "vertex_width_m", None) is not None for s in net.segments):
         man["river_widths"] = write_river_widths_bin(
             net, os.path.join(out_dir, RIVER_WIDTHS_FILE))
+    if any(getattr(s, "branch_of", None) is not None for s in net.segments):
+        from . import riverbranch
+        man["river_branches"] = riverbranch.write_branches_bin(
+            net.segments, os.path.join(out_dir, riverbranch.BRANCHES_FILE))
     hydro = net.report.get("hydrology")
     if hydro:
         man["rivers"]["discharge"] = hydro

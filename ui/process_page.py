@@ -122,6 +122,11 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             help="Move each stream's mapped line up to 15 m sideways onto the "
                  "valley bottom the scan shows, instead of cutting a trench into "
                  "the valley side where the line runs.")
+        river_side_channels = st.toggle(
+            "Side channels from N50", value=True, disabled=d,
+            help="Where a river splits round islands or into several mouths, "
+                 "draw the channels N50 maps that have no line of their own. "
+                 "Each follows the river it leaves, and dries with it.")
         lake_shoreline = st.toggle(
             "Shoreline from the scan", value=True, disabled=t,
             help="Scanned land above the lake's level stays land, scanned ground "
@@ -265,6 +270,7 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_shoreline": lake_shoreline,
             "river_n50_widths": river_n50_widths,
             "river_thalweg_snap": river_thalweg_snap,
+            "river_side_channels": river_side_channels,
             "lake_slope_ratio": lake_slope_ratio,
             "lake_bed_curvature": lake_bed_curvature,
             "lake_bed_noise": lake_bed_noise,

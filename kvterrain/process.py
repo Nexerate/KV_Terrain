@@ -156,7 +156,8 @@ def run_process(
     lake beds are then synthetic everywhere, and the manifest says so.
     """
     from . import (water, bathymetry, watersurface, waterid, rivernet, riverbed,
-                   lakebed, rivermouth, shoreline, riverwidth, thalweg)
+                   lakebed, rivermouth, shoreline, riverwidth, thalweg,
+                   riverbranch)
 
     if heights.shape != (plan.samples_y, plan.samples_x):
         raise ValueError(
@@ -191,6 +192,7 @@ def run_process(
     width_report: dict = {}
     snap_params = None
     thalweg_report: dict = {}
+    side_channels = False
     river_depth_model = "discharge"
     depth_by_order_compat = None
     snap_report: dict = {}
@@ -257,6 +259,7 @@ def run_process(
             enabled=bool(opts.pop("river_n50_widths", True)))
         snap_params = thalweg.SnapParams(
             enabled=bool(opts.pop("river_thalweg_snap", True)))
+        side_channels = bool(opts.pop("river_side_channels", True))
         if survey_layers is None:
             survey_layers = opts.pop("bathymetry", None)
         else:
@@ -384,6 +387,14 @@ def run_process(
         areas = riverwidth.water_areas(n50_layer) if width_params.enabled else None
         width_report["fit_to_areas"] = riverwidth.fit_to_areas(
             traced.segments, areas, margin_m=plan.spacing_m)
+        # 2iv. The side channels: arms and delta mouths N50 maps that no line runs
+        #      through (see riverbranch). Each is a segment of its own from here
+        #      on, raster, carve and rivers.bin alike.
+        width_report["side_channels"] = (riverbranch.add_side_channels(
+            plan, traced, areas, water_leaf,
+            width_scale=raster_opts.get("width_scale", 1.0),
+            depth_from_q=(river_depth_model == "discharge"))
+            if side_channels and areas is not None else {"enabled": False})
         water.rerasterize_rivers(plan, water_leaf, traced.segments,
                                  clip_water=(areas.buffer(plan.spacing_m)
                                              if areas is not None else None))
