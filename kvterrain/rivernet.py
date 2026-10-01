@@ -1464,9 +1464,18 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
             "NVE publishes a hoyde, but it stands more than the configured margin "
             "above practically all the land around the lake, so it was replaced by "
             "the same DTM estimate. `hoyde_moh` still holds the published value.")
+    if any(l.get("level_source") == kvwater.LEVEL_SOURCE_RAISED for l in net.lakes):
+        doc["level_sources"][kvwater.LEVEL_SOURCE_RAISED] = (
+            "NVE publishes a hoyde, but it stands more than the configured margin "
+            "below the lake's own flown water surface, with its shore above that "
+            "too, so it was raised to the same DTM estimate. `hoyde_moh` still "
+            "holds the published value.")
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)
     return {"file": os.path.basename(path), "count": len(net.lakes),
+            "with_raised_level": sum(
+                1 for l in net.lakes
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_RAISED),
             "with_authored_level": sum(
                 1 for l in net.lakes if l.get("authored_level_m") is not None),
             "with_estimated_level": sum(

@@ -204,6 +204,12 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             disabled=d or not correct_levels,
             help="How far a published level may stand above the 90th percentile of "
                  "its shore ring before it is corrected.")
+        max_below_scan = st.slider(
+            "Margin below the scanned water (m)", 0.5, 5.0, 1.0, 0.5,
+            disabled=d or not correct_levels,
+            help="How far a published level may stand below the lake's own scanned "
+                 "water before it is raised to it. NVE levels are whole metres, so "
+                 "under 0.5 m is rounding. Regulated reservoirs are never raised.")
         ocean_level = st.number_input(
             "Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0, disabled=d,
             help="Kartverket heights are metres above sea level, so 0 is real sea "
@@ -282,6 +288,7 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "estimate_lake_levels": estimate_lake_levels,
             "lake_perimeter_cap": lake_perimeter_cap,
             "lake_level_max_above_shore_m": max_above_shore if correct_levels else None,
+            "lake_level_max_below_scan_m": max_below_scan if correct_levels else None,
             "downhill_river_bed": downhill_bed,
             "lake_edge_is_shore": lake_edge_is_shore,
             "lake_shore_8_connected": lake_shore_8,
@@ -521,6 +528,18 @@ def _reports(state: dict) -> None:
                 import pandas as pd
                 with st.expander("Corrected lakes"):
                     st.dataframe(pd.DataFrame(corr.get("lakes", [])), width="stretch",
+                                 hide_index=True)
+            rais = ll.get("raise") or {}
+            if ll.get("levels_raised"):
+                st.caption(
+                    f"{ll['levels_raised']:,} published levels stood more than "
+                    f"{rais.get('max_below_scan_m', 0):g} m below their own scanned "
+                    f"water and were raised to it (median "
+                    f"{ll['levels_raised_median_m']:.1f} m, max "
+                    f"{ll['levels_raised_max_m']:.1f} m).")
+                import pandas as pd
+                with st.expander("Raised lakes"):
+                    st.dataframe(pd.DataFrame(rais.get("lakes", [])), width="stretch",
                                  hide_index=True)
             capped = ll.get("levels_capped_to_perimeter", 0)
             if capped:

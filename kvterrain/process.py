@@ -286,6 +286,9 @@ def run_process(
         max_above_shore = opts.pop("lake_level_max_above_shore_m",
                                    water.DEFAULT_LEVEL_MAX_ABOVE_SHORE_M)
         max_above_shore = None if max_above_shore is None else float(max_above_shore)
+        max_below_scan = opts.pop("lake_level_max_below_scan_m",
+                                  water.DEFAULT_LEVEL_MAX_BELOW_SCAN_M)
+        max_below_scan = None if max_below_scan is None else float(max_below_scan)
         fill_lake_holes = bool(opts.pop("fill_lake_holes", True))
         # The water redesign's first milestone. All three default ON; turning all
         # three off reproduces the pre-redesign export byte for byte.
@@ -345,7 +348,7 @@ def run_process(
         level_report = water.apply_estimated_levels(
             water_leaf, leaf_uncarved, enabled=estimate_lake_levels,
             island=water_leaf.lake_island, perimeter_cap=perimeter_cap,
-            max_above_shore_m=max_above_shore)
+            max_above_shore_m=max_above_shore, max_below_scan_m=max_below_scan)
         lake_surf = water_leaf.lake_surface_moh()
 
         # 1d. THE SHORELINE: the scan decides where the water ends. Lake samples the

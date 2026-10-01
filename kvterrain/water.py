@@ -234,6 +234,7 @@ class LakePoly:
     navn: Optional[str]
     area_m2: Optional[float]
     hoyde_moh: Optional[float] = None   # lake surface elevation (m.o.h.), if present
+    regulated: bool = False    # NVE marks it a regulated reservoir (objekttype/magasinnr)
 
 
 @dataclass
@@ -766,10 +767,13 @@ def features_from_geojson(
                 hoyde_moh = float(hv)
             except (TypeError, ValueError):
                 hoyde_moh = None
+        regulated = ("regulert" in str(props.get("objekttype") or "").lower()
+                     or props.get("magasinnr") not in (None, ""))
         for rings in _iter_polygon_rings(f.get("geometry") or {}):
             arr_rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings if len(r) >= 4]
             if arr_rings:
-                lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh))
+                lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh,
+                                           regulated))
 
     return WaterFeatures(rivers=rivers, main_rivers=main_rivers, lakes=lake_polys)
 
@@ -777,12 +781,20 @@ def features_from_geojson(
 LEVEL_SOURCE_NVE = "nve_hoyde"
 LEVEL_SOURCE_ESTIMATED = "dtm_interior_low"
 LEVEL_SOURCE_CORRECTED = "dtm_corrected"
+LEVEL_SOURCE_RAISED = "dtm_raised"
 
 # A published NVE level more than this far above the RING_PERCENTILE of the land
 # just outside the polygon is contradicted by the terrain, and is replaced by the
 # DTM estimate (owner's decision, 2026-09-17: "above all the surrounding terrain").
 DEFAULT_LEVEL_MAX_ABOVE_SHORE_M = 2.0
 LEVEL_CHECK_RING_PERCENTILE = 90.0
+# The mirror: a published level more than this far below the lake's own flown
+# water, with the land ringing it standing above that water too, is raised to the
+# DTM estimate. A lake cannot have been flown metres above its level; NVE's
+# whole-metre hoyde explains up to half a metre (owner's decision, 2026-10-01: 77
+# Lierne lakes, 254 ha, drew their water a metre or more below their own shore).
+# Regulated reservoirs keep their published level: they can be flown full.
+DEFAULT_LEVEL_MAX_BELOW_SCAN_M = 1.0
 
 # How far outside its polygon a lake may claim samples that are still its own flat
 # water surface in the DTM, and how close to that surface they have to be.
@@ -895,6 +907,7 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                            island: Optional[np.ndarray] = None,
                            perimeter_cap: bool = True,
                            max_above_shore_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SHORE_M,
+                           max_below_scan_m: Optional[float] = DEFAULT_LEVEL_MAX_BELOW_SCAN_M,
                            ) -> dict:
     """
     Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
@@ -935,6 +948,15 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     with `level_source = "dtm_corrected"`; `hoyde_moh` keeps the published value. A
     drawn-down reservoir is not caught by this, because its shore rises above its
     real level: the 12 largest Lierne lakes all sit at or below their ring.
+
+    The mirror exception (`max_below_scan_m`, 1 m by default; None disables it): a
+    `hoyde` more than that BELOW the same DTM estimate, capped at the shore ring as
+    always, puts the water below the lake's own flown surface and below its whole
+    shoreline, a raised rim round the lake. On Lierne that is 77 lakes, mostly
+    small tarns published several metres low. The level is raised to the estimate,
+    with `level_source = "dtm_raised"` and `hoyde_moh` kept. A regulated reservoir
+    (NVE `objekttype` InnsjøRegulert or a `magasinnr`) is left as published: it can
+    have been flown full.
 
     THE PERIMETER CAP (`perimeter_cap`, on by default) therefore applies to
     ESTIMATED levels only. Those come from the polygon's interior, so the one
@@ -1001,6 +1023,29 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                               "level_m": round(v, 3),
                               "lowered_m": round(float(h) - v, 3)})
 
+    raised: list = []
+    if max_below_scan_m is not None and table:
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            if (h is None or info.get("level_source") != LEVEL_SOURCE_NVE
+                    or info.get("regulated")):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            if v is None or not np.isfinite(v):
+                continue
+            c = cap.get(lid)
+            if c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            if float(v) <= float(h) + float(max_below_scan_m):
+                continue
+            info["level_m"] = float(v)
+            info["level_source"] = LEVEL_SOURCE_RAISED
+            raised.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                           "navn": info.get("navn"), "hoyde_moh": float(h),
+                           "level_m": round(float(v), 3),
+                           "raised_m": round(float(v) - float(h), 3)})
+
     if enabled and missing:
         est, cap = est_and_cap()
         for lid in missing:
@@ -1032,6 +1077,20 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                     "raised; hoyde_moh keeps the published value",
             "lakes": sorted(corrected, key=lambda c: -c["lowered_m"]),
         },
+        "levels_raised": len(raised),
+        "levels_raised_max_m": float(max(r["raised_m"] for r in raised)) if raised else 0.0,
+        "levels_raised_median_m": (float(np.median([r["raised_m"] for r in raised]))
+                                   if raised else 0.0),
+        "raise": {
+            "enabled": max_below_scan_m is not None,
+            "max_below_scan_m": max_below_scan_m,
+            "rule": "a published hoyde more than max_below_scan_m below the DTM "
+                    "estimate (perimeter cap included) is raised to it, never "
+                    "lowered; regulated reservoirs are left as published; "
+                    "hoyde_moh keeps the published value",
+            "regulated_kept": sum(1 for i in table.values() if i.get("regulated")),
+            "lakes": sorted(raised, key=lambda r: -r["raised_m"]),
+        },
         "lakes_total": len(table),
         "levels_from_nve": sum(1 for i in table.values()
                                if i.get("level_source") == LEVEL_SOURCE_NVE),
@@ -1045,7 +1104,8 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                      if margin_m is None else float(margin_m)),
         "band_pct": [bathymetry.DEFAULT_LEVEL_TRIM_PCT,
                      bathymetry.DEFAULT_LEVEL_BAND_PCT],
-        "method": (f"a published NVE hoyde is used verbatim. For a lake without "
+        "method": (f"a published NVE hoyde is used verbatim unless the terrain "
+                   f"contradicts it (see correction and raise). For a lake without "
                    f"one: the mean of the "
                    f"{bathymetry.DEFAULT_LEVEL_TRIM_PCT:g}-"
                    f"{bathymetry.DEFAULT_LEVEL_BAND_PCT:g}th percentile band of the "
@@ -1378,7 +1438,7 @@ def rasterize_water(
             lopenr_to_local[key] = local
             lake_table[local] = {
                 "lopenr": lk.lopenr, "navn": lk.navn, "area_m2": lk.area_m2,
-                "hoyde_moh": lk.hoyde_moh,
+                "hoyde_moh": lk.hoyde_moh, "regulated": bool(lk.regulated),
             }
         shell = lk.rings[0]
         holes = lk.rings[1:] if len(lk.rings) > 1 else None

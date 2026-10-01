@@ -511,6 +511,9 @@ def check_water(exp: Export) -> dict:
                            "corrected_level": sum(
                                1 for l in rows if l.get("level_source")
                                == kvwater.LEVEL_SOURCE_CORRECTED),
+                           "raised_level": sum(
+                               1 for l in rows if l.get("level_source")
+                               == kvwater.LEVEL_SOURCE_RAISED),
                            "without_level": len(no_level)}
         if no_level:
             # Not an error: an unlevelled lake is left uncarved on purpose, so it

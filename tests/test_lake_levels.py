@@ -170,3 +170,30 @@ def test_correction_can_be_switched_off():
     rep = water.apply_estimated_levels(wg, h, max_above_shore_m=None)
     assert wg.lake_table[1]["level_m"] == 118.0
     assert rep["levels_corrected"] == 0
+
+
+def test_published_level_below_its_own_flown_water_is_raised():
+    h, wg = correction_world(98.0)                    # flown water at 100 m
+    rep = water.apply_estimated_levels(wg, h)
+    info = wg.lake_table[1]
+    assert info["level_source"] == water.LEVEL_SOURCE_RAISED
+    assert info["hoyde_moh"] == 98.0
+    assert 99.0 < info["level_m"] <= 100.0
+    assert rep["levels_raised"] == 1
+
+
+def test_a_level_within_rounding_of_the_scan_or_a_reservoir_is_kept():
+    h, wg = correction_world(99.5)
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
+    h, wg = correction_world(97.0)
+    wg.lake_table[1]["regulated"] = True
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_m"] == 97.0
+
+
+def test_raise_can_be_switched_off():
+    h, wg = correction_world(97.0)
+    rep = water.apply_estimated_levels(wg, h, max_below_scan_m=None)
+    assert wg.lake_table[1]["level_m"] == 97.0
+    assert rep["levels_raised"] == 0
