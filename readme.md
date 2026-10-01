@@ -750,8 +750,9 @@ and leaves the water surface where the ground is:
   path through the piece at 1 m, with a cost that falls with the distance to its
   banks, smoothed, joined to the river as a Y, and as wide at each vertex as the
   piece. It is a segment of its own with no graph links, carrying `branch_of`
-  (`river_branches.bin`): the segment and vertex it leaves, its share
-  `w_b² / (w_b² + w_t²)` of that segment's flow, and where it rejoins. Its level
+  (`river_branches.bin`): the segment and vertex it leaves, its share of that
+  segment's flow, `w_b² / (w_t² + Σ w²)` over the river alongside and every channel
+  beside the same reach of it, and where it rejoins. Its level
   runs evenly from the river's at the split to the river's at the rejoin, or the
   lake's. On Lierne: 92 side arms and 2 delta channels, 25.4 km, and the undrawn
   share of the N50 river area falls from 18% to 13%. Pieces with one

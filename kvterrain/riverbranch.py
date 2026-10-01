@@ -28,9 +28,10 @@ pass and the exporter's accumulation both assume one downstream per segment, and
 side arm linked back into its river would count the same water twice. Instead it
 carries `branch_of`, written to `river_branches.bin`: the segment and vertex it
 leaves from, its share of that segment's flow, and where it rejoins. Its share is
-w_b^2 / (w_b^2 + w_t^2) of the median widths of branch and river alongside
-(owner, 2026-10-01). Its level runs from the river's level at the split to the
-river's level where it rejoins, or to the lake's (`riverbed.tie_branches`).
+w_b^2 / (w_t^2 + sum w^2), over the median widths of the river alongside and of
+every channel beside the same reach of it (owner, 2026-10-01; `_share_groups`).
+Its level runs from the river's level at the split to the river's level where it
+rejoins, or to the lake's (`riverbed.tie_branches`).
 """
 
 from __future__ import annotations
@@ -372,6 +373,7 @@ def add_side_channels(
     margin = 40.0 + BRANCH_CONTACT_M
     new: list = []
     shares: list = []
+    reach: list = []
     for (x0, y0, x1, y1, coarse, rs, cs) in windows:
         win = _Window(x0 - margin, y0 - margin, x1 + margin, y1 + margin, res)
         box = shapely.box(win.x0, win.y1 - win.H * res, win.x0 + win.W * res, win.y1)
@@ -439,8 +441,14 @@ def add_side_channels(
                   if not _span_mask(by_id[sid])[v]]
             w_t = float(np.median(wt)) if wt else float(parent.width_m or 1.0)
             w_b = float(np.median(vw))
-            info.share = float(w_b ** 2 / (w_b ** 2 + w_t ** 2))
-            shares.append(info.share)
+            # The reach of the river the channel runs beside, as distances to the
+            # network's sink, for sharing the flow with channels beside the same.
+            if info.rejoin != NO_SEGMENT:
+                lo = float(pos[info.rejoin][info.rejoin_vertex])
+            else:
+                open_along = [(sid, v) for sid, v in along
+                              if not _span_mask(by_id[sid])[v]] or along[:1]
+                lo = float(pos[open_along[-1][0]][open_along[-1][1]])
             ri, ci = rivernet._nearest_idx(plan, xy)
             lake_at = wg.lake_id[ri, ci].astype(np.int64)
             lake_at[wg.type[ri, ci] != kvwater.TYPE_LAKE] = 0
@@ -454,7 +462,6 @@ def add_side_channels(
                 info.lake_id = int(spans[-1][2])
             else:
                 spans = []
-            q = float(np.float32(info.share * float(parent.discharge_m3_s)))
             seg = rivernet.RiverSegment(
                 seg_id=len(segments) + len(new),
                 geom_hash=rivernet.geometry_hash(xy),
@@ -462,17 +469,29 @@ def add_side_channels(
                 xy=xy, z=None, level=None,
                 elvid=parent.elvid, vassdragsnr=None,
                 lake_spans=spans,
-                discharge_m3_s=q,
             )
+            seg.vertex_width_m = np.maximum(vw, 1.0).astype(np.float32)
+            seg.branch_of = info
+            new.append(seg)
+            reach.append((seg, float(pos[info.parent][info.parent_vertex]), lo,
+                          w_b, w_t))
+            rep["side_arms" if info.rejoin != NO_SEGMENT else "delta_channels"] += 1
+            rep["branch_length_m"] += seg_len
+    groups = _share_groups(by_id, sink, reach)
+    for members in groups:
+        w_t = float(np.median([m[4] for m in members]))
+        total = w_t ** 2 + sum(m[3] ** 2 for m in members)
+        for seg, _hi, _lo, w_b, _wt in members:
+            info = seg.branch_of
+            info.share = float(w_b ** 2 / total)
+            shares.append(info.share)
+            q = float(np.float32(info.share * float(by_id[info.parent].discharge_m3_s)))
+            seg.discharge_m3_s = q
             seg.width_m = float(np.float32(rivernet.width_from_discharge(
                 q, scale=width_scale)))
             seg.depth_m = (float(np.float32(rivernet.depth_from_discharge(q)))
                            if depth_from_q else None)
-            seg.vertex_width_m = np.maximum(vw, 1.0).astype(np.float32)
-            seg.branch_of = info
-            new.append(seg)
-            rep["side_arms" if info.rejoin != NO_SEGMENT else "delta_channels"] += 1
-            rep["branch_length_m"] += seg_len
+    rep["channels_sharing_a_reach"] = int(sum(len(g) for g in groups if len(g) > 1))
     segments.extend(new)
     rep["branch_length_m"] = round(rep["branch_length_m"], 1)
     if shares:
@@ -480,8 +499,36 @@ def add_side_channels(
     rep["rule"] = ("a line down the middle of each undrawn piece of N50 river area "
                    f"over {BRANCH_MIN_AREA_M2:g} m2 that leaves a drawn river and "
                    "rejoins it (side arm) or ends in the lake it runs into (delta "
-                   "channel); share of the river's flow w_b^2/(w_b^2+w_t^2)")
+                   "channel); share of the river's flow w_b^2/(w_t^2+sum w^2) over "
+                   "the channels beside the same reach of it")
     return rep
+
+
+def _share_groups(by_id: dict, sink: dict, reach: list) -> list:
+    """
+    Channels that take water from the same reach of one river share it: each gets
+    w_b^2 / (w_t^2 + sum of every member's w^2), not w_b^2 / (w_t^2 + w_b^2) on
+    its own, or two mouths leaving one vertex took 1.4 times the river between
+    them (runtime, 2026-10-01). A reach is the stretch of river from where a
+    channel leaves to where it rejoins or the river meets its lake; channels whose
+    reaches overlap on the same river form one group. `reach` holds
+    (segment, hi, lo, w_b, w_t), hi and lo in metres to the network's sink.
+    """
+    rows = sorted(reach, key=lambda m: (sink[m[0].branch_of.parent], -m[1]))
+    groups: list = []
+    rivers: list = []
+    for m in rows:
+        b = m[0].branch_of
+        for g, river in zip(reversed(groups), reversed(rivers)):
+            if (sink[g[0][0].branch_of.parent] == sink[b.parent]
+                    and b.parent in river and m[1] > min(x[2] for x in g)):
+                g.append(m)
+                break
+        else:
+            groups.append([m])
+            rivers.append({sid for sid, _v in _chain_after(
+                by_id, b.parent, b.parent_vertex, 1e12)})
+    return groups
 
 
 def _span_mask(s) -> np.ndarray:

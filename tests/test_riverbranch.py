@@ -155,3 +155,25 @@ def test_a_line_beside_its_own_area_gets_no_second_channel():
     rep = riverbranch.add_side_channels(plan, traced, areas, wgrid(plan))
     assert len(traced.segments) == 1, rep
     assert rep["skipped_line_beside_area"] == 1, rep
+
+
+def test_two_mouths_from_one_reach_share_the_river_between_them():
+    plan = plan128()
+    # Two arms leave the river together and reach the lake on either side of it.
+    main = shapely.box(0, 280, 455, 320)
+    north = shapely.union_all([shapely.box(200, 300, 240, 370),
+                               shapely.box(200, 340, 455, 370)])
+    south = shapely.union_all([shapely.box(200, 230, 240, 300),
+                               shapely.box(200, 230, 455, 260)])
+    areas = shapely.union_all([main, north, south])
+    seg = main_line(20, 600, spans=[(86, 116, 1)])
+    traced = SimpleNamespace(segments=[seg], stride_m=5.0)
+    rep = riverbranch.add_side_channels(plan, traced, areas,
+                                        wgrid(plan, lake_from_x=450.0))
+    assert rep["delta_channels"] == 2, rep
+    assert rep["channels_sharing_a_reach"] == 2
+    shares = [b.branch_of.share for b in traced.segments[1:]]
+    assert sum(shares) < 1.0
+    w = [float(np.median(b.vertex_width_m)) for b in traced.segments[1:]]
+    total = 40.0 ** 2 + sum(x ** 2 for x in w)
+    assert np.allclose(shares, [x ** 2 / total for x in w], atol=0.03)

@@ -89,8 +89,8 @@ EffectiveQ[b.seg_id] = b.share * EffectiveQ[b.parent_seg_id]
 ```
 
 - A side channel feeds nothing downstream, so nothing else needs recomputing.
-- A dammed or dried parent dries its side channels. They are then hidden like any
-  reach whose `EffectiveQ` drops to 0.
+- A dammed or dried parent narrows or dries its side channels with it. One
+  whose `EffectiveQ` drops to 0 is hidden like any other reach.
 - Count a side channel in `dried` only when its parent's `EffectiveQ` is 0 and
   its own exported discharge was above 0. That keeps the dried count about
   rivers, not about how they are split.
@@ -130,8 +130,13 @@ its parent and disappears with it.
   stamp, which is harmless.
 - **Discharge.** A side channel's discharge is `share × the parent's exported
   discharge`, stored f32. Its `WidthM` and depth come from that discharge by the
-  usual models. `share = w_b² / (w_b² + w_t²)`, where `w_b` and `w_t` are the
-  median visual widths of the side channel and of the river alongside it.
+  usual models. `share = w_b² / (w_t² + Σ w²)`, where `w_b` is the side channel's
+  median visual width, `w_t` the river's alongside, and the sum runs over every
+  side channel beside the same reach of that river, this one included. A reach
+  runs from where a channel leaves to where it rejoins, or to the river's lake;
+  channels whose reaches overlap share. So the shares at one split always sum
+  to less than 1 (kvterrain after d9f93af; before, Ågardselva's two mouths each
+  took their share against the river alone and summed to 1.40).
 
 ## Harness checks
 
@@ -148,7 +153,8 @@ Checks that walk links will see side channels as unlinked segments:
    The log reports `river_branches.bin` accepted with 94 branches.
 2. **Ågardselva into Skjeldbreivatnet** (around E421050 N7153650): three mouths
    are drawn, not one.
-3. **Dam the parent** upstream of the split: all three mouths dry together. Undo
-   the edit: they return.
-4. **Dam one side channel only:** that channel dries and the river beside it is
-   unchanged.
+3. **Dam the parent** upstream of the split: all three mouths narrow together
+   to what still joins the parent below the dam (the runtime narrows a reach to
+   its local inflow rather than drying it). Undo the edit: they return.
+4. **Dam one side channel only:** that channel is hidden below the dam and the
+   river beside it is unchanged.
