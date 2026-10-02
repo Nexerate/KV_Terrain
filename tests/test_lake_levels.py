@@ -158,16 +158,74 @@ def test_published_level_above_all_the_shore_is_corrected():
 
 
 def test_published_level_near_the_shore_is_kept():
-    for hoyde in (104.0, 106.5):                      # below and within 2 m of the ring
+    # Flown water at 100 m, shore at 105 m: anything up to a metre over the shore
+    # could be a drawn-down lake.
+    for hoyde in (104.0, 105.9):
         h, wg = correction_world(hoyde)
         water.apply_estimated_levels(wg, h)
         assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
         assert wg.lake_table[1]["level_m"] == hoyde
 
 
+def slope_world(hoyde, regulated=False):
+    # A tarn cut into a hillside: flown water at 100 m, the low bank at 100.5 m,
+    # the high bank climbing to 112 m, so the ring's p90 sits far above the lake.
+    h, wg = correction_world(hoyde)
+    yy, xx = np.mgrid[0:30, 0:30]
+    land = wg.type != water.TYPE_LAKE
+    h[land] = (100.5 + np.clip(xx - 14, 0, None) * 1.0)[land]
+    wg.lake_table[1]["regulated"] = regulated
+    return h, wg
+
+
+def test_a_level_above_its_water_and_low_shore_on_a_slope_is_lowered():
+    h, wg = slope_world(104.0)
+    rep = water.apply_estimated_levels(wg, h)
+    info = wg.lake_table[1]
+    assert info["level_source"] == water.LEVEL_SOURCE_CORRECTED, rep["correction"]
+    assert 99.5 <= info["level_m"] <= 100.5
+    assert rep["correction"]["lakes"][0]["test"] == "above_scan_and_shore_p10"
+    # The p90 test alone does not see it.
+    h, wg = slope_world(104.0)
+    water.apply_estimated_levels(wg, h, max_above_scan_m=None)
+    assert wg.lake_table[1]["level_m"] == 104.0
+
+
+def test_lowering_on_a_slope_spares_reservoirs_and_near_levels():
+    h, wg = slope_world(104.0, regulated=True)
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_m"] == 104.0
+    h, wg = slope_world(101.0)                        # within a metre of its water
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
+
+
+def test_a_lake_without_hoyde_touching_its_twin_takes_the_published_level():
+    h = np.full((30, 40), 105.0, np.float32)
+    h[10:20, 5:35] = 99.6                             # one flat flown surface
+    t = np.zeros(h.shape, np.uint8)
+    t[10:20, 5:35] = water.TYPE_LAKE
+    lid = np.zeros(h.shape, np.uint16)
+    lid[10:20, 5:20] = 1
+    lid[10:20, 20:35] = 2
+    wg = water.WaterGrid(type=t, weight=np.zeros(h.shape, np.uint8), lake_id=lid,
+                         lake_table={1: {"hoyde_moh": 100.0}, 2: {"hoyde_moh": None}},
+                         lake_island=np.zeros(h.shape, bool))
+    rep = water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[2]["level_source"] == water.LEVEL_SOURCE_TWIN
+    assert wg.lake_table[2]["level_m"] == 100.0
+    assert rep["levels_from_twin"] == 1 and rep["levels_estimated"] == 0
+    # A step between their flown surfaces means two lakes: each keeps its own.
+    h[10:20, 20:35] = 99.0
+    wg.lake_table = {1: {"hoyde_moh": 100.0}, 2: {"hoyde_moh": None}}
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[2]["level_source"] == water.LEVEL_SOURCE_ESTIMATED
+
+
 def test_correction_can_be_switched_off():
     h, wg = correction_world(118.0)
-    rep = water.apply_estimated_levels(wg, h, max_above_shore_m=None)
+    rep = water.apply_estimated_levels(wg, h, max_above_shore_m=None,
+                                       max_above_scan_m=None)
     assert wg.lake_table[1]["level_m"] == 118.0
     assert rep["levels_corrected"] == 0
 
@@ -183,7 +241,7 @@ def test_published_level_below_its_own_flown_water_is_raised():
 
 
 def test_a_level_within_rounding_of_the_scan_or_a_reservoir_is_kept():
-    h, wg = correction_world(99.5)
+    h, wg = correction_world(99.6)
     water.apply_estimated_levels(wg, h)
     assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
     h, wg = correction_world(97.0)

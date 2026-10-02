@@ -86,6 +86,10 @@ def _water_opts(a) -> dict:
                                          if a.correct_lake_levels else None),
         "lake_level_max_below_scan_m": (a.lake_level_max_below_scan
                                         if a.correct_lake_levels else None),
+        "lake_level_max_above_scan_m": (a.lake_level_max_above_scan
+                                        if a.correct_lake_levels else None),
+        "lake_level_twin_max_scan_diff_m": (
+            0.25 if a.correct_lake_levels else None),
         "downhill_river_bed": a.downhill_river_bed,
         "lake_edge_is_shore": a.lake_edge_is_shore,
         "lake_shore_8_connected": a.lake_shore_8_connected,
@@ -337,14 +341,17 @@ def _report_export(a, res, want_water: bool) -> None:
                   f"{ll['levels_unresolved']} unresolved (left uncarved)")
             if ll.get("levels_corrected"):
                 print(f"    corrected: {ll['levels_corrected']} published levels stood "
-                      f"more than {ll['correction']['max_above_shore_m']:g} m above "
-                      f"their shore and were replaced by the DTM estimate (max drop "
+                      f"above their shore and their own flown water and were "
+                      f"replaced by the DTM estimate (max drop "
                       f"{ll['levels_corrected_max_drop_m']:.1f} m)")
             if ll.get("levels_raised"):
                 print(f"    raised: {ll['levels_raised']} published levels stood "
                       f"more than {ll['raise']['max_below_scan_m']:g} m below their "
                       f"own flown water and were raised to it (max rise "
                       f"{ll['levels_raised_max_m']:.1f} m)")
+            if ll.get("levels_from_twin"):
+                print(f"    twins: {ll['levels_from_twin']} lakes without hoyde share "
+                      f"their flown water with a touching NVE lake and took its level")
         wid = res.manifest.get("water_id", {})
         if wid:
             print(f"  + {wid['atlas_file']} (u16 class + lake id; "
@@ -821,20 +828,30 @@ def _add_process_args(p):
                    default=True, dest="correct_lake_levels",
                    help="replace a published NVE lake level that stands more than "
                         "--lake-level-max-above-shore above the 90th percentile of "
-                        "the land ringing the lake, or more than "
+                        "the land ringing the lake, more than "
+                        "--lake-level-max-above-scan above both its own flown water "
+                        "and the 10th percentile of that ring, or more than "
                         "--lake-level-max-below-scan below its own flown water, "
-                        "with the DTM estimate (default: on). The raw value stays "
-                        "in lakes.json as hoyde_moh.")
+                        "with the DTM estimate; and give a lake without hoyde the "
+                        "level of a touching NVE lake with the same flown water "
+                        "(default: on). The raw value stays in lakes.json as "
+                        "hoyde_moh.")
     p.add_argument("--lake-level-max-above-shore", type=float, default=2.0,
                    dest="lake_level_max_above_shore",
                    help="metres a published lake level may stand above the 90th "
                         "percentile of its shore ring before it counts as wrong "
                         "(default: 2)")
-    p.add_argument("--lake-level-max-below-scan", type=float, default=1.0,
+    p.add_argument("--lake-level-max-below-scan", type=float, default=0.5,
                    dest="lake_level_max_below_scan",
                    help="metres a published lake level may stand below the lake's "
                         "own flown water (capped at its shore) before it is raised "
-                        "to it; regulated reservoirs are never raised (default: 1)")
+                        "to it; regulated reservoirs are never raised (default: 0.5)")
+    p.add_argument("--lake-level-max-above-scan", type=float, default=1.0,
+                   dest="lake_level_max_above_scan",
+                   help="metres a published lake level may stand above both the "
+                        "lake's own flown water and the 10th percentile of its "
+                        "shore ring before it is lowered to the flown water; "
+                        "regulated reservoirs are never lowered by this (default: 1)")
     p.add_argument("--downhill-river-bed", action=argparse.BooleanOptionalAction,
                    default=True, dest="downhill_river_bed",
                    help="shape each densified river profile below its dry banks, "

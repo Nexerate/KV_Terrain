@@ -782,6 +782,7 @@ LEVEL_SOURCE_NVE = "nve_hoyde"
 LEVEL_SOURCE_ESTIMATED = "dtm_interior_low"
 LEVEL_SOURCE_CORRECTED = "dtm_corrected"
 LEVEL_SOURCE_RAISED = "dtm_raised"
+LEVEL_SOURCE_TWIN = "nve_neighbour"
 
 # A published NVE level more than this far above the RING_PERCENTILE of the land
 # just outside the polygon is contradicted by the terrain, and is replaced by the
@@ -794,7 +795,24 @@ LEVEL_CHECK_RING_PERCENTILE = 90.0
 # whole-metre hoyde explains up to half a metre (owner's decision, 2026-10-01: 77
 # Lierne lakes, 254 ha, drew their water a metre or more below their own shore).
 # Regulated reservoirs keep their published level: they can be flown full.
-DEFAULT_LEVEL_MAX_BELOW_SCAN_M = 1.0
+# 2026-10-02 the owner lowered it to 0.5 m: across Lierne's NVE lakes the flown
+# water sits a median 0.23 m BELOW the published level, so half a metre above it
+# is past both the whole-metre rounding and the usual offset.
+DEFAULT_LEVEL_MAX_BELOW_SCAN_M = 0.5
+# The other side of the p90 check (owner's decision, 2026-10-02): a published level
+# more than this far above BOTH the lake's own flown water and the LOW side of its
+# shore ring (LEVEL_LOW_RING_PERCENTILE) is lowered to the DTM estimate. The p90
+# check alone cannot see a lake on a slope, whose high bank keeps its p90 up: on
+# Lierne 67 of 74 lakes standing over a metre above their water and their low
+# shore never tripped it, some by 7 m. A drawn-down lake is still safe, because
+# its shore stands above its level. Regulated reservoirs are left alone.
+DEFAULT_LEVEL_MAX_ABOVE_SCAN_M = 1.0
+LEVEL_LOW_RING_PERCENTILE = 10.0
+# A lake NVE gives no level for that touches an NVE lake whose flown water is the
+# same surface (within this) takes that lake's published level: they are one
+# body of water split into two polygons, and the estimate would leave a step of
+# up to NVE's rounding between them (Småtjørnin / Småtjønnin, 0.44 m).
+DEFAULT_LEVEL_TWIN_MAX_SCAN_DIFF_M = 0.25
 
 # How far outside its polygon a lake may claim samples that are still its own flat
 # water surface in the DTM, and how close to that surface they have to be.
@@ -902,12 +920,29 @@ def snap_lakes_to_flat_water(wg: WaterGrid, height_repaired: np.ndarray, *,
 # THOSE.
 
 
+def touching_lakes(lake_id: np.ndarray) -> set:
+    """{(a, b), a < b}: pairs of lake ids with 8-connected samples side by side."""
+    ids = np.asarray(lake_id)
+    pairs: set = set()
+    H, W = ids.shape
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        a = ids[0:H - dy, max(0, -dx):W - max(0, dx)]
+        b = ids[dy:H, max(0, dx):W - max(0, -dx)]
+        m = (a > 0) & (b > 0) & (a != b)
+        if m.any():
+            u = np.unique(np.stack([np.minimum(a[m], b[m]), np.maximum(a[m], b[m])], 1), axis=0)
+            pairs.update((int(x), int(y)) for x, y in u)
+    return pairs
+
+
 def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                            enabled: bool = True, margin_m: Optional[float] = None,
                            island: Optional[np.ndarray] = None,
                            perimeter_cap: bool = True,
                            max_above_shore_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SHORE_M,
                            max_below_scan_m: Optional[float] = DEFAULT_LEVEL_MAX_BELOW_SCAN_M,
+                           max_above_scan_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SCAN_M,
+                           twin_max_scan_diff_m: Optional[float] = DEFAULT_LEVEL_TWIN_MAX_SCAN_DIFF_M,
                            ) -> dict:
     """
     Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
@@ -949,14 +984,28 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     drawn-down reservoir is not caught by this, because its shore rises above its
     real level: the 12 largest Lierne lakes all sit at or below their ring.
 
-    The mirror exception (`max_below_scan_m`, 1 m by default; None disables it): a
+    The same lowering also applies (`max_above_scan_m`, 1 m by default; None
+    disables it) to a `hoyde` more than that above BOTH the DTM estimate (before the
+    perimeter cap) and the
+    10th percentile of the same ring: water standing over its own flown surface
+    and over the low side of its shore. The p90 test cannot see a lake on a slope,
+    whose high bank holds the p90 up. A drawn-down lake has its shore above its
+    level, so it still passes; regulated reservoirs are skipped.
+
+    The mirror exception (`max_below_scan_m`, 0.5 m by default; None disables it): a
     `hoyde` more than that BELOW the same DTM estimate, capped at the shore ring as
     always, puts the water below the lake's own flown surface and below its whole
-    shoreline, a raised rim round the lake. On Lierne that is 77 lakes, mostly
+    shoreline, a raised rim round the lake. On Lierne that is 134 lakes, mostly
     small tarns published several metres low. The level is raised to the estimate,
     with `level_source = "dtm_raised"` and `hoyde_moh` kept. A regulated reservoir
     (NVE `objekttype` InnsjøRegulert or a `magasinnr`) is left as published: it can
     have been flown full.
+
+    TWINS (`twin_max_scan_diff_m`, 0.25 m; None disables it): a lake with no
+    `hoyde` that touches a lake keeping its NVE level, with both flown water
+    surfaces within that of each other, is one body of water split in two
+    polygons. It takes the neighbour's published level
+    (`level_source = "nve_neighbour"`) instead of its own estimate.
 
     THE PERIMETER CAP (`perimeter_cap`, on by default) therefore applies to
     ESTIMATED levels only. Those come from the polygon's interior, so the one
@@ -1019,7 +1068,42 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
             info["level_source"] = LEVEL_SOURCE_CORRECTED
             corrected.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
                               "navn": info.get("navn"), "hoyde_moh": float(h),
+                              "test": "above_shore_p90",
                               "ring_p90_m": round(float(r), 3),
+                              "level_m": round(v, 3),
+                              "lowered_m": round(float(h) - v, 3)})
+
+    if max_above_scan_m is not None and table:
+        low_ring = bathymetry.perimeter_levels(
+            height_repaired, wg.lake_id, wg.type,
+            percentile=LEVEL_LOW_RING_PERCENTILE)
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            r = low_ring.get(lid)
+            if (h is None or info.get("level_source") != LEVEL_SOURCE_NVE
+                    or info.get("regulated") or r is None or not np.isfinite(r)):
+                continue
+            if float(h) <= float(r) + float(max_above_scan_m):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            if v is None or not np.isfinite(v):
+                continue
+            # Tested against the flown water itself: the shore cap below can sit
+            # under it on a small lake, and must not be what makes a level that
+            # matches its own water look too high.
+            if float(h) <= float(v) + float(max_above_scan_m):
+                continue
+            c = cap.get(lid)
+            if c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            v = float(v)
+            info["level_m"] = v
+            info["level_source"] = LEVEL_SOURCE_CORRECTED
+            corrected.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                              "navn": info.get("navn"), "hoyde_moh": float(h),
+                              "test": "above_scan_and_shore_p10",
+                              "ring_p10_m": round(float(r), 3),
                               "level_m": round(v, 3),
                               "lowered_m": round(float(h) - v, 3)})
 
@@ -1061,6 +1145,42 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
             table[lid]["level_source"] = LEVEL_SOURCE_ESTIMATED
             estimated += 1
 
+    twins: list = []
+    if twin_max_scan_diff_m is not None and estimated:
+        est, _ = est_and_cap()
+        for a, b in touching_lakes(wg.lake_id):
+            for lid, nb in ((a, b), (b, a)):
+                info, other = table.get(lid), table.get(nb)
+                if (info is None or other is None
+                        or info.get("level_source") != LEVEL_SOURCE_ESTIMATED
+                        or other.get("level_source") != LEVEL_SOURCE_NVE):
+                    continue
+                va, vb = est.get(lid), est.get(nb)
+                if va is None or vb is None or not (np.isfinite(va) and np.isfinite(vb)):
+                    continue
+                d = abs(float(va) - float(vb))
+                if d > float(twin_max_scan_diff_m):
+                    continue
+                prev = info.get("_twin_d")
+                if prev is not None and prev <= d:
+                    continue
+                info["_twin_d"] = d
+                info["_twin_of"] = nb
+        for lid, info in table.items():
+            if "_twin_of" not in info:
+                continue
+            nb, d = info.pop("_twin_of"), info.pop("_twin_d")
+            old = float(info["level_m"])
+            info["level_m"] = float(table[nb]["level_m"])
+            info["level_source"] = LEVEL_SOURCE_TWIN
+            estimated -= 1
+            twins.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                          "navn": info.get("navn"), "twin_lake_id": int(nb),
+                          "twin_vatn_lnr": table[nb].get("lopenr"),
+                          "scan_diff_m": round(d, 3), "estimate_m": round(old, 3),
+                          "level_m": info["level_m"],
+                          "shift_m": round(info["level_m"] - old, 3)})
+
     unresolved = sum(1 for i in table.values() if i.get("level_m") is None)
     drops = [c["lowered_m"] for c in corrected]
     return {
@@ -1071,10 +1191,16 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
             "enabled": max_above_shore_m is not None,
             "max_above_shore_m": max_above_shore_m,
             "ring_percentile": LEVEL_CHECK_RING_PERCENTILE,
-            "rule": "a published hoyde more than max_above_shore_m above this "
-                    "percentile of the land ring just outside the polygon is "
-                    "replaced by the DTM estimate (perimeter cap included), never "
-                    "raised; hoyde_moh keeps the published value",
+            "max_above_scan_m": max_above_scan_m,
+            "low_ring_percentile": LEVEL_LOW_RING_PERCENTILE,
+            "rule": "a published hoyde more than max_above_shore_m above "
+                    "ring_percentile of the land ring just outside the polygon "
+                    "(test above_shore_p90), or, on an unregulated lake, more than "
+                    "max_above_scan_m above both the DTM estimate and "
+                    "low_ring_percentile of that ring (test "
+                    "above_scan_and_shore_p10), is replaced by the DTM estimate "
+                    "(perimeter cap included), never raised; hoyde_moh keeps the "
+                    "published value",
             "lakes": sorted(corrected, key=lambda c: -c["lowered_m"]),
         },
         "levels_raised": len(raised),
@@ -1090,6 +1216,15 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                     "hoyde_moh keeps the published value",
             "regulated_kept": sum(1 for i in table.values() if i.get("regulated")),
             "lakes": sorted(raised, key=lambda r: -r["raised_m"]),
+        },
+        "levels_from_twin": len(twins),
+        "twins": {
+            "enabled": twin_max_scan_diff_m is not None,
+            "max_scan_diff_m": twin_max_scan_diff_m,
+            "rule": "a lake without hoyde that touches a lake keeping its NVE "
+                    "level, both flown water surfaces within max_scan_diff_m, "
+                    "takes that published level",
+            "lakes": twins,
         },
         "lakes_total": len(table),
         "levels_from_nve": sum(1 for i in table.values()

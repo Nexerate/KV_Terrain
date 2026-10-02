@@ -260,8 +260,9 @@ default, or the legacy `ramp`), the terrain model's `--lake-slope-ratio`,
 `--lake-shore-slope`, `--lake-min-depth`, `--lake-snap-px`, `--ocean-level`,
 `--river-vertex-stride-m`, `--tile-cells`, `--hmin` / `--hmax`, and the
 `--(no-)estimate-lake-levels` / `--(no-)lake-perimeter-cap` pair,
-`--(no-)correct-lake-levels` with `--lake-level-max-above-shore` (default 2 m) and
-`--lake-level-max-below-scan` (default 1 m), and
+`--(no-)correct-lake-levels` with `--lake-level-max-above-shore` (default 2 m),
+`--lake-level-max-above-scan` (default 1 m) and `--lake-level-max-below-scan`
+(default 0.5 m), and
 the water-redesign switches `--(no-)downhill-river-bed`, `--(no-)lake-edge-is-shore`,
 `--(no-)lake-shore-8-connected` and `--(no-)hierarchy` (all on by default). `build`
 accepts both sets.
@@ -584,18 +585,34 @@ Where the surface comes from:
   reservoir is not caught, because its shore rises above its real level (the 12
   largest Lierne lakes all sit at or below their ring). On Lierne 46 levels are
   corrected, mostly small unnamed ponds, by a median 8.0 m and at most 14.0 m;
-  the manifest's `water_surface.lake_levels.correction.lakes` lists each one.
+  The p90 test cannot see a lake cut into a slope, whose high bank holds the p90
+  up, so a second test lowers the same way a `hoyde` more than
+  `--lake-level-max-above-scan` (default **1 m**) above **both** the lake's own
+  flown water (the DTM estimate) and the **10th percentile** of that ring: water
+  over its own surface and over the low side of its shore. A drawn-down lake still
+  passes, because its shore stands above its level; regulated reservoirs are
+  skipped. On Lierne 85 levels are lowered this way (187 ha;
+  a median 2.1 m, at most 7.9 m; Hestbergtjønna 6.5 m, Vester-Rømmervatnet 1.7 m);
+  the manifest's `water_surface.lake_levels.correction.lakes` lists each one, with
+  the `test` that caught it.
   **The mirror exception is a `hoyde` below the lake's own flown water:** one more
-  than `--lake-level-max-below-scan` (default **1 m**) below the same DTM estimate,
+  than `--lake-level-max-below-scan` (default **0.5 m**) below the same DTM estimate,
   shore cap included, puts the water below the whole shoreline, a raised rim
-  round the lake. No lake is flown metres above its level, and NVE's whole-metre
-  `hoyde` explains up to half a metre. Such a level is raised to the estimate
+  round the lake. NVE's whole-metre `hoyde` explains up to half a metre, and
+  across Lierne's NVE lakes the flown water sits a median 0.23 m *below* the
+  published level, so half a metre above it is past both. Such a level is raised to the estimate
   (`level_source = dtm_raised`, the published value kept in `hoyde_moh`), never
   lowered. Regulated reservoirs (NVE `InnsjøRegulert` or a `magasinnr`) keep their
-  published level, since they can be flown full. On Lierne 77 levels are raised
-  (254 ha, mostly small tarns; up to 7.6 m; Kroktjønna 1.0 m, Småtjønnin 3.2 m), and the 4
+  published level, since they can be flown full. On Lierne 134 levels are raised
+  (530 ha, mostly small tarns; a median 1.1 m, up to 7.6 m; Midtitjønna 0.9 m,
+  Storflyen 0.75 m), and the 4
   reservoirs are kept; `water_surface.lake_levels.raise.lakes` lists each one.
-  `--no-correct-lake-levels` turns both checks off.
+  **Twins:** a lake NVE gives no level for that touches a lake keeping its NVE
+  level, with their flown water within 0.25 m, is one body of water split into two
+  polygons; it takes the neighbour's published level (`level_source =
+  nve_neighbour`) rather than its own estimate, so no step of NVE's rounding is
+  left between them (Lierne: Småtjørnin takes Småtjønnin's 474 m, 0.44 m over its own estimate).
+  `--no-correct-lake-levels` turns all of these off.
   `hoyde` very often does not exist, though (25% of lake records in a Lierne
   export, 11% in a Krøderen one). Those lakes get a level read off the **LiDAR
   water surface inside the polygon**: the mean of its 1st–25th percentile band —
@@ -606,7 +623,8 @@ Where the surface comes from:
   `--no-estimate-lake-levels` turns the estimate off (those lakes are then left
   uncarved rather than guessed at); `--no-lake-perimeter-cap` turns off the cap.
   `lakes.json` carries the level used as `authored_level_m` and its provenance as
-  `level_source` (`nve_hoyde`, `dtm_interior_low`, `dtm_corrected` or `dtm_raised`); the raw NVE
+  `level_source` (`nve_hoyde`, `dtm_interior_low`, `dtm_corrected`, `dtm_raised` or
+  `nve_neighbour`); the raw NVE
   field stays visible (null where NVE has none) as `hoyde_moh`.
 - **Rivers:** Elvenett has no elevation, so the surface is the **terrain height
   under the channel's own centreline**, sampled from the leaf DTM before any carve

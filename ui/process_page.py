@@ -204,8 +204,16 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             disabled=d or not correct_levels,
             help="How far a published level may stand above the 90th percentile of "
                  "its shore ring before it is corrected.")
+        max_above_scan = st.slider(
+            "Margin above the scanned water and low shore (m)", 0.5, 5.0, 1.0, 0.5,
+            disabled=d or not correct_levels,
+            help="How far a published level may stand above both the lake's own "
+                 "scanned water and the 10th percentile of its shore ring before it "
+                 "is lowered to the scanned water. Catches lakes on a slope, whose "
+                 "high bank hides them from the 90th-percentile check. Regulated "
+                 "reservoirs are never lowered by this.")
         max_below_scan = st.slider(
-            "Margin below the scanned water (m)", 0.5, 5.0, 1.0, 0.5,
+            "Margin below the scanned water (m)", 0.25, 5.0, 0.5, 0.25,
             disabled=d or not correct_levels,
             help="How far a published level may stand below the lake's own scanned "
                  "water before it is raised to it. NVE levels are whole metres, so "
@@ -289,6 +297,8 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_perimeter_cap": lake_perimeter_cap,
             "lake_level_max_above_shore_m": max_above_shore if correct_levels else None,
             "lake_level_max_below_scan_m": max_below_scan if correct_levels else None,
+            "lake_level_max_above_scan_m": max_above_scan if correct_levels else None,
+            "lake_level_twin_max_scan_diff_m": None if not correct_levels else 0.25,
             "downhill_river_bed": downhill_bed,
             "lake_edge_is_shore": lake_edge_is_shore,
             "lake_shore_8_connected": lake_shore_8,
@@ -520,9 +530,12 @@ def _reports(state: dict) -> None:
             corr = ll.get("correction") or {}
             if ll.get("levels_corrected"):
                 st.caption(
-                    f"{ll['levels_corrected']:,} published levels stood more than "
-                    f"{corr.get('max_above_shore_m', 0):g} m above the 90th percentile "
-                    f"of their shore and were replaced by the DTM estimate (median "
+                    f"{ll['levels_corrected']:,} published levels stood above their "
+                    f"shore (more than {corr.get('max_above_shore_m', 0):g} m over its "
+                    f"90th percentile, or more than "
+                    f"{corr.get('max_above_scan_m') or 0:g} m over both their scanned "
+                    f"water and its 10th percentile) and were replaced by the DTM "
+                    f"estimate (median "
                     f"drop {ll['levels_corrected_median_drop_m']:.1f} m, max "
                     f"{ll['levels_corrected_max_drop_m']:.1f} m).")
                 import pandas as pd
@@ -540,6 +553,16 @@ def _reports(state: dict) -> None:
                 import pandas as pd
                 with st.expander("Raised lakes"):
                     st.dataframe(pd.DataFrame(rais.get("lakes", [])), width="stretch",
+                                 hide_index=True)
+            twin = ll.get("twins") or {}
+            if ll.get("levels_from_twin"):
+                st.caption(
+                    f"{ll['levels_from_twin']:,} lakes without a published level "
+                    f"share their scanned water with a touching NVE lake and took "
+                    f"its level.")
+                import pandas as pd
+                with st.expander("Twin lakes"):
+                    st.dataframe(pd.DataFrame(twin.get("lakes", [])), width="stretch",
                                  hide_index=True)
             capped = ll.get("levels_capped_to_perimeter", 0)
             if capped:
