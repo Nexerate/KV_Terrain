@@ -86,13 +86,80 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
                  "channel, so this is what stops a thin film of water climbing a "
                  "cliff the rasterised channel ran past. Lower = water stays in the "
                  "channel; higher = wider, more forgiving channels.")
+        from kvterrain import lakebed as _lakebed
+        lbd = _lakebed.LakeBedParams()
+        lake_bed_model = st.radio(
+            "Lake beds", ["terrain", "ramp"], horizontal=True, disabled=d,
+            format_func={"terrain": "Continue the terrain (+ NVE surveys)",
+                         "ramp": "Legacy straight ramp"}.get,
+            help="Lakes can drain at runtime, so the bed has to pass for ground. "
+                 "'Continue the terrain' reads the slope of the land around each "
+                 "lake and carries it under the water — deep under cliffs, shallow "
+                 "in bogs, deepest furthest from shore, never flat — with noise on "
+                 "top, and follows NVE depth surveys where the dataset has them.")
+        t = d or lake_bed_model != "terrain"
+        if ds.has_water and not ds.has_bathymetry:
+            st.caption("This dataset predates lake surveys: every bed is synthetic. "
+                       "`kvterrain fetch-bathymetry --dataset "
+                       f"{ds.slug}` adds them without refetching heights.")
+        lake_surveys = st.toggle(
+            "Use NVE lake surveys", value=True, disabled=t,
+            help="Depth contours and spot depths where NVE has surveyed a lake; "
+                 "only max/mean depth for some. The synthetic shape is bent to "
+                 "pass through them.")
+        river_mouths = st.toggle(
+            "Carry rivers into lakes", value=True, disabled=t,
+            help="Continue each river's channel into its lake: a delta at inflows, "
+                 "a funnel and a riffle at outlets that holds the lake by the "
+                 "river's depth.")
+        river_n50_widths = st.toggle(
+            "River widths from N50", value=True, disabled=d,
+            help="Wide rivers take the width of Kartverket's mapped river areas, "
+                 "and streams their N50 width class, where the dataset has N50 "
+                 "(`kvterrain fetch-n50 --dataset ...` adds it).")
+        river_thalweg_snap = st.toggle(
+            "Streams onto the scanned channel", value=True, disabled=d,
+            help="Move each stream's mapped line up to 15 m sideways onto the "
+                 "valley bottom the scan shows, instead of cutting a trench into "
+                 "the valley side where the line runs.")
+        river_side_channels = st.toggle(
+            "Side channels from N50", value=True, disabled=d,
+            help="Where a river splits round islands or into several mouths, "
+                 "draw the channels N50 maps that have no line of their own. "
+                 "Each follows the river it leaves, and dries with it.")
+        lake_shoreline = st.toggle(
+            "Shoreline from the scan", value=True, disabled=t,
+            help="Scanned land above the lake's level stays land, scanned ground "
+                 "below it is flooded as it is, and only the scanned water gets a "
+                 "modelled bed, with no line of zero depth at its edge.")
+        lake_slope_ratio = st.slider(
+            "Underwater slope ÷ land slope", 0.1, 2.0, float(lbd.slope_ratio), 0.05,
+            disabled=t,
+            help="How steeply the bed leaves the shore, as a fraction of how "
+                 "steeply the land around the lake rises.")
+        lake_bed_curvature = st.slider(
+            "Bed curvature", 0.05, 2.0, float(lbd.curvature), 0.05, disabled=t,
+            help="How soon the bed bends over toward the centre. Small = a bowl "
+                 "with a gentle floor; large = a straight-sided cone. Never flat.")
+        lake_bed_noise = st.slider(
+            "Bed noise", 0.0, 0.9, float(lbd.noise_amplitude), 0.05, disabled=t,
+            help="Multiplicative: depth × (1 ± this). A zero stays zero and a "
+                 "positive depth stays positive, so the shoreline never moves and "
+                 "no shoal reaches the surface.")
+        lake_bed_wavelength = st.slider(
+            "Bed noise wavelength (m)", 50.0, 2000.0, float(lbd.noise_wavelength_m),
+            50.0, disabled=t)
+        lake_bed_seed = st.number_input("Bed noise seed", 0, 10_000,
+                                        int(lbd.noise_seed), 1, disabled=t)
         lake_shore_slope = st.slider(
-            "Lake shore slope (m depth / m shore)", 0.1, 2.0, 1.0, 0.1, disabled=d,
+            "Lake shore slope (m depth / m shore)", 0.1, 2.0, 1.0, 0.1,
+            disabled=d or lake_bed_model != "ramp",
             help="The lake bed descends on a STRAIGHT ramp at this slope until it "
                  "reaches the carve depth. At 1.0 a 20 m carve is reached 20 m from "
                  "shore — four texels at 5 m spacing. Lower = gentler sides.")
         lake_max_depth = st.slider(
-            "Lake carve depth (m, real)", 1.0, 40.0, 20.0, 1.0, disabled=d,
+            "Lake carve depth (m, real)", 1.0, 40.0, 20.0, 1.0,
+            disabled=d or lake_bed_model != "ramp",
             help="Deepest the lake bed goes below the authored surface, reached only "
                  "by lakes big enough to ramp that far. Must exceed the renderer's "
                  "opaque threshold AFTER any height compression (e.g. 20 m real → "
@@ -137,6 +204,20 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             disabled=d or not correct_levels,
             help="How far a published level may stand above the 90th percentile of "
                  "its shore ring before it is corrected.")
+        max_above_scan = st.slider(
+            "Margin above the scanned water and low shore (m)", 0.5, 5.0, 1.0, 0.5,
+            disabled=d or not correct_levels,
+            help="How far a published level may stand above both the lake's own "
+                 "scanned water and the 10th percentile of its shore ring before it "
+                 "is lowered to the scanned water. Catches lakes on a slope, whose "
+                 "high bank hides them from the 90th-percentile check. Regulated "
+                 "reservoirs are never lowered by this.")
+        max_below_scan = st.slider(
+            "Margin below the scanned water (m)", 0.25, 5.0, 0.5, 0.25,
+            disabled=d or not correct_levels,
+            help="How far a published level may stand below the lake's own scanned "
+                 "water before it is raised to it. NVE levels are whole metres, so "
+                 "under 0.5 m is rounding. Regulated reservoirs are never raised.")
         ocean_level = st.number_input(
             "Ocean level (m.o.h.)", -50.0, 50.0, 0.0, 1.0, disabled=d,
             help="Kartverket heights are metres above sea level, so 0 is real sea "
@@ -197,12 +278,27 @@ def _sidebar(ds: ds_mod.Dataset) -> dict:
             "lake_shore_slope": lake_shore_slope,
             "lake_max_depth_m": lake_max_depth,
             "lake_min_depth_m": lake_min_depth,
+            "lake_bed_model": lake_bed_model,
+            "lake_surveys": lake_surveys,
+            "river_mouths": river_mouths,
+            "lake_shoreline": lake_shoreline,
+            "river_n50_widths": river_n50_widths,
+            "river_thalweg_snap": river_thalweg_snap,
+            "river_side_channels": river_side_channels,
+            "lake_slope_ratio": lake_slope_ratio,
+            "lake_bed_curvature": lake_bed_curvature,
+            "lake_bed_noise": lake_bed_noise,
+            "lake_bed_noise_wavelength_m": lake_bed_wavelength,
+            "lake_bed_seed": int(lake_bed_seed),
             "lake_snap_px": lake_snap_px,
             "ocean_level_m": ocean_level,
             "emit_geojson": emit_geojson,
             "estimate_lake_levels": estimate_lake_levels,
             "lake_perimeter_cap": lake_perimeter_cap,
             "lake_level_max_above_shore_m": max_above_shore if correct_levels else None,
+            "lake_level_max_below_scan_m": max_below_scan if correct_levels else None,
+            "lake_level_max_above_scan_m": max_above_scan if correct_levels else None,
+            "lake_level_twin_max_scan_diff_m": None if not correct_levels else 0.25,
             "downhill_river_bed": downhill_bed,
             "lake_edge_is_shore": lake_edge_is_shore,
             "lake_shore_8_connected": lake_shore_8,
@@ -434,14 +530,39 @@ def _reports(state: dict) -> None:
             corr = ll.get("correction") or {}
             if ll.get("levels_corrected"):
                 st.caption(
-                    f"{ll['levels_corrected']:,} published levels stood more than "
-                    f"{corr.get('max_above_shore_m', 0):g} m above the 90th percentile "
-                    f"of their shore and were replaced by the DTM estimate (median "
+                    f"{ll['levels_corrected']:,} published levels stood above their "
+                    f"shore (more than {corr.get('max_above_shore_m', 0):g} m over its "
+                    f"90th percentile, or more than "
+                    f"{corr.get('max_above_scan_m') or 0:g} m over both their scanned "
+                    f"water and its 10th percentile) and were replaced by the DTM "
+                    f"estimate (median "
                     f"drop {ll['levels_corrected_median_drop_m']:.1f} m, max "
                     f"{ll['levels_corrected_max_drop_m']:.1f} m).")
                 import pandas as pd
                 with st.expander("Corrected lakes"):
                     st.dataframe(pd.DataFrame(corr.get("lakes", [])), width="stretch",
+                                 hide_index=True)
+            rais = ll.get("raise") or {}
+            if ll.get("levels_raised"):
+                st.caption(
+                    f"{ll['levels_raised']:,} published levels stood more than "
+                    f"{rais.get('max_below_scan_m', 0):g} m below their own scanned "
+                    f"water and were raised to it (median "
+                    f"{ll['levels_raised_median_m']:.1f} m, max "
+                    f"{ll['levels_raised_max_m']:.1f} m).")
+                import pandas as pd
+                with st.expander("Raised lakes"):
+                    st.dataframe(pd.DataFrame(rais.get("lakes", [])), width="stretch",
+                                 hide_index=True)
+            twin = ll.get("twins") or {}
+            if ll.get("levels_from_twin"):
+                st.caption(
+                    f"{ll['levels_from_twin']:,} lakes without a published level "
+                    f"share their scanned water with a touching NVE lake and took "
+                    f"its level.")
+                import pandas as pd
+                with st.expander("Twin lakes"):
+                    st.dataframe(pd.DataFrame(twin.get("lakes", [])), width="stretch",
                                  hide_index=True)
             capped = ll.get("levels_capped_to_perimeter", 0)
             if capped:
@@ -459,6 +580,25 @@ def _reports(state: dict) -> None:
                            f"{snap['lakes_grown']:,} lakes were still the lake's own "
                            f"flat water surface outside its polygon and are now part "
                            f"of it.")
+            lb = wm.get("lake_bathymetry", {})
+            if lb.get("model") == "terrain":
+                import pandas as pd
+                st.markdown("**Lake beds** — continued from the surrounding terrain")
+                deep = lb.get("body_max_depth_m") or {}
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Water bodies", f"{lb.get('bodies', 0):,}")
+                c2.metric("Deepest", f"{deep.get('max', 0):.1f} m")
+                c3.metric("Median body max depth", f"{deep.get('p50', 0):.1f} m")
+                if not lb.get("dataset_has_bathymetry"):
+                    st.caption("No NVE lake surveys in this dataset — every bed is "
+                               "synthetic.")
+                elif lb.get("surveyed_lakes"):
+                    cols = ["name", "vatnlnr", "tier", "model_max_depth_m",
+                            "survey_max_depth_m", "model_mean_depth_m",
+                            "survey_mean_depth_m", "level_offset_m", "survey_year",
+                            "cropped_by_map_edge"]
+                    st.dataframe(pd.DataFrame(lb["surveyed_lakes"]).reindex(
+                        columns=cols), width="stretch", hide_index=True)
 
     with tabs[2]:
         if not wv:

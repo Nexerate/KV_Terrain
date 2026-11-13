@@ -12,11 +12,11 @@ The runtime burn needs all four, so this module keeps them.
 WHERE THE Z COMES FROM
 ----------------------
 Elvenett polylines are 2D. There is no Z in the source to "keep" — it has to be
-constructed, and this module constructs it exactly the way the raster already
-does, because that is the behaviour that visibly works:
+constructed. The bed comes from the carved terrain; the surface comes from the
+profile that drove that carve:
 
     z(v)     = carved leaf DTM sampled beneath vertex v   <- the BED
-    level(v) = z(v) + carve_depth_for_order(order)        <- the water SURFACE
+    level(v) = shaped centreline profile                  <- the water SURFACE
 
 Two values per vertex, deliberately, because they have different consumers:
 
@@ -24,36 +24,35 @@ Two values per vertex, deliberately, because they have different consumers:
     and it is what the burn runs its running-minimum over. Burning against the
     surface instead would cut ~1-11 m too shallow and leave the DEM dams in place.
   * `level` is the authored water surface, and it is what a river pins to when it
-    is not disturbed. It is read VERBATIM out of the raster surface field when one
-    is supplied, so the polyline and the raster cannot drift apart; the
-    `z + carve_depth` form above is the fallback, and it reconstructs the same
-    number because the surface a river is given IS the ground the trench was cut
-    from.
+    is not disturbed. `riverbed` caps the raw centreline ground at dry banks,
+    makes it downstream-only, smooths its staircase and ties it to confluences
+    and lakes. The raster is spread from those same values. Reading a nearest
+    raster pixel back here would lose that sub-pixel profile and can introduce
+    rises, so the shaped array is passed directly. `z + carve_depth` remains the
+    compatibility fallback when shaping is disabled.
 
-This is the same per-pixel rule as `watersurface.river_surface_moh`, applied at
-vertices. It is NOT a fitted profile. An earlier revision rasterised the centreline,
+This is NOT a fitted profile. An earlier revision rasterised the centreline,
 fitted a monotone-descending profile (PAVA) and widened it back out; wherever the
 chord between two sparse Elvenett vertices cut across a bank, the fit pooled the
 surface metres above the bed and the widen smeared that inflated value onto lower
 neighbours, so the runtime read depth >> 0 and the river spiked.
 
-The defence here is DENSIFICATION, not fitting. Vertices are resampled to the leaf
-spacing before Z is sampled, so the polyline follows the real channel instead of
-cutting chords across it. This module REPORTS non-monotonic descent and never
-corrects `z`; descent is enforced on the terrain before the carve, by
+The defence here is DENSIFICATION plus bank-safe profile shaping, not fitting.
+Vertices are resampled to the leaf spacing before Z is sampled, so the polyline
+follows the real channel instead of cutting chords across it. This module REPORTS
+non-monotonic descent and never corrects `z`; descent is enforced on the terrain before the carve, by
 `riverbed` (the downhill-only bed), and `z` is sampled from that carved bed. The
 numbers here sample bilinearly, so they also read the banks beside a trench and
 do not reach zero even when the channel's own samples never rise.
 
 FLOW DIRECTION
 --------------
-Source vertex order is trusted. ELVIS is designed to encode flow direction, but
-that is design intent rather than a per-feature guarantee, and nothing verifies
-it upstream of us. So a Z-derived direction is computed independently and the
-DISAGREEMENT RATE is reported as a diagnostic — broken out by whether the segment
-touches a lake, because clustering there indicates a real problem while a diffuse
-scatter is just DTM noise. Z never flips a segment: on flat reaches, through
-weirs, across lakes and over DTM artefacts it is the noisier signal of the two.
+Source vertex order is trusted except for an unmistakable, entirely open-channel
+error: a run whose DTM endpoint climbs by more than 25 m is reversed before links
+are built. ELVIS is designed to encode flow direction, but Lierne contains one
+such 58.6 m reversed run; trusting it carved the low endpoint through a hillside.
+Smaller disagreements remain diagnostics because on flat reaches, through weirs,
+across lakes and over DTM artefacts Z is the noisier signal.
 """
 
 from __future__ import annotations
@@ -71,7 +70,7 @@ import numpy as np
 from . import core
 from . import water as kvwater
 from . import waterid as kvid
-from .bathymetry import DEFAULT_RIVER_DEPTH_BY_ORDER, depth_for_order
+from .bathymetry import DEFAULT_RIVER_DEPTH_BY_ORDER, depth_for_order, segment_depth
 from .watersurface import _fill_nan_1d, _bresenham_path
 
 RIVERS_BIN_FILE = "rivers.bin"
@@ -79,8 +78,42 @@ RIVERS_GEOJSON_FILE = "rivers.geojson"
 LAKES_FILE = "lakes.json"
 JUNCTIONS_FILE = "junctions.json"
 
-BIN_MAGIC = b"KVRIVER1"
-BIN_VERSION = 1
+BIN_MAGIC = b"KVRIVER2"
+BIN_VERSION = 2
+NO_HIERARCHY_NODE = 0xFFFFFFFF
+
+# The visual width per vertex, beside rivers.bin rather than inside it: rivers.bin
+# v2 stays byte-for-byte what the runtime reads today, and a runtime that does not
+# know this file simply keeps stamping the hydraulic width.
+RIVER_WIDTHS_FILE = "river_widths.bin"
+WIDTHS_MAGIC = b"KVRWIDT1"
+WIDTHS_VERSION = 1
+
+# Modelled mean-annual flow.  One metre/year is 31.688 L/s/km², a deliberately
+# explicit effective-runoff assumption rather than an unlabeled rainfall knob.
+DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR = 1.0
+SECONDS_PER_MEAN_YEAR = 365.25 * 24.0 * 60.0 * 60.0
+
+# Channel depth from discharge: depth = clamp(c * Q^f). It replaced a table by
+# stream order (1.5 m for a headwater stream to 11 m for an order-8 trunk) that
+# made a 6 m wide river 5.5 m deep and a 21 m wide one 9 m (owner, 2026-09-30:
+# "too deep to be realistic"). The textbook depth half of the hydraulic geometry
+# (Leopold & Maddock 1953: 0.3 * Q^0.4) was then too harsh: modelled discharge on
+# a 40 km tile tops out near 13 m³/s, so nearly every river came out 0.5-0.8 m and
+# lake inlets and outlets vanished under the water's opacity (owner, same day:
+# "something in between"). These values keep a headwater stream at the 0.5 m
+# floor, put a lake inlet (0.1-0.5 m³/s) at 1-1.6 m and a trunk river (10+ m³/s)
+# at about 4 m, which is also roughly what real rivers of those widths measure.
+DEFAULT_DEPTH_COEFFICIENT = 2.0
+DEFAULT_DEPTH_EXPONENT = 0.3
+DEFAULT_MIN_DEPTH_M = 0.5
+DEFAULT_MAX_DEPTH_M = 5.0
+
+# Hydraulic geometry shared with the runtime: full width = clamp(a * Q^b).
+DEFAULT_WIDTH_COEFFICIENT = 8.0
+DEFAULT_WIDTH_EXPONENT = 0.5
+DEFAULT_MIN_WIDTH_M = 2.0
+DEFAULT_MAX_WIDTH_M = 80.0
 
 JUNCTION_INFLOW = "Inflow"
 JUNCTION_OUTFLOW = "Outflow"
@@ -90,6 +123,11 @@ JUNCTION_OUTFLOW = "Outflow"
 ENDPOINT_TOL_CELLS = 1.0
 # Descent tolerance: a rise smaller than this is DTM noise, not a real reversal.
 DESCENT_TOL_M = 0.05
+# Source order remains authoritative except for an unmistakable non-lake error.
+# Lierne contains one segment whose coordinates climb 58.6 m from start to end;
+# trusting it makes the downhill running minimum carve that entire hillside to
+# the low endpoint. Smaller disagreements can be dams, falls, or DTM noise.
+CLEAR_REVERSE_RISE_M = 25.0
 
 # The ELVIS query uses esriSpatialRelIntersects, so any feature TOUCHING the crop
 # comes back in full — including the part outside it. There is no terrain there:
@@ -231,6 +269,20 @@ def geometry_hash(xy: np.ndarray) -> str:
     return hashlib.blake2b(q.tobytes(), digest_size=16).hexdigest()
 
 
+def orient_clear_uphill_run(xy: np.ndarray, ground: np.ndarray,
+                            lake_spans: list,
+                            min_rise_m: float = CLEAR_REVERSE_RISE_M
+                            ) -> tuple[np.ndarray, bool]:
+    """Reverse only a clearly backward, entirely open-channel source run."""
+    p = np.asarray(xy, dtype=np.float64)
+    g = np.asarray(ground, dtype=np.float64)
+    if (p.shape[0] < 2 or g.size != p.shape[0] or lake_spans or
+            not np.isfinite(g[[0, -1]]).all() or
+            g[-1] <= g[0] + float(min_rise_m)):
+        return p, False
+    return p[::-1].copy(), True
+
+
 def _segment_pixel_path(plan: core.GridPlan, xy: np.ndarray) -> list:
     """8-connected pixel path covering the polyline, clipped to the grid."""
     r, c = _nearest_idx(plan, xy)
@@ -284,9 +336,26 @@ class RiverSegment:
     elvid: Optional[str] = None
     vassdragsnr: Optional[str] = None
     vatnlnr: Optional[int] = None
+    regine_area_km2: Optional[float] = None
     upstream: list = field(default_factory=list)     # seg_ids
     downstream: Optional[int] = None                 # seg_id
     lake_spans: list = field(default_factory=list)   # (start_idx, end_idx, local_lake_id)
+    discharge_m3_s: float = 0.0
+    width_m: Optional[float] = None
+    # The VISUAL full width per vertex (`riverwidth`): N50 where it knows, else
+    # width_m. None until set. `width_m` stays the hydraulic width in rivers.bin.
+    vertex_width_m: Optional[np.ndarray] = None
+    # Modelled channel depth from discharge (unscaled); None = the order table.
+    depth_m: Optional[float] = None
+    # Ridges the downhill bed does not cut through (`riverbed._find_barriers`):
+    # (first, crest) vertex pairs, set by the first profile pass.
+    barriers: list = field(default_factory=list)
+    # A side channel traced from N50's river area (`riverbranch.BranchOf`); None
+    # for a mapped line.
+    branch_of: Optional[object] = None
+    node_id: int = NO_HIERARCHY_NODE
+    local_catchment_m2: float = 0.0
+    accumulated_catchment_m2: float = 0.0
 
     @property
     def n(self) -> int:
@@ -364,7 +433,7 @@ def trace_river_network(
         raise ValueError(f"height {height_nodata.shape} != grid {(SY, SX)}")
 
     segments: list = []
-    clip = {"features": 0, "clipped": 0, "split": 0,
+    clip = {"features": 0, "clipped": 0, "split": 0, "reversed_clear_uphill": 0,
             "vertices_in": 0, "vertices_dropped": 0, "features_dropped": 0}
     span_stats = {"raw": 0, "merged": 0, "dropped": 0, "kept": 0}
 
@@ -420,6 +489,13 @@ def trace_river_network(
             for k in span_stats:
                 span_stats[k] += st[k]
 
+            row, col = world_to_grid(plan, xy[:, 0], xy[:, 1])
+            sampled_ground = _fill_nan_1d(_bilinear(height_nodata, row, col))
+            xy, reversed_clear = orient_clear_uphill_run(
+                xy, sampled_ground, spans)
+            if reversed_clear:
+                clip["reversed_clear_uphill"] += 1
+
             segments.append(RiverSegment(
                 seg_id=len(segments),
                 # Hash the CLIPPED run, not the source feature: after a split the
@@ -434,6 +510,7 @@ def trace_river_network(
                 elvid=seg.elvid,
                 vassdragsnr=seg.vassdragsnr,
                 vatnlnr=seg.vatnlnr,
+                regine_area_km2=seg.regine_area_km2,
                 lake_spans=spans,
             ))
 
@@ -442,6 +519,197 @@ def trace_river_network(
     _link_segments(segments, tol_m=ENDPOINT_TOL_CELLS * plan.spacing_m)
     return TracedNetwork(segments=segments, stride_m=stride, clip=clip,
                          span_stats=span_stats)
+
+
+def width_from_discharge(discharge_m3_s, *,
+                         coefficient: float = DEFAULT_WIDTH_COEFFICIENT,
+                         exponent: float = DEFAULT_WIDTH_EXPONENT,
+                         min_width_m: float = DEFAULT_MIN_WIDTH_M,
+                         max_width_m: float = DEFAULT_MAX_WIDTH_M,
+                         scale: float = 1.0):
+    """Full modelled channel width in metres from discharge in m³/s."""
+    q = np.maximum(np.asarray(discharge_m3_s, dtype=np.float64), 0.0)
+    width = float(coefficient) * np.power(q, float(exponent))
+    width = np.clip(width, float(min_width_m), float(max_width_m)) * float(scale)
+    return width
+
+
+def depth_from_discharge(discharge_m3_s, *,
+                         coefficient: float = DEFAULT_DEPTH_COEFFICIENT,
+                         exponent: float = DEFAULT_DEPTH_EXPONENT,
+                         min_depth_m: float = DEFAULT_MIN_DEPTH_M,
+                         max_depth_m: float = DEFAULT_MAX_DEPTH_M):
+    """Modelled channel depth in metres (before `--river-depth-scale`) from
+    discharge in m³/s."""
+    q = np.maximum(np.asarray(discharge_m3_s, dtype=np.float64), 0.0)
+    depth = float(coefficient) * np.power(q, float(exponent))
+    return np.clip(depth, float(min_depth_m), float(max_depth_m))
+
+
+def assign_discharge_and_width(
+    traced: TracedNetwork,
+    *,
+    effective_runoff_m_per_year: float = DEFAULT_EFFECTIVE_RUNOFF_M_PER_YEAR,
+    width_coefficient: float = DEFAULT_WIDTH_COEFFICIENT,
+    width_exponent: float = DEFAULT_WIDTH_EXPONENT,
+    min_width_m: float = DEFAULT_MIN_WIDTH_M,
+    max_width_m: float = DEFAULT_MAX_WIDTH_M,
+    width_scale: float = 1.0,
+    depth_from_q: bool = True,
+) -> dict:
+    """Put modelled mean-annual Q and its matching hydraulic width on the graph.
+
+    With `depth_from_q` each segment also gets `depth_m` from `depth_from_discharge`
+    (unscaled); without it `depth_m` stays None and the legacy order table rules.
+
+    ELVIS carries each local REGINE unit's area, not accumulated segment
+    catchments.  A unit's area is therefore apportioned once across its emitted
+    segments by polyline length (uniform lateral contribution), then accumulated
+    through the authored upstream/downstream graph.  This preserves mass across
+    forks and clipped components without pretending the source supplies gauges.
+    """
+    segments = traced.segments
+    if effective_runoff_m_per_year < 0:
+        raise ValueError("effective runoff must be non-negative")
+
+    groups: dict[str, list] = {}
+    missing = []
+    for s in segments:
+        if (s.vassdragsnr and s.regine_area_km2 is not None and
+                np.isfinite(s.regine_area_km2) and s.regine_area_km2 > 0):
+            groups.setdefault(s.vassdragsnr, []).append(s)
+        else:
+            missing.append(s)
+
+    represented_area_m2 = 0.0
+    inconsistent_units = 0
+    for unit, members in groups.items():
+        source_areas = np.asarray(
+            [float(s.regine_area_km2) for s in members], dtype=np.float64)
+        area_km2 = float(np.median(source_areas))
+        if float(source_areas.max() - source_areas.min()) > 1e-6:
+            inconsistent_units += 1
+        represented_area_m2 += area_km2 * 1e6
+        lengths = np.asarray([
+            float(np.hypot(np.diff(s.xy[:, 0]), np.diff(s.xy[:, 1])).sum())
+            for s in members], dtype=np.float64)
+        if not np.isfinite(lengths).all() or float(lengths.sum()) <= 0:
+            lengths[:] = 1.0
+        local = area_km2 * 1e6 * lengths / float(lengths.sum())
+        for s, a in zip(members, local):
+            s.local_catchment_m2 = float(a)
+
+    for s in missing:
+        s.local_catchment_m2 = 0.0
+
+    by_id = {s.seg_id: s for s in segments}
+    indegree = {s.seg_id: sum(1 for u in s.upstream if u in by_id)
+                for s in segments}
+    ready = sorted(sid for sid, degree in indegree.items() if degree == 0)
+    accumulated = {s.seg_id: float(s.local_catchment_m2) for s in segments}
+    visited = []
+    while ready:
+        sid = ready.pop(0)
+        visited.append(sid)
+        s = by_id[sid]
+        d = s.downstream
+        if d is not None and d in by_id:
+            accumulated[d] += accumulated[sid]
+            indegree[d] -= 1
+            if indegree[d] == 0:
+                ready.append(d)
+                ready.sort()
+
+    cyclic = set(by_id) - set(visited)
+    cycle_components = []
+    unseen = set(cyclic)
+    while unseen:
+        start = min(unseen)
+        component = []
+        sid = start
+        while sid in unseen:
+            unseen.remove(sid)
+            component.append(sid)
+            nxt = by_id[sid].downstream
+            if nxt is None or nxt not in cyclic:
+                break
+            sid = nxt
+        total = float(sum(accumulated[v] for v in component))
+        for v in component:
+            accumulated[v] = total
+        cycle_components.append((component, total))
+    q_scale = float(effective_runoff_m_per_year) / SECONDS_PER_MEAN_YEAR
+    for s in segments:
+        area = max(float(accumulated[s.seg_id]), 0.0)
+        s.accumulated_catchment_m2 = area
+        # Q is a per-segment f32 in rivers.bin. Derive width from THAT packed
+        # value so the runtime reproduces the shipped width bit-for-bit.
+        s.discharge_m3_s = float(np.float32(area * q_scale))
+        s.width_m = float(np.float32(width_from_discharge(
+            s.discharge_m3_s, coefficient=width_coefficient,
+            exponent=width_exponent, min_width_m=min_width_m,
+            max_width_m=max_width_m, scale=width_scale)))
+        s.depth_m = (float(np.float32(depth_from_discharge(s.discharge_m3_s)))
+                     if depth_from_q else None)
+
+    sinks = [s for s in segments if s.downstream is None or s.downstream not in by_id]
+    sink_area = float(sum(accumulated[s.seg_id] for s in sinks) +
+                      sum(total for _component, total in cycle_components))
+    qs = np.asarray([s.discharge_m3_s for s in segments], dtype=np.float64)
+    widths = np.asarray([s.width_m for s in segments], dtype=np.float64)
+    return {
+        "kind": "modelled_mean_annual_discharge",
+        "units": "m3/s",
+        "reference_period": "mean annual",
+        "gauged": False,
+        "effective_runoff_m_per_year": float(effective_runoff_m_per_year),
+        "effective_runoff_l_s_km2": float(
+            effective_runoff_m_per_year * 1e6 * 1000.0 / SECONDS_PER_MEAN_YEAR),
+        "seconds_per_year": float(SECONDS_PER_MEAN_YEAR),
+        "regine_units": len(groups),
+        "regine_units_with_inconsistent_source_area": int(inconsistent_units),
+        "segments_without_regine_area": len(missing),
+        "represented_regine_area_m2": represented_area_m2,
+        "sink_accumulated_area_m2": sink_area,
+        "graph_cycle_segments": len(cyclic),
+        "graph_cycle_components": len(cycle_components),
+        "discharge_min_m3_s": float(qs.min()) if qs.size else 0.0,
+        "discharge_median_m3_s": float(np.median(qs)) if qs.size else 0.0,
+        "discharge_max_m3_s": float(qs.max()) if qs.size else 0.0,
+        "width_min_m": float(widths.min()) if widths.size else 0.0,
+        "width_median_m": float(np.median(widths)) if widths.size else 0.0,
+        "width_max_m": float(widths.max()) if widths.size else 0.0,
+        "depth_median_m": (float(np.median([s.depth_m for s in segments]))
+                           if segments and depth_from_q else None),
+        "method": "For each vassdragsnr, the median finite positive NVE REGINE "
+                  "unit area is apportioned once across "
+                  "its emitted ELVIS segments by in-export polyline length, then "
+                  "accumulated downstream on the authored graph. Q = accumulated "
+                  "area * uniform effective runoff / seconds_per_year.",
+        "source_field": "arealregineenhet_km2",
+        "source_field_semantics": "local REGINE-unit area, not upstream area",
+    }
+
+
+def attach_hierarchy_nodes(plan: core.GridPlan, net: RiverNetwork, hier) -> dict:
+    """Attach each segment to the leaf node at its downstream-most vertex."""
+    root = 0
+    counts = {"root": 0, "leaf": 0, "missing": 0}
+    for s in net.segments:
+        if s.n == 0:
+            s.node_id = NO_HIERARCHY_NODE
+            counts["missing"] += 1
+            continue
+        r, c = _nearest_idx(plan, s.xy[-1:])
+        node = int(hier.labels[int(r[0]), int(c[0])])
+        s.node_id = node
+        counts["root" if node == root else "leaf"] += 1
+    return counts
+
+
+# A vertex level and the exported surface at its sample further apart than this
+# belong to different rivers sharing the sample.
+SAME_RIVER_M = 2.0
 
 
 def build_river_network(
@@ -455,6 +723,8 @@ def build_river_network(
     depth_by_order: Optional[dict] = None,
     depth_scale: float = 1.0,
     traced: Optional[TracedNetwork] = None,
+    shaped_profiles: Optional[dict] = None,
+    drawn_ground: Optional[np.ndarray] = None,
     progress: Optional[Callable[[float, str], None]] = None,
 ) -> RiverNetwork:
     """
@@ -467,15 +737,14 @@ def build_river_network(
     `height_leaf` must be the LEAF DTM the surface raster was built against, so the
     polyline `z` (the bed) matches the bed the raster used.
 
-    `water_surface` is the COMBINED raster surface field. When supplied, each
-    vertex's `level` is read straight out of it, which makes polyline/raster
-    agreement exact rather than merely close. Recomputing `bed + raise`
-    independently is not good enough: the raster applies rules the recomputation
-    would miss — most importantly it pins river pixels ADJACENT to a lake to that
-    lake's surface, so a vertex near an inlet would otherwise carry `bed + raise`
-    while the raster carried the lake's `hoyde`. On steep inlet banks that is a
-    100 m+ disagreement on the handful of vertices that matter most, since they
-    are precisely where the burn hands off to the lake basin.
+    `shaped_profiles`, when supplied, is the per-segment output of
+    `riverbed.downhill_profiles`. It is the authority for open-channel `level`:
+    the raster was spread FROM these vertices, so reading a nearest raster pixel
+    back would reintroduce the sub-pixel disagreement that shaping removed.
+    Authored lake spans are still pinned to their lake level.
+
+    `water_surface` remains the compatibility source when no shaped profile is
+    supplied. In that path each vertex reads the combined raster verbatim.
 
     Without `water_surface` the function falls back to `bed + carve depth` plus
     lake-span pinning, which is correct in the interior and wrong only at those
@@ -501,6 +770,9 @@ def build_river_network(
                   for lid, info in (wg.lake_table or {}).items()}
 
     ws = None if water_surface is None else np.asarray(water_surface)
+    dg = None if drawn_ground is None else np.asarray(drawn_ground)
+    raised_to_surface = 0
+    matched_to_surface = 0
 
     for s in segments:
         xy = s.xy
@@ -514,7 +786,16 @@ def build_river_network(
         # Fallback surface: the trench floor plus the depth that was carved to
         # make it, i.e. the ground the channel was cut from. Overwritten below
         # wherever the raster actually carries a surface at this vertex.
-        level = z + depth_for_order(s.order, depth_by_order, depth_scale)
+        level = z + segment_depth(s, depth_by_order, depth_scale)
+
+        if shaped_profiles is not None and s.seg_id in shaped_profiles:
+            shaped = np.asarray(shaped_profiles[s.seg_id][2], dtype=np.float64)
+            if shaped.shape != level.shape:
+                raise ValueError(
+                    f"shaped profile for segment {s.seg_id} has {shaped.shape}, "
+                    f"expected {level.shape}")
+            take = np.isfinite(shaped)
+            level[take] = shaped[take]
 
         # Inside a lake, the authored lake surface wins over bed+raise: the lake's
         # NVE `hoyde` is real data and the raise is a synthetic constant, so a
@@ -524,11 +805,10 @@ def build_river_network(
             if h is not None and np.isfinite(h):
                 level[a:b + 1] = float(h)
 
-        # Then, wherever the raster actually carries water at this vertex's pixel,
-        # take ITS value verbatim. The raster is the display authority; this makes
-        # the two products identical instead of independently derived, and it picks
-        # up the adjacent-to-lake pinning that bed+raise cannot know about.
-        if ws is not None:
+        # Compatibility path without shaped profiles: wherever the raster carries
+        # water at this vertex's pixel, take its value verbatim, including the old
+        # adjacent-to-lake tie-in.
+        if ws is not None and shaped_profiles is None:
             # INDEX FIRST, convert after. `np.asarray(ws, dtype=np.float64)`
             # here would rebuild the ENTIRE surface grid as float64 — 537 MB
             # on an 8193² export — allocate it, convert it, read a few hundred
@@ -542,8 +822,50 @@ def build_river_network(
             take = np.isfinite(ras)
             level[take] = ras[take]
 
+        # The runtime draws `level - ground` on the terrain as shipped. Where an
+        # open vertex's level sits below that ground but the exported surface
+        # carries water there (a lake's level at a mouth, the tie-in raise beside
+        # one), take the surface: otherwise the river runs
+        # under the terrain there in the runtime, which the preview never shows
+        # (Lierne, 2026-09-30: 660 vertices, 251 by more than 0.5 m).
+        if ws is not None and dg is not None:
+            ri, ci = _nearest_idx(plan, xy)
+            ras = ws[ri, ci].astype(np.float64)
+            open_vertex = np.ones(s.n, dtype=bool)
+            for a, b, _lid in s.lake_spans:
+                open_vertex[a:b + 1] = False
+            low = (open_vertex & np.isfinite(ras) & (level < dg[ri, ci] - 0.02)
+                   & (ras > level))
+            if low.any():
+                level[low] = ras[low]
+                raised_to_surface += int(low.sum())
+            # And on the channel itself the vertex carries the surface the terrain
+            # was carved to. Each sample holds the lowest vertex that lands in it,
+            # so on a steep stream the vertex above stood up to a step higher and
+            # the runtime drew it that much deeper than the preview (26k vertices
+            # over 0.5 m on Lierne). Only ever lowered, and walked from downstream
+            # up so a vertex never drops below the one after it: the sample's value
+            # can come from a vertex further on, or from another segment. A gap
+            # over SAME_RIVER_M is another river sharing the sample.
+            same = (open_vertex & (wg.type[ri, ci] == kvwater.TYPE_RIVER)
+                    & np.isfinite(ras) & (ras < level - 1e-6)
+                    & (level - ras <= SAME_RIVER_M))
+            if same.any():
+                before = level.copy()
+                nxt = np.inf
+                for i in range(s.n - 1, -1, -1):
+                    if not open_vertex[i]:
+                        nxt = np.inf
+                        continue
+                    if same[i]:
+                        level[i] = min(level[i], max(ras[i], nxt))
+                    nxt = level[i]
+                matched_to_surface += int((level < before - 1e-6).sum())
+
         s.z = z.astype(np.float32)
         s.level = level.astype(np.float32)
+
+    branch_ends_retied = _retie_branch_ends(segments)
 
     junctions = _detect_junctions(segments, wg)
     lakes = build_lake_records(plan, wg)
@@ -551,6 +873,9 @@ def build_river_network(
     report = {
         "segments": len(segments),
         "vertices": int(sum(s.n for s in segments)),
+        "levels_raised_to_surface_above_ground": int(raised_to_surface),
+        "levels_matched_to_surface": int(matched_to_surface),
+        "side_channel_ends_retied": int(branch_ends_retied),
         "vertex_stride_m": stride,
         "junctions": len(junctions),
         "lakes": len(lakes),
@@ -564,6 +889,8 @@ def build_river_network(
         "clip_features_dropped": clip["features_dropped"],
         "clip_segments_split": clip["split"],
         "clip_vertices_dropped": clip["vertices_dropped"],
+        "clear_uphill_segments_reversed": clip.get("reversed_clear_uphill", 0),
+        "clear_uphill_reverse_threshold_m": float(CLEAR_REVERSE_RISE_M),
         "clip_vertices_dropped_pct": (
             100.0 * clip["vertices_dropped"] / clip["vertices_in"]
         ) if clip["vertices_in"] else 0.0,
@@ -584,6 +911,36 @@ def build_river_network(
 
     return RiverNetwork(segments=segments, junctions=junctions, lakes=lakes,
                         report=report, vertex_stride_m=stride)
+
+
+def _retie_branch_ends(segments: list) -> int:
+    """
+    A side channel (`riverbranch`) starts at its river's level and ends at the
+    level where it rejoins. The profiles tied it so, but the vertex levels above
+    are adjusted afterwards, a river's included. Take each end's gap out again,
+    spread linearly along the channel short of any lake, so the runtime meets one
+    level at a split and at a rejoin. Returns the number of ends moved.
+    """
+    by_id = {s.seg_id: s for s in segments}
+    moved = 0
+    for s in segments:
+        b = getattr(s, "branch_of", None)
+        if b is None or b.parent not in by_id or s.level is None:
+            continue
+        lv = s.level.astype(np.float64)
+        ds = float(by_id[b.parent].level[b.parent_vertex]) - lv[0]
+        de = 0.0
+        if b.rejoin >= 0 and b.rejoin in by_id:
+            de = float(by_id[b.rejoin].level[b.rejoin_vertex]) - lv[-1]
+        a = min([int(sp[0]) for sp in s.lake_spans], default=s.n - 1)
+        a = max(a, 1)
+        d = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(s.xy[:a + 1], axis=0).T))])
+        t = d / d[-1] if d[-1] > 0 else np.linspace(0.0, 1.0, a + 1)
+        if abs(ds) > 1e-6 or abs(de) > 1e-6:
+            lv[:a + 1] += ds * (1.0 - t) + de * t
+            moved += int(abs(ds) > 1e-6) + int(abs(de) > 1e-6)
+            s.level = lv.astype(np.float32)
+    return moved
 
 
 def _runs_of_lake(
@@ -836,11 +1193,10 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
     Compare the SOURCE vertex order against a Z-derived direction, and report how
     often they disagree — split by whether the segment touches a lake.
 
-    Source order wins in every case. This is a diagnostic, not a correction: a
-    diffuse low disagreement rate is ordinary DTM noise on flat reaches, whereas a
-    high rate, or one concentrated in lake-touching segments, points at something
-    real (a genuinely mis-ordered layer, or lake-through-lines whose flat Z carries
-    no directional signal at all).
+    Apart from the clear-uphill correction made during tracing, this is a
+    diagnostic, not a correction: a diffuse low disagreement rate is ordinary DTM
+    noise on flat reaches, whereas a high rate, or one concentrated in
+    lake-touching segments, points at something real.
     """
     dis = touch = dis_touch = n = vatn = 0
     for s in segments:
@@ -875,8 +1231,9 @@ def validate_flow_direction(segments: list, tol_m: float = 0.5) -> dict:
             100.0 * dis_touch / touch) if touch else 0.0,
         "flowdir_disagreement_pct_non_lake": (
             100.0 * dis_non / non_touch) if non_touch else 0.0,
-        "flowdir_note": "source vertex order is authoritative; Z is an independent "
-                        "QA signal only and never flips a segment.",
+        "flowdir_note": "source vertex order is authoritative except that a non-lake "
+                        "run climbing more than 25 m endpoint-to-endpoint is reversed "
+                        "before linking; remaining Z disagreement is QA only.",
     }
 
 
@@ -915,7 +1272,7 @@ def validate_connectivity(segments: list) -> dict:
 # consumers, two formats, no conflict.
 #
 # Header (little-endian):
-#   8s  magic "KVRIVER1"
+#   8s  magic "KVRIVER2"
 #   I   version
 #   I   epsg
 #   d   origin_x            <- vertex x/y are stored RELATIVE to this
@@ -931,6 +1288,9 @@ def validate_connectivity(segments: list) -> dict:
 #   q   vatn_lnr          (-1 = absent)
 #   H   order
 #   i   downstream_id     (-1 = none)
+#   f   discharge_m3_s    (modelled mean annual discharge)
+#   f   width_m            (full hydraulic width from manifest function)
+#   I   node_id            (leaf label at downstream vertex; 0=root, UINT32_MAX=none)
 #   H   upstream_count, then I * upstream_count
 #   B   elvid_len,       then bytes (ascii)
 #   B   vassdragsnr_len, then bytes (ascii)
@@ -954,11 +1314,12 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
 
         for s in net.segments:
             fh.write(struct.pack(
-                "<IqqHi", s.seg_id,
+                "<IqqHiffI", s.seg_id,
                 -1 if s.strekn_lnr is None else int(s.strekn_lnr),
                 -1 if s.vatnlnr is None else int(s.vatnlnr),
                 int(s.order),
-                -1 if s.downstream is None else int(s.downstream)))
+                -1 if s.downstream is None else int(s.downstream),
+                float(s.discharge_m3_s), float(s.width_m), int(s.node_id)))
             fh.write(struct.pack("<H", len(s.upstream)))
             if s.upstream:
                 fh.write(np.asarray(s.upstream, dtype="<u4").tobytes())
@@ -978,18 +1339,46 @@ def write_rivers_bin(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
 
     return {
         "file": os.path.basename(path),
-        "format": "kvterrain-rivers-bin/1",
+        "format": "kvterrain-rivers-bin/2",
         "magic": BIN_MAGIC.decode("ascii"),
+        "version": BIN_VERSION,
         "byte_order": "little_endian",
+        "header_bytes": 48,
+        "header_layout": "<8sIIddfIII",
         "bytes": os.path.getsize(path),
         "segments": len(net.segments),
         "vertices": net.total_vertices(),
+        "segment_prefix_bytes": 38,
+        "segment_prefix_layout": "<IqqHiffI",
+        "segment_prefix_fields": [
+            {"name": "seg_id", "dtype": "u32le", "offset": 0},
+            {"name": "strekn_lnr", "dtype": "i64le", "offset": 4,
+             "none": -1},
+            {"name": "vatn_lnr", "dtype": "i64le", "offset": 12,
+             "none": -1},
+            {"name": "order", "dtype": "u16le", "offset": 20},
+            {"name": "downstream_id", "dtype": "i32le", "offset": 22,
+             "none": -1},
+            {"name": "discharge_m3_s", "dtype": "f32le", "offset": 26},
+            {"name": "width_m", "dtype": "f32le", "offset": 30},
+            {"name": "node_id", "dtype": "u32le", "offset": 34,
+             "none": NO_HIERARCHY_NODE},
+        ],
+        "segment_tail": "u16 upstream_count; upstream_count*u32 ids; u8+ASCII "
+                        "elvid; u8+ASCII vassdragsnr; u16 lake_span_count; "
+                        "lake_span_count*(u32 start,u32 end,u16 lake_id); "
+                        "16-byte geometry hash; u32 vertex_count; "
+                        "vertex_count*(4*f32)",
+        "node_id": "level-0 hierarchy leaf label at the nearest sample to the "
+                   "segment's downstream-most vertex; 0 drains directly off-map; "
+                   "4294967295 means unavailable",
         "vertex_fields": ["x_rel_origin_m", "y_rel_origin_m", "z_bed_m", "level_surface_m"],
         "vertex_order": "upstream_to_downstream",
         "note": ("z is the sampled DTM BED — the floor of the carved channel — burn "
-                 "against this. level is the water SURFACE (the ground above that "
-                 "channel, or the lake's authored level inside a lake span) — pin "
-                 "to this. Loaded once, resident; not streamed."),
+                 "against this. level is the shaped water SURFACE: capped at dry "
+                 "banks, downstream-only, smoothed, accordant at confluences and "
+                 "graded onto lakes (authored lake level inside a span) — pin to "
+                 "this. Loaded once, resident; not streamed."),
     }
 
 
@@ -1020,6 +1409,9 @@ def write_rivers_geojson(net: RiverNetwork, plan: core.GridPlan, path: str) -> d
                 "downstream_id": s.downstream,
                 "upstream_ids": list(s.upstream),
                 "lake_spans": [[int(a), int(b), int(l)] for a, b, l in s.lake_spans],
+                "discharge_m3_s": float(s.discharge_m3_s),
+                "width_m": float(s.width_m),
+                "node_id": int(s.node_id),
                 "level_m": [round(float(v), 2) for v in s.level],
             },
         })
@@ -1070,11 +1462,30 @@ def write_lakes_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> dict:
     if any(l.get("level_source") == kvwater.LEVEL_SOURCE_CORRECTED for l in net.lakes):
         doc["level_sources"][kvwater.LEVEL_SOURCE_CORRECTED] = (
             "NVE publishes a hoyde, but it stands more than the configured margin "
-            "above practically all the land around the lake, so it was replaced by "
-            "the same DTM estimate. `hoyde_moh` still holds the published value.")
+            "above practically all the land around the lake, or above both the "
+            "lake's own flown water and the low side of its shore, so it was "
+            "replaced by the same DTM estimate. `hoyde_moh` still holds the "
+            "published value.")
+    if any(l.get("level_source") == kvwater.LEVEL_SOURCE_RAISED for l in net.lakes):
+        doc["level_sources"][kvwater.LEVEL_SOURCE_RAISED] = (
+            "NVE publishes a hoyde, but it stands more than the configured margin "
+            "below the lake's own flown water surface, with its shore above that "
+            "too, so it was raised to the same DTM estimate. `hoyde_moh` still "
+            "holds the published value.")
+    if any(l.get("level_source") == kvwater.LEVEL_SOURCE_TWIN for l in net.lakes):
+        doc["level_sources"][kvwater.LEVEL_SOURCE_TWIN] = (
+            "NVE publishes no hoyde, but the lake touches one whose NVE level is "
+            "kept and their flown water is the same surface, so it takes that "
+            "published level: one body of water split into two polygons.")
     with open(path, "w") as fh:
         json.dump(doc, fh, indent=2)
     return {"file": os.path.basename(path), "count": len(net.lakes),
+            "with_raised_level": sum(
+                1 for l in net.lakes
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_RAISED),
+            "with_twin_level": sum(
+                1 for l in net.lakes
+                if l.get("level_source") == kvwater.LEVEL_SOURCE_TWIN),
             "with_authored_level": sum(
                 1 for l in net.lakes if l.get("authored_level_m") is not None),
             "with_estimated_level": sum(
@@ -1113,6 +1524,44 @@ def write_junctions_json(net: RiverNetwork, plan: core.GridPlan, path: str) -> d
             "inflow": inflow, "outflow": len(net.junctions) - inflow}
 
 
+def write_river_widths_bin(net: RiverNetwork, path: str) -> dict:
+    """
+    The visual full width at every vertex, in rivers.bin's segment and vertex
+    order: header `<8sIII` (magic, version, segment_count, vertex_count), then per
+    segment `<II` (seg_id, vertex_count) and vertex_count f32 widths in metres. A
+    segment without visual widths repeats its hydraulic width_m.
+    """
+    total = 0
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<8sIII", WIDTHS_MAGIC, WIDTHS_VERSION,
+                             len(net.segments), net.total_vertices()))
+        for s in net.segments:
+            vw = getattr(s, "vertex_width_m", None)
+            if vw is None or len(vw) != s.n:
+                vw = np.full(s.n, float(s.width_m or 0.0))
+            fh.write(struct.pack("<II", int(s.seg_id), int(s.n)))
+            fh.write(np.asarray(vw, dtype="<f4").tobytes())
+            total += s.n
+    return {
+        "file": os.path.basename(path),
+        "format": "kvterrain-river-widths/1",
+        "magic": WIDTHS_MAGIC.decode("ascii"),
+        "version": WIDTHS_VERSION,
+        "byte_order": "little_endian",
+        "header_layout": "<8sIII (magic, version, segment_count, vertex_count)",
+        "segment_layout": "<II (seg_id, vertex_count), then vertex_count * f32 width_m",
+        "segments": len(net.segments),
+        "vertices": int(total),
+        "bytes": os.path.getsize(path),
+        "quantity": "full VISUAL channel width in metres at each rivers.bin vertex, "
+                    "same segment and vertex order",
+        "note": "What the export rasterised, carved and levelled the river to: "
+                "Kartverket N50's river areas and width classes where they exist, "
+                "the hydraulic width (rivers.bin width_m, from discharge) elsewhere. "
+                "width_m stays the hydraulic width for the solver.",
+    }
+
+
 def export_river_network(
     net: RiverNetwork, plan: core.GridPlan, out_dir: str, *,
     emit_geojson: bool = False,
@@ -1126,6 +1575,21 @@ def export_river_network(
             net, plan, os.path.join(out_dir, JUNCTIONS_FILE)),
         "validation": net.report,
     }
+    if any(getattr(s, "vertex_width_m", None) is not None for s in net.segments):
+        man["river_widths"] = write_river_widths_bin(
+            net, os.path.join(out_dir, RIVER_WIDTHS_FILE))
+    if any(getattr(s, "branch_of", None) is not None for s in net.segments):
+        from . import riverbranch
+        man["river_branches"] = riverbranch.write_branches_bin(
+            net.segments, os.path.join(out_dir, riverbranch.BRANCHES_FILE))
+    hydro = net.report.get("hydrology")
+    if hydro:
+        man["rivers"]["discharge"] = hydro
+        man["rivers"]["width_model"] = net.report["width_model"]
+        if "depth_model" in net.report:
+            man["rivers"]["depth_model"] = net.report["depth_model"]
+        man["rivers"]["hierarchy_attachment"] = net.report.get(
+            "hierarchy_attachment", {})
     if emit_geojson:
         man["rivers_geojson"] = write_rivers_geojson(
             net, plan, os.path.join(out_dir, RIVERS_GEOJSON_FILE))

@@ -24,14 +24,42 @@ def test_new_products_and_manifest(export_dir):
     m = json.load(open(os.path.join(export_dir, "manifest.json")))
     atlas = m["atlas"]
     assert atlas["labels_file"] == "labels.atlas"
+    assert atlas["flowdir_file"] == "flowdir.atlas"
     assert atlas["bytes_per_sample"] == {"heights.atlas": 2, "surface.atlas": 2,
-                                         "water_id.atlas": 2, "labels.atlas": 4}
-    for f in ("hierarchy.bin", "labels.atlas", "water_audit.json"):
+                                         "water_id.atlas": 2, "labels.atlas": 4,
+                                         "flowdir.atlas": 1}
+    for f in ("hierarchy.bin", "hypsometry.bin", "catchments.bin", "labels.atlas",
+              "flowdir.atlas", "water_audit.json", "lake_islands.bin"):
         assert os.path.exists(os.path.join(export_dir, f))
     assert m["hierarchy"]["record_bytes"] == 52
+    hypso = m["hierarchy"]["hypsometry"]
+    assert hypso["file"] == "hypsometry.bin"
+    assert hypso["format"] == "kvterrain-hypsometry/1"
+    assert hypso["samples_per_node"] == 64
+    assert hypso["axis"]["kind"] == "absolute_heights_atlas_u16_code"
+    catch = m["hierarchy"]["catchments"]
+    assert catch["file"] == "catchments.bin"
+    assert catch["record_bytes"] == 8
+    assert catch["parent_includes_children"] is True
+    assert m["flow_direction"]["file"] == "flowdir.atlas"
+    assert m["flow_direction"]["levels"] == 1
+    rivers = m["water_vector"]["rivers"]
+    assert rivers["format"] == "kvterrain-rivers-bin/2"
+    assert rivers["discharge"]["kind"] == "modelled_mean_annual_discharge"
+    assert rivers["width_model"]["formula"].startswith("width_m = clamp")
+    assert rivers["hierarchy_attachment"]["missing"] == 0
     assert m["water_surface"]["river_bathymetry"]["downhill_bed"]["enabled"]
     assert m["water_surface"]["lake_bathymetry"]["edge_is_shore"]
     assert m["water_surface"]["lake_bathymetry"]["shore_8_connected"]
+    islands = m["water_id"]["lake_islands"]
+    assert islands["file"] == "lake_islands.bin"
+    assert islands["bytes"] == 4 + 4 * islands["count"]
+    cells = m["water_id"]["lake_cells"]
+    assert cells["file"] == "lake_cells.bin"
+    assert cells["bytes"] == 4 + 8 * cells["lake_count"] + 8 * cells["run_count"]
+    samples = m["water_id"]["lake_samples"]
+    assert samples["file"] == "lake_samples.bin"
+    assert samples["bytes"] == 4 + 12 * samples["record_count"]
     audit = json.load(open(os.path.join(export_dir, "water_audit.json")))
     assert audit["summary"]["lakes"] == len(audit["lakes"])
 
@@ -99,3 +127,21 @@ def test_shore_is_watertight_diagonally():
     assert old[4, 4] < 49.0                    # diagonal to dry ground, carved ~2 m
     assert new[4, 4] == 50.0
     assert new[8, 8] == old[8, 8]              # the interior is unchanged
+
+
+def test_repeated_nve_records_become_one_segment():
+    def feat(oid, date, coords, order=1):
+        return {"type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": coords},
+                "properties": {"objectid": oid, "statusdatofra": date,
+                               "strekninglnr": "7", "elveordenstrahler": order}}
+    a = [[0.0, 0.0], [10.0, 0.0]]
+    b = [[10.0, 0.0], [20.0, 5.0]]
+    raw = [feat(1, 100, a), feat(2, 100, b), feat(3, 300, a, order=2),
+           feat(4, 200, a), feat(5, 300, a, order=3)]
+    wf = water.features_from_geojson(raw, [], [])
+    assert len(wf.rivers) == 2
+    first = wf.rivers[0]
+    assert first.feature_index == 4 and first.order == 3      # latest, then highest id
+    assert np.array_equal(first.xy, np.asarray(a))             # at a's first position
+    assert wf.rivers[1].feature_index == 1

@@ -38,10 +38,11 @@ DEFAULT_ROOT = os.path.join(PROJECT_ROOT, "exports")
 MANIFEST_NAME = "manifest.json"
 
 # The atlases, in the order a reader most wants them.
-ATLAS_KINDS = ("height", "surface", "water_id", "labels")
+ATLAS_KINDS = ("height", "surface", "water_id", "labels", "flowdir")
 _ATLAS_KEYS = {"height": "height_file", "surface": "surface_file",
-               "water_id": "water_id_file", "labels": "labels_file"}
-_DTYPE_BY_BYTES = {2: "<u2", 4: "<u4"}
+               "water_id": "water_id_file", "labels": "labels_file",
+               "flowdir": "flowdir_file"}
+_DTYPE_BY_BYTES = {1: "u1", 2: "<u2", 4: "<u4"}
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +111,12 @@ class Export:
         atlas = self.manifest.get("atlas", {})
         fn = atlas.get(_ATLAS_KEYS[kind])
         return int((atlas.get("bytes_per_sample") or {}).get(fn, 2))
+
+    def atlas_levels(self, kind: str) -> int:
+        """Number of levels physically present; flowdir is deliberately L0-only."""
+        if kind == "flowdir":
+            return int(self.manifest.get("flow_direction", {}).get("levels", 1))
+        return self.num_levels
 
     @property
     def has_hierarchy(self) -> bool:
@@ -191,6 +198,9 @@ class Export:
         path = self.atlas_path(kind)
         if path is None:
             raise FileNotFoundError(f"export has no {kind} atlas")
+        levels = self.atlas_levels(kind)
+        if level < 0 or level >= levels:
+            raise ValueError(f"{kind} atlas has {levels} level(s), not level {level}")
         lx, ly = self.leaf_tiles
         ts, tc = self.tile_samples, self.tile_cells
         tiles_x, tiles_y = core.tiles_at_level(lx, ly, level)
@@ -203,7 +213,7 @@ class Export:
         with open(path, "rb") as fh:
             for ty in range(tiles_y):
                 for tx in range(tiles_x):
-                    off = core.atlas_tile_offset(lx, ly, self.num_levels, ts,
+                    off = core.atlas_tile_offset(lx, ly, levels, ts,
                                                  level, tx, ty, bps)
                     fh.seek(off)
                     buf = fh.read(tile_bytes)
@@ -320,7 +330,8 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
         entry = {"kind": kind, "file": os.path.basename(path)}
         bps = exp.bytes_per_sample(kind)
         a_tile_bytes = core.atlas_tile_bytes(ts, bps)
-        a_expect = core.atlas_total_bytes(lx, ly, exp.num_levels, ts, bps)
+        levels = exp.atlas_levels(kind)
+        a_expect = core.atlas_total_bytes(lx, ly, levels, ts, bps)
         actual = os.path.getsize(path)
         entry["bytes"] = actual
         entry["bytes_per_sample"] = bps
@@ -331,7 +342,7 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
 
         if entry["size_ok"]:
             with open(path, "rb") as fh:
-                for lvl in range(exp.num_levels):
+                for lvl in range(levels):
                     tx, ty = core.tiles_at_level(lx, ly, lvl)
                     coords = [(x, y) for y in range(ty) for x in range(tx)]
                     pick = rng.choice(len(coords),
@@ -339,7 +350,7 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
                                       replace=False)
                     for idx in pick:
                         x, y = coords[int(idx)]
-                        off = core.atlas_tile_offset(lx, ly, exp.num_levels, ts,
+                        off = core.atlas_tile_offset(lx, ly, levels, ts,
                                                      lvl, x, y, bps)
                         fh.seek(off)
                         if len(fh.read(a_tile_bytes)) != a_tile_bytes:
@@ -358,7 +369,8 @@ def check_water(exp: Export) -> dict:
     """
     Re-read the exported water products and check them against the manifest:
     `rivers.bin` parses cleanly and its counts match, every segment link resolves,
-    every junction names a lake that exists, and the water_id atlas is dense.
+    every junction names a lake that exists, the water_id atlas is dense, and
+    the lake-island sidecar is structurally valid.
 
     The advisory checks (descent, flow direction) are replayed from the stored
     report rather than recomputed — the tool never corrects them, so the numbers
@@ -376,6 +388,7 @@ def check_water(exp: Export) -> dict:
     # ---- rivers.bin -------------------------------------------------------- #
     path = os.path.join(exp.root, wv["rivers"]["file"])
     seen_ids, downstream_refs = set(), []
+    discharge_by_id, width_by_id, node_by_id, downstream_by_id = {}, {}, {}, {}
     total_v = 0
     try:
         with open(path, "rb") as fh:
@@ -387,12 +400,31 @@ def check_water(exp: Export) -> dict:
             report["rivers"] = {"file": wv["rivers"]["file"], "version": version,
                                 "epsg": epsg, "stride_m": stride,
                                 "segments": nseg, "vertices": nvert}
+            if version != 2:
+                raise ValueError(f"unsupported rivers.bin version {version}; expected 2")
             # Per-segment record, in write_rivers_bin's exact order. Walking it
             # in full (rather than seeking past it) IS the check: a wrong field
             # width desynchronises the stream and the walk runs off the end,
             # which is precisely the corruption a length-only check would miss.
             for _ in range(nseg):
-                (sid, strekn, vatn, order, down) = struct.unpack("<IqqHi", fh.read(26))
+                (sid, strekn, vatn, order, down, discharge, width,
+                 node_id) = struct.unpack("<IqqHiffI", fh.read(38))
+                if not np.isfinite(discharge) or discharge < 0:
+                    report["errors"].append(
+                        f"segment {sid} has invalid discharge {discharge}")
+                if not np.isfinite(width) or width <= 0:
+                    report["errors"].append(
+                        f"segment {sid} has invalid width {width}")
+                node_count = exp.manifest.get("hierarchy", {}).get("node_count")
+                if (node_count is not None and node_id != 0xFFFFFFFF and
+                        node_id >= int(node_count)):
+                    report["errors"].append(
+                        f"segment {sid} names hierarchy node {node_id}, but only "
+                        f"{node_count} nodes exist")
+                discharge_by_id[sid] = float(discharge)
+                width_by_id[sid] = float(width)
+                node_by_id[sid] = int(node_id)
+                downstream_by_id[sid] = int(down)
                 (nup,) = struct.unpack("<H", fh.read(2))
                 fh.read(4 * nup)                       # upstream ids, u32 each
                 for _field in range(2):                # elvid, vassdragsnr
@@ -424,6 +456,40 @@ def check_water(exp: Export) -> dict:
         if dangling:
             report["errors"].append(
                 f"{len(dangling)} downstream links point at no segment")
+        hydro = wv["rivers"].get("discharge", {})
+        model = wv["rivers"].get("width_model", {})
+        if hydro and model:
+            q = np.asarray([discharge_by_id[i] for i in sorted(discharge_by_id)],
+                           dtype=np.float32)
+            got_width = np.asarray(
+                [width_by_id[i] for i in sorted(width_by_id)], dtype=np.float32)
+            expected_width = np.asarray(rivernet.width_from_discharge(
+                q, coefficient=float(model["a"]), exponent=float(model["b"]),
+                min_width_m=float(model["min_m"]),
+                max_width_m=float(model["max_m"]),
+                scale=float(model.get("scale", 1.0))), dtype=np.float32)
+            width_exact = got_width.view("<u4") == expected_width.view("<u4")
+            decreases = sum(
+                1 for sid, down in downstream_by_id.items()
+                if down >= 0 and discharge_by_id[down] + 1e-6 < discharge_by_id[sid])
+            missing_nodes = sum(v == 0xFFFFFFFF for v in node_by_id.values())
+            report["river_hydrology"] = {
+                "segments": len(discharge_by_id),
+                "width_exact": int(width_exact.sum()),
+                "width_mismatched": int((~width_exact).sum()),
+                "discharge_decreases_downstream": int(decreases),
+                "segments_without_hierarchy_node": int(missing_nodes),
+            }
+            if not width_exact.all():
+                report["errors"].append(
+                    f"{int((~width_exact).sum())} river widths do not reproduce "
+                    "from discharge and the manifest width function")
+            if decreases:
+                report["errors"].append(
+                    f"{decreases} river links lose discharge downstream")
+            if exp.manifest.get("hierarchy") and missing_nodes:
+                report["errors"].append(
+                    f"{missing_nodes} river segments have no hierarchy node")
     except Exception as e:      # noqa: BLE001 — reported, not raised
         report["errors"].append(f"rivers.bin: {e}")
 
@@ -445,6 +511,12 @@ def check_water(exp: Export) -> dict:
                            "corrected_level": sum(
                                1 for l in rows if l.get("level_source")
                                == kvwater.LEVEL_SOURCE_CORRECTED),
+                           "raised_level": sum(
+                               1 for l in rows if l.get("level_source")
+                               == kvwater.LEVEL_SOURCE_RAISED),
+                           "twin_level": sum(
+                               1 for l in rows if l.get("level_source")
+                               == kvwater.LEVEL_SOURCE_TWIN),
                            "without_level": len(no_level)}
         if no_level:
             # Not an error: an unlevelled lake is left uncarved on purpose, so it
@@ -486,6 +558,59 @@ def check_water(exp: Export) -> dict:
     elif exp.manifest.get("water_id"):
         report["errors"].append("manifest names a water_id atlas that is not there")
 
+    # ---- lake_islands.bin ------------------------------------------------- #
+    island_info = exp.manifest.get("water_id", {}).get("lake_islands")
+    if island_info:
+        try:
+            from . import waterid
+            island_path = os.path.join(exp.root, island_info["file"])
+            indices = waterid.read_lake_islands(island_path)
+            SY, SX = exp.level_shape(0)
+            if island_info.get("count") != int(indices.size):
+                raise ValueError(
+                    f"manifest count {island_info.get('count')} != file count "
+                    f"{indices.size}")
+            if island_info.get("bytes") != os.path.getsize(island_path):
+                raise ValueError(
+                    f"manifest bytes {island_info.get('bytes')} != file bytes "
+                    f"{os.path.getsize(island_path)}")
+            if island_info.get("samples_x") != SX or island_info.get("samples_y") != SY:
+                raise ValueError(
+                    "manifest lake-island dimensions do not match level 0")
+            if indices.size and int(indices[-1]) >= SX * SY:
+                raise ValueError("lake-island cell index lies outside level 0")
+            report["lake_islands"] = {
+                "file": island_info["file"], "count": int(indices.size),
+                "bytes": os.path.getsize(island_path), "ok": True}
+        except Exception as e:      # noqa: BLE001
+            report["lake_islands"] = {"ok": False, "error": str(e)}
+            report["errors"].append(f"lake islands: {e}")
+    elif exp.manifest.get("water_id"):
+        report["errors"].append("water_id manifest has no lake_islands sidecar")
+
+    # ---- lake_cells.bin / lake_samples.bin (optional post-processing) ------ #
+    from . import lakeindex
+    for key, reader in (("lake_cells", lakeindex.read_lake_cells),
+                        ("lake_samples", lakeindex.read_lake_samples)):
+        info = exp.manifest.get("water_id", {}).get(key)
+        if not info:
+            continue
+        try:
+            path = os.path.join(exp.root, info["file"])
+            if info.get("bytes") != os.path.getsize(path):
+                raise ValueError(f"manifest bytes {info.get('bytes')} != file bytes "
+                                 f"{os.path.getsize(path)}")
+            got = reader(path)
+            n = len(got) if key == "lake_cells" else int(got.size)
+            want = info.get("lake_count" if key == "lake_cells" else "record_count")
+            if n != want:
+                raise ValueError(f"manifest count {want} != file count {n}")
+            report[key] = {"file": info["file"], "count": n,
+                           "bytes": info["bytes"], "ok": True}
+        except Exception as e:      # noqa: BLE001
+            report[key] = {"ok": False, "error": str(e)}
+            report["errors"].append(f"{key}: {e}")
+
     report["ok"] = not report["errors"]
     return report
 
@@ -503,6 +628,10 @@ def check_hierarchy(exp: Export) -> dict:
         spill_code = max over spill_cell and outlet_cell;
       * each saddle sits where it says: spill_cell drains into the node's own
         subtree, outlet_cell into overflow_to's;
+      * every outflow head is reproduced exactly from surface.atlas and
+        water_id.atlas;
+      * every hypsometry record is rebuilt exactly from level-0 packed heights,
+        level-0 labels, and immediate child curves;
       * every level-0 label is 0 or a leaf, and the per-node sample counts match;
       * every coarse label level is recomputed from the level below and the
         heights at that level, and must match exactly.
@@ -510,7 +639,9 @@ def check_hierarchy(exp: Export) -> dict:
     Reads a whole level 0 of heights and labels, so it takes a few seconds and a
     few hundred MB on a large export.
     """
+    from . import flowdir as F
     from . import hierarchy as H
+    from . import waterid as WID
 
     hb = exp.manifest.get("hierarchy")
     if not hb:
@@ -610,6 +741,155 @@ def check_hierarchy(exp: Export) -> dict:
         lo = lflat[oc].astype(np.int64)
         if ((tin[lo] < tin[ov]) | (tin[lo] >= tout[ov])).any():
             fail("an outlet_cell does not drain into overflow_to's subtree")
+
+    if exp.atlas_path("surface") and exp.atlas_path("water_id"):
+        surface = exp.read_surface(0).ravel()
+        water_id = exp.read_level("water_id", 0).ravel()
+        expected_head = np.zeros(n, dtype=np.float64)
+        spill_m = nodes["spill_m"].astype(np.float64)
+        has = (flags & H.FLAG_HAS_SPILL) != 0
+        for key in ("spill_cell", "outlet_cell"):
+            cell = nodes[key].astype(np.int64)
+            ok = has & (cell != H.NONE)
+            c = cell[ok]
+            level = np.where(
+                water_id[c] == WID.CODE_RIVER, surface[c], np.nan).astype(np.float64)
+            candidate = np.where(np.isfinite(level), level - spill_m[ok], 0.0)
+            expected_head[ok] = np.maximum(expected_head[ok], candidate)
+        expected_head = np.maximum(expected_head, 0.0).astype(np.float32)
+        probe = nodes.copy()
+        probe["outflow_head_m"] = expected_head
+        own = None
+        lakes_file = (exp.manifest.get("water_vector", {}).get("lakes", {})
+                      .get("file"))
+        if lakes_file and os.path.exists(os.path.join(exp.root, lakes_file)):
+            with open(os.path.join(exp.root, lakes_file)) as f:
+                rows = json.load(f)
+            rows = rows.get("lakes", rows)
+            levels = {int(r["lake_id"]): r.get("authored_level_m") for r in rows
+                      if "lake_id" in r}
+            lake_of = np.where(water_id >= WID.LAKE_ID_BASE,
+                               water_id.astype(np.int64) - WID.LAKE_ID_BASE, 0)
+            own = H.lake_sample_levels(nodes, lflat, lake_of, levels)
+        expected_head, _capped = H.capped_heads(probe, own)
+        actual_head = nodes["outflow_head_m"]
+        exact = actual_head.view("<u4") == expected_head.view("<u4")
+        mismatch = ~exact
+        quantum_m = ((exp.height_range[1] - exp.height_range[0]) / 65534.0)
+        within = mismatch & (np.abs(
+            actual_head.astype(np.float64) - expected_head.astype(np.float64))
+                             <= quantum_m)
+        report["outflow_heads"] = {
+            "nodes": n,
+            "exact": int(exact.sum()),
+            "within_one_surface_code": int(within.sum()),
+            "mismatched": int(mismatch.sum()),
+            "surface_code_step_m": float(quantum_m),
+        }
+        if mismatch.any():
+            fail(f"{int(mismatch.sum())} outflow heads do not reproduce exactly "
+                 "from the packed surface atlas")
+        del surface, water_id, expected_head
+
+    hypso_block = hb.get("hypsometry")
+    if hypso_block:
+        hypso_path = os.path.join(exp.root, hypso_block["file"])
+        try:
+            hypso_header, actual_hypso = H.read_hypsometry_bin(hypso_path)
+        except Exception as e:      # noqa: BLE001
+            fail(f"{hypso_block['file']}: {e}")
+        else:
+            for key, want in (
+                    ("node_count", n),
+                    ("record_bytes", hypso_block["record_bytes"]),
+                    ("samples_per_node", H.HYPSOMETRY_SAMPLES),
+                    ("below_spill_samples", H.HYPSOMETRY_BELOW_SPILL_SAMPLES)):
+                if hypso_header[key] != want:
+                    fail(f"hypsometry header {key} = {hypso_header[key]}, "
+                         f"expected {want}")
+            packed_hierarchy = H.Hierarchy(
+                nodes=nodes, labels=labels, leaf_count=P,
+                samples_x=SX, samples_y=SY,
+                height_min=exp.height_range[0], height_max=exp.height_range[1],
+                seconds={})
+            expected_hypso = H.build_hypsometry(
+                packed_hierarchy, codes.reshape(SY, SX),
+                spacing_m=float(exp.manifest["leaf_spacing_m"]))
+            exact = ((actual_hypso["max_code"] == expected_hypso["max_code"])
+                     & (actual_hypso["flags"] == expected_hypso["flags"])
+                     & np.all(actual_hypso["area_m2"].view("<u4") ==
+                              expected_hypso["area_m2"].view("<u4"), axis=1))
+            report["hypsometry"] = {
+                "nodes": n,
+                "exact": int(exact.sum()),
+                "mismatched": int((~exact).sum()),
+                "samples_per_node": H.HYPSOMETRY_SAMPLES,
+            }
+            if not exact.all():
+                fail(f"{int((~exact).sum())} hypsometry records do not reproduce "
+                     "exactly from the packed heights, labels and child curves")
+            del expected_hypso, actual_hypso
+    else:
+        report["notes"].append("no hierarchy hypsometry block")
+
+    flow_block = exp.manifest.get("flow_direction")
+    catch_block = hb.get("catchments")
+    if flow_block:
+        try:
+            actual_flow = exp.read_level("flowdir", 0)
+            expected_flow = F.build_flow_directions(codes.reshape(SY, SX))
+        except Exception as e:      # noqa: BLE001
+            fail(f"flowdir.atlas: {e}")
+        else:
+            exact_flow = actual_flow == expected_flow
+            report["flow_direction"] = {
+                "samples": int(actual_flow.size),
+                "exact": int(exact_flow.sum()),
+                "mismatched": int((~exact_flow).sum()),
+            }
+            if not exact_flow.all():
+                fail(f"{int((~exact_flow).sum())} flow directions do not reproduce "
+                     "from the packed heights")
+
+            if catch_block:
+                catch_path = os.path.join(exp.root, catch_block["file"])
+                try:
+                    catch_header, actual_catch = F.read_catchments_bin(catch_path)
+                    expected_catch, accumulation = F.node_catchment_areas(
+                        actual_flow, labels, nodes,
+                        spacing_m=float(exp.manifest["leaf_spacing_m"]))
+                except Exception as e:      # noqa: BLE001
+                    fail(f"{catch_block['file']}: {e}")
+                else:
+                    for key, want in (("node_count", n), ("record_bytes", 8)):
+                        if catch_header[key] != want:
+                            fail(f"catchments header {key} = {catch_header[key]}, "
+                                 f"expected {want}")
+                    if actual_catch.shape != expected_catch.shape:
+                        fail(f"catchments payload has {actual_catch.size} records, "
+                             f"expected {expected_catch.size}")
+                        exact_catch = np.zeros(n, dtype=bool)
+                    else:
+                        exact_catch = (actual_catch.view("<u8") ==
+                                       expected_catch.view("<u8"))
+                    report["catchments"] = {
+                        "nodes": n,
+                        "exact": int(exact_catch.sum()),
+                        "mismatched": int((~exact_catch).sum()),
+                        "root_area_m2": float(actual_catch[0]),
+                        "accumulation": accumulation,
+                    }
+                    if not exact_catch.all():
+                        fail(f"{int((~exact_catch).sum())} catchment records do not "
+                             "reproduce exactly from flowdir.atlas")
+                    del actual_catch, expected_catch
+            else:
+                fail("flow_direction exists without hierarchy.catchments")
+            del actual_flow, expected_flow
+    elif catch_block:
+        fail("hierarchy.catchments exists without flow_direction")
+    else:
+        report["notes"].append("no flow-direction or catchment products")
     del codes, lflat
 
     prev_labels = labels

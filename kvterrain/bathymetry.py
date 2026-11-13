@@ -153,9 +153,19 @@ def depth_for_order(order: int, table: dict, scale: float = 1.0) -> float:
     return float(table[o]) * float(scale)
 
 
+def segment_depth(seg, table: dict, scale: float = 1.0) -> float:
+    """A river segment's carve depth: its discharge depth (`depth_m`) where it has
+    one, else the order table's, scaled."""
+    d = getattr(seg, "depth_m", None)
+    if d is not None and np.isfinite(d) and d > 0:
+        return float(d) * float(scale)
+    return depth_for_order(int(seg.order), table, scale)
+
+
 def channel_half_width_m(order: np.ndarray, mask: np.ndarray, spacing_m: float,
                          width_by_order: dict | None = None,
-                         width_scale: float = 1.0) -> np.ndarray:
+                         width_scale: float = 1.0,
+                         width_m: np.ndarray | None = None) -> np.ndarray:
     """
     Per-pixel modelled channel HALF-width in metres, floored at half a texel.
 
@@ -165,6 +175,14 @@ def channel_half_width_m(order: np.ndarray, mask: np.ndarray, spacing_m: float,
     the other is what fills it.
     """
     from . import water as kvwater
+
+    if width_m is not None:
+        explicit = np.asarray(width_m, dtype=np.float32)
+        if explicit.shape != mask.shape:
+            raise ValueError(f"width_m {explicit.shape} != mask {mask.shape}")
+        return np.where(
+            mask, np.maximum(0.5 * explicit, 0.5 * spacing_m),
+            0.5 * spacing_m).astype(np.float32)
 
     width_by_order = width_by_order or kvwater.DEFAULT_WIDTH_BY_ORDER
     orders = np.asarray(order, dtype=np.int32)
@@ -842,12 +860,17 @@ def carve_river_beds(
     depth_scale: float = 1.0,
     width_by_order: dict | None = None,
     width_scale: float = 1.0,
+    width_m: np.ndarray | None = None,
+    depth_m: np.ndarray | None = None,
     bed_target: np.ndarray | None = None,
+    surface_target: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Cut a trench under every river pixel: deepest along the channel's middle,
     feathering to nearly nothing at the banks, with the maximum depth set by that
-    pixel's Strahler order (`DEFAULT_RIVER_DEPTH_BY_ORDER`, scaled).
+    pixel's Strahler order (`DEFAULT_RIVER_DEPTH_BY_ORDER`, scaled) — or, where
+    `depth_m` is given (the per-pixel discharge depth, `rivernet.depth_from_discharge`),
+    by that, scaled.
 
     WHY THIS EXISTS. The river water surface is the terrain height under the
     channel (`watersurface.river_surface_moh`), and the runtime derives
@@ -901,6 +924,12 @@ def carve_river_beds(
     against `level` as passed, which must be the ORIGINAL channel level, not the
     lowered one, or lowering the level would switch the carve off.
 
+    `surface_target` is that shaped level raster. After the weighted trench pull,
+    a river sample still standing just above it is lowered to the waterline. This
+    is a dry-band guard, not permission to flatten a cliff: it uses the same bank
+    tolerance as the ordinary carve. An earlier unconditional form cut order-7
+    buffer pixels 30-40 m down where the rasterised strip lapped onto a steep bank.
+
     `order` is the per-pixel stream order (`WaterGrid.weight`). Returns a copy.
     """
     from . import water as kvwater
@@ -931,8 +960,13 @@ def carve_river_beds(
     for o in np.unique(orders[is_river]):
         depth_max[is_river & (orders == o)] = depth_for_order(
             int(o), depth_by_order, depth_scale)
+    if depth_m is not None:
+        # Per-pixel discharge depth (WaterGrid.depth_m) wins where it is set.
+        dm = np.asarray(depth_m, dtype=np.float32)
+        have = is_river & (dm > 0)
+        depth_max[have] = dm[have] * float(depth_scale)
     half_w = channel_half_width_m(orders, is_river, spacing_m,
-                                  width_by_order, width_scale)
+                                  width_by_order, width_scale, width_m=width_m)
 
     # The MODELLED half-width can exceed the width the channel actually got on the
     # grid — an order-4 river is modelled 8 m wide but rasterises to two texels at
@@ -976,4 +1010,10 @@ def carve_river_beds(
         sel = is_river & np.isfinite(tgt) & (h0 > tgt)
         pulled = h0[sel] - (h0[sel] - tgt[sel]) * weight[sel]
         out[sel] = np.minimum(out[sel], pulled).astype(out.dtype)
+    if surface_target is not None:
+        surf = np.asarray(surface_target, dtype=np.float32)
+        above = height_m.astype(np.float32) - surf
+        sel = (is_river & np.isfinite(surf) & (out > surf) &
+               (above <= max(float(bank_tolerance_m), 0.0)))
+        out[sel] = surf[sel].astype(out.dtype)
     return out

@@ -85,6 +85,19 @@ except ImportError as e:        # pragma: no cover — a clear message, not a Na
 HIERARCHY_FILE = "hierarchy.bin"
 LABELS_FILE = "labels.atlas"
 LABELS_BYTES_PER_SAMPLE = 4
+HYPSOMETRY_FILE = "hypsometry.bin"
+HYPSOMETRY_MAGIC = b"KVHYPS01"
+HYPSOMETRY_VERSION = 1
+HYPSOMETRY_SAMPLES = 64
+HYPSOMETRY_BELOW_SPILL_SAMPLES = 48
+HYPSOMETRY_HEADER_FMT = "<8sIIIIII"
+HYPSOMETRY_HEADER_BYTES = struct.calcsize(HYPSOMETRY_HEADER_FMT)
+HYPSOMETRY_DTYPE = np.dtype([
+    ("max_code", "<u2"),
+    ("flags", "<u2"),
+    ("area_m2", "<f4", (HYPSOMETRY_SAMPLES,)),
+])
+HYPSOMETRY_FLAG_VALID = 1 << 0
 
 BIN_MAGIC = b"KVDEPH01"
 BIN_VERSION = 1
@@ -123,6 +136,9 @@ FLAG_SPILLS_OFF_MAP = 1 << 2
 FLAG_OUTLET_OCEAN = 1 << 3
 FLAG_AUTHORED_LAKE = 1 << 4
 FLAG_MINOR = 1 << 5
+# This node's outflow head was capped by `cap_heads_below_lakes`. (Bit 6 is the
+# runtime's own FLAG_EDITED_ESCAPE.)
+FLAG_HEAD_CAPPED = 1 << 7
 
 FLAG_NAMES = {
     "leaf": FLAG_LEAF,
@@ -131,6 +147,7 @@ FLAG_NAMES = {
     "outlet_ocean": FLAG_OUTLET_OCEAN,
     "authored_lake": FLAG_AUTHORED_LAKE,
     "minor": FLAG_MINOR,
+    "head_capped": FLAG_HEAD_CAPPED,
 }
 
 # Below either threshold a node is flagged MINOR: kept in the tree (a runtime walk
@@ -489,8 +506,9 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
     `outflow_head_m` for every node that spills through a river sample: the river
     surface there minus the spill — the river's depth at the spill point — never
     negative; 0 elsewhere. The higher of the two saddle samples counts.
-    `river_surface` is the exported water surface (m.o.h.); only river samples
-    are read.
+    `river_surface` is quantised and decoded exactly as surface.atlas before any
+    samples are read.  Heads therefore reproduce bit-for-bit when the runtime
+    derives them from that atlas rather than from this in-memory float raster.
 
     Measured before the lake tie-in, with the channel's own ground as its level,
     509 Lierne lakes still stood a median 0.45 m above spill + head: at an outlet
@@ -498,11 +516,16 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
     The exported surface is raised to the lake there, which is what the river
     actually carries out of it.
     """
+    from . import watersurface
+
     nodes = h.nodes
     has = (nodes["flags"] & FLAG_HAS_SPILL) != 0
     head = np.zeros(h.node_count, dtype=np.float64)
     riv = np.asarray(is_river, dtype=bool).ravel()
-    lvl = np.asarray(river_surface, dtype=np.float32).ravel()
+    packed = watersurface.pack_surface_u16(
+        np.asarray(river_surface), h.height_min, h.height_max)
+    lvl = watersurface.unpack_surface_u16(
+        packed, h.height_min, h.height_max).ravel()
     spill = nodes["spill_m"].astype(np.float64)
     for key in ("spill_cell", "outlet_cell"):
         cell = nodes[key].astype(np.int64)
@@ -512,6 +535,229 @@ def set_outflow_heads(h: Hierarchy, is_river: np.ndarray,
         cand = np.where(np.isfinite(lv), lv - spill[ok], 0.0)
         head[ok] = np.maximum(head[ok], cand)
     nodes["outflow_head_m"] = np.maximum(head, 0.0).astype(np.float32)
+
+
+def lake_sample_levels(nodes: np.ndarray, labels_flat: np.ndarray,
+                       lake_of_sample: np.ndarray, level_by_lake: dict) -> np.ndarray:
+    """Per node, the lowest level of the authored lakes whose samples it labels
+    itself (+inf where none). `lake_of_sample` is the local lake id per sample, 0
+    off the lakes: `water_id - 16` where `water_id >= 16`."""
+    n = nodes.shape[0]
+    low = np.full(n, np.inf)
+    ids = np.asarray(lake_of_sample).ravel()
+    m = ids > 0
+    if not m.any() or not level_by_lake:
+        return low
+    table = np.full(int(max(int(ids[m].max()), max(level_by_lake))) + 1, np.nan)
+    for lid, lv in level_by_lake.items():
+        if lv is not None and np.isfinite(lv):
+            table[int(lid)] = float(lv)
+    lv = table[ids[m].astype(np.int64)]
+    lab = np.asarray(labels_flat).ravel()[m].astype(np.int64)
+    ok = np.isfinite(lv) & (lab > 0) & (lab < n)
+    np.minimum.at(low, lab[ok], lv[ok])
+    return low
+
+
+def lowest_authored_level_below(nodes: np.ndarray,
+                                own: Optional[np.ndarray] = None) -> np.ndarray:
+    """Per node, the lowest level of an authored lake inside its subtree: of any
+    authored lake NODE below it, and of any authored lake whose samples it or its
+    descendants label (`own`, from `lake_sample_levels`); +inf where none. A lake's
+    samples can lie in a basin that is not the lake's node's ancestor, and a basin
+    beside a lake's outlet can hold some of them. Relies on a non-root parent's id
+    being greater than its children's."""
+    n = nodes.shape[0]
+    low = np.full(n, np.inf) if own is None else np.asarray(own, np.float64).copy()
+    parent = nodes["parent"].astype(np.int64)
+    authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
+    level = nodes["authored_level_m"].astype(np.float64)
+    for v in range(1, n):
+        p = parent[v]
+        if p == ROOT or p == NONE or p >= n:
+            continue
+        mine = low[v]
+        if authored[v] and np.isfinite(level[v]):
+            mine = min(mine, level[v])
+        if mine < low[p]:
+            low[p] = mine
+    return low
+
+
+def capped_heads(nodes: np.ndarray, own: Optional[np.ndarray] = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """(head, capped): `outflow_head_m` with every node that is not an authored lake
+    held no higher than the lowest authored lake inside it, and where that bit."""
+    head = nodes["outflow_head_m"].astype(np.float64)
+    low = lowest_authored_level_below(nodes, own)
+    authored = (nodes["flags"] & FLAG_AUTHORED_LAKE) != 0
+    room = np.maximum(low - nodes["spill_m"].astype(np.float64), 0.0)
+    capped = (~authored) & np.isfinite(low) & (head > room)
+    head = np.where(capped, room, head).astype(np.float32)
+    return head, capped
+
+
+def cap_heads_below_lakes(h: Hierarchy, lake_of_sample: Optional[np.ndarray] = None,
+                          level_by_lake: Optional[dict] = None) -> dict:
+    """
+    A node that is not an authored lake may not hold water above an authored lake
+    inside it: the runtime fills a node's whole subtree to the highest level on its
+    ancestor path, so such a node floods that lake past its mapped shore.
+
+    The head that did it is read at a river sample on the saddle, and on Lierne
+    (2026-09-30) that sample was mostly not the river carrying water OUT of the
+    node: an inflow's carved trench on the lake's rim, or a stray river sample
+    beside a lake carrying a nearby river's higher surface. 195 unmatched
+    ancestors then held up to 2.9 m above the lakes below them, and the runtime
+    drew 392 lakes too high. Run after the lakes are matched (FLAG_AUTHORED_LAKE).
+    Marks every capped node FLAG_HEAD_CAPPED.
+
+    With `lake_of_sample` and `level_by_lake`, a lake's own samples count wherever
+    they are labelled, not only under the lake's node: that left 24.9k lake samples
+    drawn high in basins beside their lakes (runtime re-audit, 2026-09-30).
+    """
+    nodes = h.nodes
+    own = (lake_sample_levels(nodes, h.labels, lake_of_sample, level_by_lake)
+           if lake_of_sample is not None and level_by_lake else None)
+    head, capped = capped_heads(nodes, own)
+    before = nodes["outflow_head_m"].astype(np.float64)
+    nodes["outflow_head_m"] = head
+    nodes["flags"][capped] |= FLAG_HEAD_CAPPED
+    cut = before[capped] - head[capped]
+    return {"heads_capped_below_a_lake": int(capped.sum()),
+            "cap_median_m": round(float(np.median(cut)), 3) if cut.size else 0.0,
+            "cap_max_m": round(float(cut.max()), 3) if cut.size else 0.0}
+
+
+def hypsometry_axis(floor_code: int, spill_code: int, max_code: int) -> np.ndarray:
+    """The fixed absolute packed-height axis for one non-root node.
+
+    Integer half-up interpolation is part of the wire contract: it avoids a
+    language-specific floating-point rounding decision in rebuilt nodes.
+    """
+    floor = int(floor_code)
+    spill = max(int(spill_code), floor)
+    top = max(int(max_code), spill)
+    out = np.empty(HYPSOMETRY_SAMPLES, dtype=np.uint16)
+    low_n = HYPSOMETRY_BELOW_SPILL_SAMPLES
+    den = low_n - 1
+    for i in range(low_n):
+        out[i] = (floor * (den - i) + spill * i + den // 2) // den
+    high_n = HYPSOMETRY_SAMPLES - low_n
+    for k in range(1, high_n + 1):
+        out[low_n + k - 1] = (
+            spill * (high_n - k) + top * k + high_n // 2) // high_n
+    return out
+
+
+@nb.njit(cache=True)
+def _leaf_hypsometry(labels, codes, floor_code, spill_code, max_code,
+                     leaf_count, sample_count):
+    """Difference counts at the first axis sample >= each cell code."""
+    diff = np.zeros((leaf_count + 1, sample_count), dtype=np.uint32)
+    low_n = HYPSOMETRY_BELOW_SPILL_SAMPLES
+    high_n = sample_count - low_n
+    for i in range(labels.size):
+        leaf = int(labels[i])
+        if leaf <= 0 or leaf > leaf_count:
+            continue
+        code = int(codes[i])
+        floor = int(floor_code[leaf])
+        spill = max(int(spill_code[leaf]), floor)
+        top = max(int(max_code[leaf]), spill)
+        lo = 0
+        hi = sample_count
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if mid < low_n:
+                den = low_n - 1
+                axis = (floor * (den - mid) + spill * mid + den // 2) // den
+            else:
+                k = mid - low_n + 1
+                axis = (spill * (high_n - k) + top * k + high_n // 2) // high_n
+            if axis < code:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < sample_count:
+            diff[leaf, lo] += 1
+    for leaf in range(1, leaf_count + 1):
+        for j in range(1, sample_count):
+            diff[leaf, j] += diff[leaf, j - 1]
+    return diff
+
+
+def _curve_at(axis: np.ndarray, area: np.ndarray, z: int) -> float:
+    """Linear interpolation; duplicate codes take their rightmost area."""
+    j = int(np.searchsorted(axis, z, side="right"))
+    if j == 0:
+        return 0.0
+    if j >= axis.size:
+        return float(area[-1])
+    x0, x1 = int(axis[j - 1]), int(axis[j])
+    if x1 == x0:
+        return float(area[j])
+    t = (int(z) - x0) / float(x1 - x0)
+    return float(area[j - 1]) + t * (float(area[j]) - float(area[j - 1]))
+
+
+def build_hypsometry(h: Hierarchy, codes: np.ndarray,
+                     spacing_m: float) -> np.ndarray:
+    """Fixed-size, absolute-axis cumulative area curves for every non-root node.
+
+    Leaves are measured from the shipped label/code grids. Internal nodes are
+    deliberately composed from their immediate child curves, never rescanned,
+    which is the same operation the runtime can use after an in-place rebuild.
+    """
+    flat_codes = np.ascontiguousarray(codes, dtype=np.uint16).ravel()
+    flat_labels = np.ascontiguousarray(h.labels, dtype=np.uint32).ravel()
+    if flat_codes.size != flat_labels.size:
+        raise ValueError("hypsometry codes and labels must have the same shape")
+    n, P = h.node_count, h.leaf_count
+    nodes = h.nodes
+
+    max_code = np.zeros(n, dtype=np.uint16)
+    for leaf in range(1, P + 1):
+        max_code[leaf] = nodes["floor_code"][leaf]
+    np.maximum.at(max_code, flat_labels.astype(np.intp), flat_codes)
+    parent = nodes["parent"].astype(np.int64)
+    for v in range(1, n):
+        p = int(parent[v])
+        if p != NONE and max_code[v] > max_code[p]:
+            max_code[p] = max_code[v]
+
+    records = np.zeros(n, dtype=HYPSOMETRY_DTYPE)
+    records["max_code"] = max_code
+    records["flags"][1:] = HYPSOMETRY_FLAG_VALID
+    leaf_counts = _leaf_hypsometry(
+        flat_labels, flat_codes, nodes["floor_code"], nodes["spill_code"],
+        max_code, P, HYPSOMETRY_SAMPLES)
+    cell_area = float(spacing_m) * float(spacing_m)
+    records["area_m2"][1:P + 1] = (
+        leaf_counts[1:].astype(np.float64) * cell_area).astype(np.float32)
+    del leaf_counts
+
+    children: list[list[int]] = [[] for _ in range(n)]
+    for v in range(1, n):
+        p = int(parent[v])
+        if p != NONE:
+            children[p].append(v)
+
+    for v in range(P + 1, n):
+        if v == ROOT:
+            continue
+        axis = hypsometry_axis(
+            nodes["floor_code"][v], nodes["spill_code"][v], max_code[v])
+        total = np.zeros(HYPSOMETRY_SAMPLES, dtype=np.float64)
+        for child in children[v]:
+            child_axis = hypsometry_axis(
+                nodes["floor_code"][child], nodes["spill_code"][child],
+                max_code[child])
+            child_area = records["area_m2"][child]
+            for j, z in enumerate(axis):
+                total[j] += _curve_at(child_axis, child_area, int(z))
+        records["area_m2"][v] = total.astype(np.float32)
+    return records
 
 
 def subtree_intervals(nodes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -567,6 +813,95 @@ def build_label_pyramid(labels0: np.ndarray, code_levels: list) -> list:
 # --------------------------------------------------------------------------- #
 # Writers                                                                      #
 # --------------------------------------------------------------------------- #
+
+def write_hypsometry_bin(records: np.ndarray, path: str) -> dict:
+    records = np.ascontiguousarray(records, dtype=HYPSOMETRY_DTYPE)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack(
+            HYPSOMETRY_HEADER_FMT, HYPSOMETRY_MAGIC, HYPSOMETRY_VERSION,
+            HYPSOMETRY_HEADER_BYTES, HYPSOMETRY_DTYPE.itemsize,
+            int(records.shape[0]), HYPSOMETRY_SAMPLES,
+            HYPSOMETRY_BELOW_SPILL_SAMPLES))
+        records.tofile(fh)
+    return {"file": os.path.basename(path), "bytes": os.path.getsize(path)}
+
+
+def read_hypsometry_bin(path: str) -> tuple[dict, np.ndarray]:
+    with open(path, "rb") as fh:
+        raw_header = fh.read(HYPSOMETRY_HEADER_BYTES)
+        if len(raw_header) != HYPSOMETRY_HEADER_BYTES:
+            raise ValueError("short hypsometry header")
+        (magic, version, header_bytes, record_bytes, node_count,
+         samples, below_spill) = struct.unpack(HYPSOMETRY_HEADER_FMT, raw_header)
+        if magic != HYPSOMETRY_MAGIC:
+            raise ValueError(f"bad hypsometry magic {magic!r}")
+        if record_bytes != HYPSOMETRY_DTYPE.itemsize:
+            raise ValueError(
+                f"hypsometry record_bytes {record_bytes} != {HYPSOMETRY_DTYPE.itemsize}")
+        fh.seek(header_bytes)
+        raw = fh.read()
+    expected = node_count * record_bytes
+    if len(raw) != expected:
+        raise ValueError(f"hypsometry payload is {len(raw)} bytes, expected {expected}")
+    records = np.frombuffer(raw, dtype=HYPSOMETRY_DTYPE).copy()
+    return {
+        "version": version, "header_bytes": header_bytes,
+        "record_bytes": record_bytes, "node_count": node_count,
+        "samples_per_node": samples,
+        "below_spill_samples": below_spill,
+    }, records
+
+
+def hypsometry_manifest(h: Hierarchy, records: np.ndarray, info: dict,
+                        spacing_m: float) -> dict:
+    return {
+        "file": info["file"],
+        "bytes": info["bytes"],
+        "format": "kvterrain-hypsometry/1",
+        "magic": HYPSOMETRY_MAGIC.decode("ascii"),
+        "version": HYPSOMETRY_VERSION,
+        "byte_order": "little_endian",
+        "header_bytes": HYPSOMETRY_HEADER_BYTES,
+        "header_layout": HYPSOMETRY_HEADER_FMT,
+        "header_fields": ["magic", "version", "header_bytes", "record_bytes",
+                          "node_count", "samples_per_node",
+                          "below_spill_samples"],
+        "record_bytes": HYPSOMETRY_DTYPE.itemsize,
+        "record_fields": [
+            {"name": "max_code", "dtype": "u16le", "offset": 0},
+            {"name": "flags", "dtype": "u16le", "offset": 2,
+             "bits": {"valid": HYPSOMETRY_FLAG_VALID}},
+            {"name": "area_m2", "dtype": "64*f32le", "offset": 4},
+        ],
+        "node_count": h.node_count,
+        "samples_per_node": HYPSOMETRY_SAMPLES,
+        "below_spill_samples": HYPSOMETRY_BELOW_SPILL_SAMPLES,
+        "upper_samples": HYPSOMETRY_SAMPLES - HYPSOMETRY_BELOW_SPILL_SAMPLES,
+        "node_record": "record i belongs to hierarchy node i; root record 0 is invalid",
+        "axis": {
+            "kind": "absolute_heights_atlas_u16_code",
+            "decode_m": "height_min_m + code/65535*(height_max_m-height_min_m)",
+            "lower": "48 integer-half-up samples, inclusive, from floor_code to "
+                     "spill_code",
+            "upper": "16 integer-half-up samples after the lower block, from "
+                     "spill_code toward max_code, inclusive of max_code",
+            "integer_rounding": "round non-negative rational half up",
+            "max_code": "maximum heights.atlas level-0 code carried by any leaf "
+                        "label in this node's subtree; parent max is max(children)",
+        },
+        "value": "cumulative planimetric flooded area in square metres at or "
+                 "below the sample's absolute elevation code",
+        "interpolation": "piecewise linear in absolute height code; below the "
+                         "first code area=0; above max_code area=last value; "
+                         "duplicate codes take the rightmost area",
+        "composition": "leaf curves are derived from heights.atlas level 0 and "
+                       "labels.atlas level 0. Every non-root internal curve is "
+                       "computed only as sum(interpolate(child,z)) over immediate "
+                       "children at its own absolute axis, in ascending child id "
+                       "order, accumulated as f64 then stored f32.",
+        "cell_area_m2": float(spacing_m) * float(spacing_m),
+        "valid_nodes": int(((records["flags"] & HYPSOMETRY_FLAG_VALID) != 0).sum()),
+    }
 
 def write_hierarchy_bin(h: Hierarchy, path: str) -> dict:
     with open(path, "wb") as fh:
@@ -633,8 +968,9 @@ def manifest_block(h: Hierarchy, *, hier_file: dict, labels: dict,
     nonroot = np.arange(h.node_count) != ROOT
     return {
         "format": "kvterrain-depression-hierarchy/1",
-        "status": "first milestone of WATER_REDESIGN.md: node table and labels; "
-                  "no catchment, hypsometry or flow directions yet",
+        "status": "node table, labels, composable absolute-axis hypsometry and "
+                  "flow-derived node catchments; flow directions are a level-0 "
+                  "sidecar atlas",
         "file": hier_file["file"],
         "bytes": hier_file["bytes"],
         "magic": BIN_MAGIC.decode("ascii"),
@@ -674,8 +1010,10 @@ def manifest_block(h: Hierarchy, *, hier_file: dict, labels: dict,
             "lake_id": "authored lake matched to this node (lakes.json lake_id), 0 = none",
             "outflow_head_m": "depth of water the outflow river carries over the "
                               "spill: the node holds water up to spill_m + "
-                              "outflow_head_m. The exported river surface at the "
-                              "spill minus spill_m (0 where the spill is on land); "
+                              "outflow_head_m. The river surface at the spill is "
+                              "first encoded and decoded with surface.atlas's "
+                              "[0,65534] packing, then reduced by spill_m (0 where "
+                              "the spill is on land); "
                               "for a matched lake whose authored level lies within "
                               "that head plus tolerance, raised to authored_level_m "
                               "- spill_m",
