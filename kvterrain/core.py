@@ -228,6 +228,54 @@ def export_image_fetch(
     raise RuntimeError(f"exportImage failed after {retries} tries: {last_err}")
 
 
+# A remainder this small is absorbed into the chunks before it rather than sent as
+# its own request. `plan_grid` pads to a power of two PLUS ONE sample (corner-
+# centred tiles share their edge), so a lattice is almost always 2^k + 1 wide and
+# a power-of-two chunk size used to leave a one-sample sliver in every row and
+# column of chunks: 9 of Lierne's 25 requests were 1 px wide, and against a slow
+# server each costs as much wall clock as a full chunk. The ImageServer accepts
+# up to 15000 px per side, so a chunk this much over max_fetch_px is safe.
+CHUNK_SLACK_FRACTION = 0.125
+# Parallel exportImage requests. Enough to hide one slow response behind the
+# others; few enough to stay polite to a public service.
+DEFAULT_FETCH_WORKERS = 4
+# A chunk that still fails after the fetcher's own retries is split in four and
+# the quarters are fetched instead, down to this size. hoydedata.no answers a
+# request it cannot finish in ~90-110 s with a 502 from its proxy, whatever the
+# client's timeout, so a smaller request is the only thing that can get through.
+MIN_SPLIT_PX = 256
+# A piece too small to split is retried after these pauses (seconds). Asking
+# again at once is how a 99%-done Lierne fetch died on 2026-09-29: three 500s in
+# a row on one 256 px piece while the server was having a bad minute.
+RETRY_BACKOFF_S = (5.0, 20.0, 60.0, 120.0)
+
+
+def chunk_spans(n: int, max_px: int) -> list[tuple[int, int]]:
+    """
+    Split `n` samples into (start, size) spans of at most ~max_px, balanced so
+    that no span is a sliver: a remainder of up to CHUNK_SLACK_FRACTION * max_px
+    is shared out among the other spans instead of becoming a request of its own.
+    """
+    max_px = max(int(max_px), 1)
+    k = -(-n // max_px)
+    if k > 1 and n - (k - 1) * max_px <= max(1, int(CHUNK_SLACK_FRACTION * max_px)):
+        k -= 1
+    base, extra = divmod(n, k)
+    spans, start = [], 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        spans.append((start, size))
+        start += size
+    return spans
+
+
+def fetch_chunks(plan: "GridPlan", max_px: int) -> list[tuple[int, int, int, int]]:
+    """(ix, iy, nx, ny) per exportImage request; iy counts rows from the SOUTH."""
+    return [(ix, iy, nx, ny)
+            for iy, ny in chunk_spans(plan.samples_y, max_px)
+            for ix, nx in chunk_spans(plan.samples_x, max_px)]
+
+
 def assemble_region(
     plan: GridPlan,
     fetcher: Fetcher,
@@ -235,30 +283,145 @@ def assemble_region(
     *,
     max_fetch_px: int = DEFAULT_MAX_FETCH_PX,
     progress: Optional[Callable[[int, int, str], None]] = None,
+    workers: int = 1,
+    cache_dir: Optional[str] = None,
+    min_split_px: int = MIN_SPLIT_PX,
+    retry_backoff_s: tuple = RETRY_BACKOFF_S,
+    stats: Optional[dict] = None,
 ) -> np.ndarray:
+    """
+    Fetch the plan's lattice block by block into one north-up array.
+
+    Blocks start as `fetch_chunks(plan, max_fetch_px)`. `workers` > 1 fetches
+    them concurrently (`fetcher` must then be thread-safe). A block whose fetch
+    raises is split into quarters that go back into the same pool, recursively,
+    down to `min_split_px`; a block too small to split is retried after each
+    pause in `retry_backoff_s`, then given up on. With `cache_dir`, every block is saved there as it
+    arrives and read back instead of refetched, so a fetch that dies half-way
+    resumes where it stopped; the caller deletes the directory once the result is
+    safe. `progress(done, total, msg)` counts samples; `stats` receives counts.
+    """
+    import os
+    from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, wait)
+
     SX, SY = plan.samples_x, plan.samples_y
     out = np.full((SY, SX), np.nan, dtype=np.float32)
+    chunks = fetch_chunks(plan, max_fetch_px)
+    counts = {"chunks": len(chunks), "requests": 0, "failed_requests": 0,
+              "splits": 0, "from_cache": 0}
+    total_px = SX * SY
+    done_px = 0
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
 
-    x_starts = list(range(0, SX, max_fetch_px))
-    y_starts = list(range(0, SY, max_fetch_px))
-    total = len(x_starts) * len(y_starts)
-    done = 0
+    def cache_path(b):
+        ix, iy, nx, ny = b
+        return os.path.join(cache_dir, f"{iy}_{ix}_{ny}x{nx}.npy")
 
-    for jy in y_starts:
-        ny = min(max_fetch_px, SY - jy)
-        for ix in x_starts:
-            nx = min(max_fetch_px, SX - ix)
-            sx0 = plan.origin_x + ix * plan.spacing_m
-            sy0 = plan.origin_y + jy * plan.spacing_m
+    def quarters(b):
+        ix, iy, nx, ny = b
+        hx, hy = nx // 2, ny // 2
+        return [(qx, qy, qnx, qny)
+                for qy, qny in ((iy, hy), (iy + hy, ny - hy))
+                for qx, qnx in ((ix, hx), (ix + hx, nx - hx))]
 
-            block = fetcher(server_url, plan.epsg, sx0, sy0, nx, ny, plan.spacing_m)
-            top = SY - (jy + ny)
-            out[top:top + ny, ix:ix + nx] = block
+    def cached(b):
+        """Blocks to place from the cache, and blocks still to fetch, for `b`
+        (an earlier run may have finished it whole or only some of its quarters)."""
+        if not cache_dir:
+            return [], [b]
+        if os.path.exists(cache_path(b)):
+            return [b], []
+        if min(b[2], b[3]) >= 2 * min_split_px and any(
+                os.path.exists(cache_path(q)) for q in quarters(b)):
+            hit, miss = [], []
+            for q in quarters(b):
+                h, m = cached(q)
+                hit += h
+                miss += m
+            return hit, miss
+        return [], [b]
 
-            done += 1
-            if progress:
-                progress(done, total, f"tile {done}/{total}")
+    def fetch(b, wait_s=0.0):
+        if wait_s:
+            time.sleep(wait_s)
+        ix, iy, nx, ny = b
+        arr = np.asarray(fetcher(server_url, plan.epsg,
+                                 plan.origin_x + ix * plan.spacing_m,
+                                 plan.origin_y + iy * plan.spacing_m,
+                                 nx, ny, plan.spacing_m), dtype=np.float32)
+        if arr.shape != (ny, nx):
+            raise ValueError(f"fetcher returned {arr.shape}, asked for {(ny, nx)}")
+        if cache_dir:
+            tmp = cache_path(b) + ".tmp.npy"
+            np.save(tmp, arr)
+            os.replace(tmp, cache_path(b))
+        return arr
 
+    def place(b, arr):
+        nonlocal done_px
+        ix, iy, nx, ny = b
+        top = SY - (iy + ny)
+        out[top:top + ny, ix:ix + nx] = arr
+        done_px += nx * ny
+        if progress:
+            extra = (f", {counts['failed_requests']} failed requests re-asked as "
+                     f"smaller pieces" if counts["failed_requests"] else "")
+            progress(done_px, total_px,
+                     f"{100.0 * done_px / total_px:.0f}% of samples{extra}")
+
+    todo = []
+    for c in chunks:
+        hit, miss = cached(c)
+        for b in hit:
+            place(b, np.load(cache_path(b)))
+            counts["from_cache"] += 1
+        todo += miss
+
+    tries: dict = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            running = {}
+
+            def submit(b, wait_s=0.0):
+                counts["requests"] += 1
+                running[pool.submit(fetch, b, wait_s)] = b
+
+            for b in todo:
+                submit(b)
+            try:
+                while running:
+                    finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    for fut in finished:
+                        b = running.pop(fut)
+                        try:
+                            arr = fut.result()
+                        except Exception:
+                            counts["failed_requests"] += 1
+                            if min(b[2], b[3]) >= 2 * min_split_px:
+                                counts["splits"] += 1
+                                for q in quarters(b):
+                                    submit(q)
+                                continue
+                            k = tries.get(b, 0)
+                            if k >= len(retry_backoff_s):
+                                raise
+                            tries[b] = k + 1
+                            submit(b, float(retry_backoff_s[k]))
+                            continue
+                        place(b, arr)
+            except BaseException:
+                for f in running:
+                    f.cancel()
+                raise
+    except Exception as e:
+        where = (f" {100.0 * done_px / total_px:.0f}% of the samples are cached in "
+                 f"{cache_dir}; the same fetch again resumes from there."
+                 if cache_dir and done_px else "")
+        raise RuntimeError(f"height fetch failed: {e}.{where}") from e
+    finally:
+        if stats is not None:
+            stats.update(counts)
     return out
 
 
@@ -309,6 +472,8 @@ class PackResult:
     terrain_leaf: object = None     # np.ndarray | None
     water_surface: object = None    # np.ndarray | None — m.o.h., NaN off-water
     stage_seconds: dict = None      # {stage key -> seconds}, filled by process
+    hierarchy: object = None        # hierarchy.Hierarchy | None
+    water_audit: object = None      # dict (water_audit.json) | None
 
 
 def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int, int, int]:
@@ -329,7 +494,7 @@ def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int
 # GridPlan) so a consumer can recompute every offset from the manifest header  #
 # alone — no per-tile offset table is written or needed.                        #
 #                                                                              #
-#   tileBytes           = tile_samples * tile_samples * 2                       #
+#   tileBytes           = tile_samples * tile_samples * bytesPerSample          #
 #   tilesCount(l)       = tilesX(l) * tilesY(l)                                 #
 #   levelByteBase(L)    = tileBytes * Σ_{l=0}^{L-1} tilesCount(l)               #
 #   tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes    #
@@ -351,17 +516,26 @@ def tiles_at_level(leaf_tiles_x: int, leaf_tiles_y: int, level: int) -> tuple[in
             max(1, int(leaf_tiles_y) // (2 ** level)))
 
 
-def atlas_tile_bytes(tile_samples: int) -> int:
-    return int(tile_samples) * int(tile_samples) * 2
+# Every atlas this tool wrote before labels.atlas is 2 bytes per sample, and the
+# default below keeps all of them — and every existing caller — exactly as it was.
+# labels.atlas is the first 4-byte atlas: a label tile sits at the same TILE INDEX
+# as its height twin, but not at the same byte offset. The manifest records each
+# atlas's bytes per sample under `atlas.bytes_per_sample`.
+DEFAULT_BYTES_PER_SAMPLE = 2
+
+
+def atlas_tile_bytes(tile_samples: int, bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE) -> int:
+    return int(tile_samples) * int(tile_samples) * int(bytes_per_sample)
 
 
 def atlas_level_byte_bases(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> list[int]:
     """Byte offset at which each level begins (prefix sum over tile counts).
     Length == num_levels; every value is a Python int (unbounded, so no int32
     overflow — the runtime side must use a 64-bit type)."""
-    tb = atlas_tile_bytes(tile_samples)
+    tb = atlas_tile_bytes(tile_samples, bytes_per_sample)
     bases: list[int] = []
     acc = 0
     for lvl in range(int(num_levels)):
@@ -373,10 +547,11 @@ def atlas_level_byte_bases(
 
 def atlas_total_bytes(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> int:
     """Exact size a dense atlas file must have. The export self-check asserts the
     written file matches this; a mismatch means the grid wasn't dense (ragged)."""
-    tb = atlas_tile_bytes(tile_samples)
+    tb = atlas_tile_bytes(tile_samples, bytes_per_sample)
     total = 0
     for lvl in range(int(num_levels)):
         tx, ty = tiles_at_level(leaf_tiles_x, leaf_tiles_y, lvl)
@@ -387,12 +562,41 @@ def atlas_total_bytes(
 def atlas_tile_offset(
     leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int, tile_samples: int,
     level: int, x: int, y: int,
+    bytes_per_sample: int = DEFAULT_BYTES_PER_SAMPLE,
 ) -> int:
     """Byte offset of tile (x, y) at `level` inside a dense atlas."""
     tx, _ = tiles_at_level(leaf_tiles_x, leaf_tiles_y, level)
     base = atlas_level_byte_bases(
-        leaf_tiles_x, leaf_tiles_y, num_levels, tile_samples)[level]
-    return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples)
+        leaf_tiles_x, leaf_tiles_y, num_levels, tile_samples, bytes_per_sample)[level]
+    return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples, bytes_per_sample)
+
+
+def resolve_height_range(
+    leaf: np.ndarray,
+    height_min: Optional[float] = None,
+    height_max: Optional[float] = None,
+) -> tuple[float, float]:
+    """The global [height_min, height_max] packing range for a finished leaf.
+
+    Split out of `export_tiles` because the depression hierarchy must be built on
+    the heights AS PACKED, which means knowing this range before the atlas is
+    written. Both call this, so they cannot disagree about it."""
+    finite = leaf[np.isfinite(leaf)]
+    if height_min is None:
+        height_min = float(finite.min()) if finite.size else 0.0
+    if height_max is None:
+        height_max = float(finite.max()) if finite.size else 1.0
+    if height_max <= height_min:
+        height_max = height_min + 1.0
+    return height_min, height_max
+
+
+def pack_leaf_codes(leaf: np.ndarray, height_min: float, height_max: float,
+                    nodata_fill_m: float = 0.0) -> np.ndarray:
+    """The whole leaf level as the u16 codes `export_tiles` writes, sample for
+    sample: same nodata fill, same `pack_r16`. What the runtime reads."""
+    filled = np.where(np.isfinite(leaf), leaf, np.float32(nodata_fill_m))
+    return pack_r16(filled, height_min, height_max)
 
 
 def pack_r16(value_m: np.ndarray, hmin: float, hmax: float) -> np.ndarray:
@@ -418,14 +622,7 @@ def export_tiles(
     TC = plan.tile_cells
     TS = TC + 1
 
-    leaf = levels[0]
-    finite = leaf[np.isfinite(leaf)]
-    if height_min is None:
-        height_min = float(finite.min()) if finite.size else 0.0
-    if height_max is None:
-        height_max = float(finite.max()) if finite.size else 1.0
-    if height_max <= height_min:
-        height_max = height_min + 1.0
+    height_min, height_max = resolve_height_range(levels[0], height_min, height_max)
 
     os.makedirs(out_dir, exist_ok=True)
     tiles_written = 0
@@ -484,6 +681,9 @@ def export_tiles(
             "height_file": atlas_name,
             "tile_bytes": atlas_tile_bytes(TS),
             "height_bytes": expect,
+            # Per atlas file. Every atlas before labels.atlas is 2; readers must
+            # use this, not tile_bytes, for any atlas they did not already know.
+            "bytes_per_sample": {atlas_name: DEFAULT_BYTES_PER_SAMPLE},
         },
     }
 
@@ -501,6 +701,7 @@ def run_export(
     fetcher: Optional[Fetcher] = None,
     server_url: Optional[str] = None,
     max_fetch_px: int = DEFAULT_MAX_FETCH_PX,
+    workers: int = DEFAULT_FETCH_WORKERS,
     nodata_fill_m: float = 0.0,
     height_min: Optional[float] = None,
     height_max: Optional[float] = None,
@@ -524,13 +725,14 @@ def run_export(
     from . import process as _process
 
     if fetcher is None:
-        fetcher = lambda u, e, sx, sy, nx, ny, sp: export_image_fetch(
-            u, e, sx, sy, nx, ny, sp, source_kind=source_kind)
+        from .fetch import live_height_fetcher
+        fetcher = live_height_fetcher(source_kind)
     if server_url is None:
         server_url = IMAGESERVER[source_kind]
 
     leaf = assemble_region(plan, fetcher, server_url,
-                           max_fetch_px=max_fetch_px, progress=progress)
+                           max_fetch_px=max_fetch_px, progress=progress,
+                           workers=workers)
 
     features = None
     if include_water:
@@ -551,6 +753,9 @@ def run_export(
                 features = _water.fetch_water_features(
                     plan, progress=progress,
                     include_main_rivers=bool(wopts.get("include_main_rivers", True)))
+                if "bathymetry" not in wopts:
+                    wopts["bathymetry"] = _water.fetch_bathymetry_geojson(
+                        plan, progress=progress)
         water_opts = wopts
 
     # `run_process` reports a fraction; this function's callers were written

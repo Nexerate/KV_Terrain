@@ -1,0 +1,257 @@
+"""Outflow head on the hierarchy, and correcting published levels the terrain contradicts."""
+
+import numpy as np
+
+from kvterrain import core, hierarchy as H, wateraudit, water, watersurface
+
+
+def bowl_with_outlet(outlet_is_river=True):
+    """15x15 at 20 m; a lake bowl at 10 m; a flat outlet channel at 12 m to the east edge."""
+    h = np.full((15, 15), 20.0)
+    h[4:11, 4:11] = 10.0
+    h[7, 11:15] = 12.0
+    t = np.zeros(h.shape, np.uint8)
+    t[4:11, 4:11] = water.TYPE_LAKE
+    if outlet_is_river:
+        t[7, 11:15] = water.TYPE_RIVER
+    lake_id = np.where(t == water.TYPE_LAKE, 1, 0).astype(np.uint16)
+    wg = water.WaterGrid(type=t, weight=(t == water.TYPE_RIVER).astype(np.uint8),
+                         lake_id=lake_id, lake_table={1: {"hoyde_moh": None}},
+                         weight_raw=None, lake_island=np.zeros(h.shape, bool))
+    channel = np.where(t == water.TYPE_RIVER, 14.0, np.nan).astype(np.float32)
+    return h, wg, channel
+
+
+def audit(level, outlet_is_river=True):
+    h, wg, channel = bowl_with_outlet(outlet_is_river)
+    wg.lake_table[1]["level_m"] = level
+    plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
+                         tile_cells=14, leaf_tiles_x=1, leaf_tiles_y=1, num_levels=1)
+    codes = np.rint(h * 100).astype(np.uint16)       # 1 cm steps
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    H.set_outflow_heads(hier, wg.type == water.TYPE_RIVER, channel)
+    tin, tout = H.subtree_intervals(hier.nodes)
+    rows = wateraudit.audit_lakes(plan, hier, codes, wg, inflow_lakes=set(),
+                                  tin=tin, tout=tout)
+    return rows[0], hier
+
+
+def test_outflow_head_is_river_depth_at_the_spill():
+    row, hier = audit(11.0)
+    v = row["node_id"]
+    assert abs(float(hier.nodes["spill_m"][v]) - 12.0) < 0.02
+    assert abs(float(hier.nodes["outflow_head_m"][v]) - 2.0) < 0.02
+    assert row["status"] == "ok"
+
+
+def test_outflow_head_uses_surface_atlas_round_trip():
+    h, wg, channel = bowl_with_outlet()
+    channel[wg.type == water.TYPE_RIVER] = 14.003
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    H.set_outflow_heads(hier, wg.type == water.TYPE_RIVER, channel)
+
+    v = int(hier.labels[7, 7])
+    stored = watersurface.unpack_surface_u16(
+        watersurface.pack_surface_u16(channel, hier.height_min, hier.height_max),
+        hier.height_min, hier.height_max)[7, 11]
+    expected = np.float32(max(
+        np.float64(stored) - np.float64(hier.nodes["spill_m"][v]), 0.0))
+    actual = hier.nodes["outflow_head_m"][v]
+    assert actual.tobytes() == expected.tobytes()
+    raw = np.float32(max(
+        np.float64(channel[7, 11]) - np.float64(hier.nodes["spill_m"][v]), 0.0))
+    assert actual.tobytes() != raw.tobytes()
+
+
+def test_level_within_outflow_head_is_held_and_reproduced():
+    row, hier = audit(13.5)
+    v = row["node_id"]
+    assert row["status"] == "held_by_outflow"
+    n = hier.nodes
+    assert float(n["spill_m"][v] + n["outflow_head_m"][v]) >= 13.5 - 1e-3
+    assert n["flags"][v] & H.FLAG_AUTHORED_LAKE
+
+
+def test_level_above_the_head_is_a_finding():
+    row, _ = audit(16.0)
+    assert row["status"] == "level_above_spill"
+    assert row["spill_through"] in ("river_channel", "map_edge")
+    assert abs(row["excess_m"] - 2.0) < 0.1
+
+
+def test_spill_over_land_has_no_head():
+    row, hier = audit(13.5, outlet_is_river=False)
+    assert float(hier.nodes["outflow_head_m"][row["node_id"]]) == 0.0
+    assert row["status"] == "level_above_spill"
+
+
+def test_a_lake_shallower_than_its_outlet_river_is_matched_through_its_head():
+    # A 13 m lake bed draining into a scour hole at 11.5 behind a riffle at 12 m:
+    # the whole lake stands above its bare spill, held only by the river's depth.
+    h, wg, channel = bowl_with_outlet()
+    h[4:11, 4:11] = 13.0
+    h[7, 10] = 11.5
+    h[7, 11] = 12.0
+    h[7, 12:15] = 11.0
+    wg.lake_table[1]["level_m"] = 13.5
+    plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
+                         tile_cells=14, leaf_tiles_x=1, leaf_tiles_y=1, num_levels=1)
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    H.set_outflow_heads(hier, wg.type == water.TYPE_RIVER, channel)
+    tin, tout = H.subtree_intervals(hier.nodes)
+    row, = wateraudit.audit_lakes(plan, hier, codes, wg, inflow_lakes=set(),
+                                  tin=tin, tout=tout)
+    assert row["status"] == "held_by_outflow" and row["iou"] > 0.95
+    assert abs(row["spill_m"] - 12.0) < 0.02
+
+
+def test_a_basin_spilling_into_its_own_lake_is_not_the_lake():
+    # One lake (level 12) whose bed is two basins joined by a neck 0.3 m under
+    # water, the right one draining through a sill into a big low patch outside the
+    # outline. The left basin alone overlaps the lake best, but its water only runs
+    # on into the other half of the same lake.
+    h = np.full((20, 20), 20.0)
+    h[5:10, 2:8] = 10.0                        # left basin, 30 samples
+    h[5:10, 8] = 11.7                          # the neck
+    h[5:10, 9:13] = 10.0                       # right basin
+    h[11:17, 2:17] = 11.0                      # low ground outside the outline
+    h[10, 10] = 11.0                           # joined to the right basin
+    t = np.zeros(h.shape, np.uint8)
+    t[5:10, 2:13] = water.TYPE_LAKE
+    wg = water.WaterGrid(type=t, weight=np.zeros(h.shape, np.uint8),
+                         lake_id=np.where(t == water.TYPE_LAKE, 1, 0).astype(np.uint16),
+                         lake_table={1: {"level_m": 12.0}}, weight_raw=None,
+                         lake_island=np.zeros(h.shape, bool))
+    plan = core.GridPlan(epsg=25833, spacing_m=5.0, origin_x=0.0, origin_y=0.0,
+                         tile_cells=19, leaf_tiles_x=1, leaf_tiles_y=1, num_levels=1)
+    codes = np.rint(h * 100).astype(np.uint16)
+    hier = H.build_hierarchy(codes, 0.0, 655.35, spacing_m=5.0)
+    tin, tout = H.subtree_intervals(hier.nodes)
+    row, = wateraudit.audit_lakes(plan, hier, codes, wg, inflow_lakes=set(),
+                                  tin=tin, tout=tout)
+    assert row["status"] == "ok", row
+    assert row["spill_m"] > 12.0
+
+
+def correction_world(hoyde):
+    h = np.full((30, 30), 105.0, np.float32)          # shore at ~105 m
+    h[10:20, 10:20] = 100.0                           # flown water surface at 100 m
+    t = np.zeros(h.shape, np.uint8)
+    t[10:20, 10:20] = water.TYPE_LAKE
+    wg = water.WaterGrid(type=t, weight=np.zeros(h.shape, np.uint8),
+                         lake_id=np.where(t == water.TYPE_LAKE, 1, 0).astype(np.uint16),
+                         lake_table={1: {"hoyde_moh": hoyde}},
+                         lake_island=np.zeros(h.shape, bool))
+    return h, wg
+
+
+def test_published_level_above_all_the_shore_is_corrected():
+    h, wg = correction_world(118.0)
+    rep = water.apply_estimated_levels(wg, h)
+    info = wg.lake_table[1]
+    assert info["level_source"] == water.LEVEL_SOURCE_CORRECTED
+    assert info["hoyde_moh"] == 118.0
+    assert info["level_m"] <= 105.0
+    assert rep["levels_corrected"] == 1
+
+
+def test_published_level_near_the_shore_is_kept():
+    # Flown water at 100 m, shore at 105 m: anything up to a metre over the shore
+    # could be a drawn-down lake.
+    for hoyde in (104.0, 105.9):
+        h, wg = correction_world(hoyde)
+        water.apply_estimated_levels(wg, h)
+        assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
+        assert wg.lake_table[1]["level_m"] == hoyde
+
+
+def slope_world(hoyde, regulated=False):
+    # A tarn cut into a hillside: flown water at 100 m, the low bank at 100.5 m,
+    # the high bank climbing to 112 m, so the ring's p90 sits far above the lake.
+    h, wg = correction_world(hoyde)
+    yy, xx = np.mgrid[0:30, 0:30]
+    land = wg.type != water.TYPE_LAKE
+    h[land] = (100.5 + np.clip(xx - 14, 0, None) * 1.0)[land]
+    wg.lake_table[1]["regulated"] = regulated
+    return h, wg
+
+
+def test_a_level_above_its_water_and_low_shore_on_a_slope_is_lowered():
+    h, wg = slope_world(104.0)
+    rep = water.apply_estimated_levels(wg, h)
+    info = wg.lake_table[1]
+    assert info["level_source"] == water.LEVEL_SOURCE_CORRECTED, rep["correction"]
+    assert 99.5 <= info["level_m"] <= 100.5
+    assert rep["correction"]["lakes"][0]["test"] == "above_scan_and_shore_p10"
+    # The p90 test alone does not see it.
+    h, wg = slope_world(104.0)
+    water.apply_estimated_levels(wg, h, max_above_scan_m=None)
+    assert wg.lake_table[1]["level_m"] == 104.0
+
+
+def test_lowering_on_a_slope_spares_reservoirs_and_near_levels():
+    h, wg = slope_world(104.0, regulated=True)
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_m"] == 104.0
+    h, wg = slope_world(101.0)                        # within a metre of its water
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
+
+
+def test_a_lake_without_hoyde_touching_its_twin_takes_the_published_level():
+    h = np.full((30, 40), 105.0, np.float32)
+    h[10:20, 5:35] = 99.6                             # one flat flown surface
+    t = np.zeros(h.shape, np.uint8)
+    t[10:20, 5:35] = water.TYPE_LAKE
+    lid = np.zeros(h.shape, np.uint16)
+    lid[10:20, 5:20] = 1
+    lid[10:20, 20:35] = 2
+    wg = water.WaterGrid(type=t, weight=np.zeros(h.shape, np.uint8), lake_id=lid,
+                         lake_table={1: {"hoyde_moh": 100.0}, 2: {"hoyde_moh": None}},
+                         lake_island=np.zeros(h.shape, bool))
+    rep = water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[2]["level_source"] == water.LEVEL_SOURCE_TWIN
+    assert wg.lake_table[2]["level_m"] == 100.0
+    assert rep["levels_from_twin"] == 1 and rep["levels_estimated"] == 0
+    # A step between their flown surfaces means two lakes: each keeps its own.
+    h[10:20, 20:35] = 99.0
+    wg.lake_table = {1: {"hoyde_moh": 100.0}, 2: {"hoyde_moh": None}}
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[2]["level_source"] == water.LEVEL_SOURCE_ESTIMATED
+
+
+def test_correction_can_be_switched_off():
+    h, wg = correction_world(118.0)
+    rep = water.apply_estimated_levels(wg, h, max_above_shore_m=None,
+                                       max_above_scan_m=None)
+    assert wg.lake_table[1]["level_m"] == 118.0
+    assert rep["levels_corrected"] == 0
+
+
+def test_published_level_below_its_own_flown_water_is_raised():
+    h, wg = correction_world(98.0)                    # flown water at 100 m
+    rep = water.apply_estimated_levels(wg, h)
+    info = wg.lake_table[1]
+    assert info["level_source"] == water.LEVEL_SOURCE_RAISED
+    assert info["hoyde_moh"] == 98.0
+    assert 99.0 < info["level_m"] <= 100.0
+    assert rep["levels_raised"] == 1
+
+
+def test_a_level_within_rounding_of_the_scan_or_a_reservoir_is_kept():
+    h, wg = correction_world(99.6)
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_source"] == water.LEVEL_SOURCE_NVE
+    h, wg = correction_world(97.0)
+    wg.lake_table[1]["regulated"] = True
+    water.apply_estimated_levels(wg, h)
+    assert wg.lake_table[1]["level_m"] == 97.0
+
+
+def test_raise_can_be_switched_off():
+    h, wg = correction_world(97.0)
+    rep = water.apply_estimated_levels(wg, h, max_below_scan_m=None)
+    assert wg.lake_table[1]["level_m"] == 97.0
+    assert rep["levels_raised"] == 0

@@ -14,8 +14,10 @@ the split.
 """
 import argparse
 import json
+import math
 import os
 import sys
+import time
 
 
 from . import core
@@ -64,17 +66,49 @@ def _water_opts(a) -> dict:
         "lake_max_depth_m": a.lake_max_depth,
         "lake_min_depth_m": a.lake_min_depth,
         "lake_shore_slope": a.lake_shore_slope,
+        "lake_bed_model": a.lake_bed,
+        "lake_surveys": a.lake_surveys,
+        "river_mouths": a.river_mouths,
+        "lake_shoreline": a.lake_shoreline,
+        "river_n50_widths": a.river_n50_widths,
+        "river_thalweg_snap": a.river_thalweg_snap,
+        "river_side_channels": a.river_side_channels,
+        "river_depth_model": a.river_depth_model,
         "lake_snap_px": a.lake_snap_px,
         "river_depth_scale": a.river_depth_scale,
         "river_bank_tolerance_m": a.river_bank_tolerance,
+        "river_runoff_m_per_year": a.river_runoff_m_per_year,
         "fill_lake_holes": not a.keep_lake_holes,
         "ocean_level_m": a.ocean_level,
         "emit_geojson": a.emit_geojson,
         "estimate_lake_levels": a.estimate_lake_levels,
         "lake_perimeter_cap": a.lake_perimeter_cap,
+        "lake_level_max_above_shore_m": (a.lake_level_max_above_shore
+                                         if a.correct_lake_levels else None),
+        "lake_level_max_below_scan_m": (a.lake_level_max_below_scan
+                                        if a.correct_lake_levels else None),
+        "lake_level_max_above_scan_m": (a.lake_level_max_above_scan
+                                        if a.correct_lake_levels else None),
+        "lake_level_twin_max_scan_diff_m": (
+            0.25 if a.correct_lake_levels else None),
+        "downhill_river_bed": a.downhill_river_bed,
+        "lake_edge_is_shore": a.lake_edge_is_shore,
+        "lake_shore_8_connected": a.lake_shore_8_connected,
+        "hierarchy": a.hierarchy,
     }
     if a.river_vertex_stride is not None:
         opts["river_vertex_stride_m"] = a.river_vertex_stride
+    # Unset terrain-model knobs are left out, so lakebed.LakeBedParams stays the
+    # one place the (calibrated) defaults live.
+    for key, val in (("lake_slope_ratio", a.lake_slope_ratio),
+                     ("lake_bed_curvature", a.lake_bed_curvature),
+                     ("lake_ring_fraction", a.lake_ring_fraction),
+                     ("lake_bed_noise", a.lake_bed_noise),
+                     ("lake_bed_noise_wavelength_m", a.lake_bed_noise_wavelength),
+                     ("lake_bed_seed", a.lake_bed_seed),
+                     ("lake_bed_max_depth_m", a.lake_bed_max_depth)):
+        if val is not None:
+            opts[key] = val
     return opts
 
 
@@ -104,6 +138,7 @@ def cmd_fetch(a):
         dest=a.dest,
         source_kind=a.source,
         max_fetch_px=a.max_px,
+        workers=a.fetch_workers,
         include_water=a.water,
         include_main_rivers=not a.no_main_rivers,
         compression=a.compress or ds_mod.DEFAULT_COMPRESSION,
@@ -138,6 +173,52 @@ def cmd_fetch(a):
 # --------------------------------------------------------------------------- #
 # datasets — what is already on disk                                           #
 # --------------------------------------------------------------------------- #
+
+def cmd_fetch_bathymetry(a):
+    """Add NVE lake surveys to a dataset fetched before they were part of a fetch."""
+    from . import fetch as kvfetch
+
+    d = _resolve_dataset(a.dataset, a.root)
+    d = kvfetch.fetch_bathymetry_into(d, progress=_bar("lake surveys"))
+    print()
+    c = d.manifest["water"]["bathymetry"]["counts"]
+    print(f"dataset {d.name!r}: {c['surveys']} lake surveys, {c['contours']} depth "
+          f"contours, {c['points']} spot depths, {c['shores']} surveyed shorelines")
+
+
+def cmd_fetch_n50(a):
+    """Add Kartverket N50 river widths to a dataset fetched before they were part of
+    a fetch."""
+    from . import fetch as kvfetch
+
+    d = _resolve_dataset(a.dataset, a.root)
+    d = kvfetch.fetch_n50_into(d, progress=_bar("N50"))
+    print()
+    n = d.manifest["water"]["n50"]
+    print(f"dataset {d.name!r}: {n['count']} N50 river features {n['counts']} from "
+          f"{', '.join(m[1] for m in n['municipalities'])}")
+
+
+def cmd_calibrate_lake_beds(a):
+    """Score the synthetic lake bed against NVE-surveyed lakes and sweep its knobs."""
+    from . import lakecalib
+
+    res = lakecalib.calibrate(a.n, cache=a.cache or lakecalib.DEFAULT_CACHE, seed=a.seed,
+                              max_area_km2=a.max_area, cache_only=a.cache_only)
+    best = res["best"]
+    print(f"\nbest of {len(res['ranking'])} combinations over {res['lakes']} lakes: "
+          f"{best['params']}")
+    print(f"  median |log error| at survey samples {best['sample_abs_log_err']:.3f} "
+          f"(x{math.exp(best['sample_abs_log_err']):.2f}), bias "
+          f"{best['sample_log_bias']:+.3f}")
+    print(f"  max depth |log error| {best['max_abs_log_err']:.3f}, bias "
+          f"{best['max_log_bias']:+.3f}; mean depth |log error| "
+          f"{best['mean_abs_log_err']:.3f}, bias {best['mean_log_bias']:+.3f}")
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(res, f, indent=1, default=str)
+        print(f"  full results: {a.json}")
+
 
 def cmd_datasets(a):
     from . import dataset as ds_mod
@@ -228,6 +309,7 @@ def cmd_build(a):
     res = core.run_export(plan, a.out, source_kind=a.source,
                           fetcher=fetcher, server_url=server,
                           max_fetch_px=a.max_px,
+                          workers=a.fetch_workers,
                           nodata_fill_m=a.nodata_fill,
                           height_min=a.hmin, height_max=a.hmax,
                           progress=prog,
@@ -258,15 +340,38 @@ def _report_export(a, res, want_water: bool) -> None:
                   f"those capped at the surrounding terrain, max drop "
                   f"{ll.get('levels_cap_max_drop_m', 0.0):.2f} m), "
                   f"{ll['levels_unresolved']} unresolved (left uncarved)")
+            if ll.get("levels_corrected"):
+                print(f"    corrected: {ll['levels_corrected']} published levels stood "
+                      f"above their shore and their own flown water and were "
+                      f"replaced by the DTM estimate (max drop "
+                      f"{ll['levels_corrected_max_drop_m']:.1f} m)")
+            if ll.get("levels_raised"):
+                print(f"    raised: {ll['levels_raised']} published levels stood "
+                      f"more than {ll['raise']['max_below_scan_m']:g} m below their "
+                      f"own flown water and were raised to it (max rise "
+                      f"{ll['levels_raised_max_m']:.1f} m)")
+            if ll.get("levels_from_twin"):
+                print(f"    twins: {ll['levels_from_twin']} lakes without hoyde share "
+                      f"their flown water with a touching NVE lake and took its level")
         wid = res.manifest.get("water_id", {})
         if wid:
             print(f"  + {wid['atlas_file']} (u16 class + lake id; "
                   f"lake code = {wid['encoding']['lake_id_base']} + lake_id)")
+            islands = wid.get("lake_islands")
+            if islands:
+                print(f"  + {islands['file']}: {islands['count']} level-0 "
+                      "lake-island cells")
         wv = res.manifest.get("water_vector", {})
         if wv:
             r, lk, jn = wv["rivers"], wv["lakes"], wv["junctions"]
             print(f"  + {r['file']}: {r['segments']} segments, {r['vertices']} "
                   f"vertices ({r['bytes'] / 1e6:.1f} MB), upstream→downstream")
+            discharge = r.get("discharge")
+            if discharge:
+                print(f"    Q: modelled mean annual, median "
+                      f"{discharge['discharge_median_m3_s']:.3g} m³/s, max "
+                      f"{discharge['discharge_max_m3_s']:.3g} m³/s; effective "
+                      f"runoff {discharge['effective_runoff_m_per_year']:g} m/year")
             print(f"  + {lk['file']}: {lk['count']} lakes "
                   f"({lk['with_authored_level']} with an authored level)")
             print(f"  + {jn['file']}: {jn['count']} junctions "
@@ -280,17 +385,55 @@ def _report_export(a, res, want_water: bool) -> None:
                   f"{snap['lakes_grown']} lakes were still the lake's own flat water "
                   f"surface outside its polygon and are now part of it")
         lb = wm.get("lake_bathymetry", {})
-        print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
-              f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
-              f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
-        print(f"  + river beds carved under the channel by stream order "
-              f"(× {a.river_depth_scale:g}); the surface is level across each "
+        if lb.get("model") == "terrain":
+            t = lb.get("tiers", {})
+            deep = lb.get("body_max_depth_m") or {}
+            surveyed = [e for e in lb.get("surveyed_lakes", [])
+                        if e.get("tier") != "synthetic"]
+            print(f"  + lake beds continue the surrounding terrain: "
+                  f"{lb.get('bodies', 0)} water bodies, deepest {deep.get('max', 0):.1f} m "
+                  f"(median body {deep.get('p50', 0):.1f} m)")
+            if not lb.get("dataset_has_bathymetry"):
+                print("    no NVE lake survey layers in this run (a dataset fetched "
+                      "before they were part of a fetch lacks them; `kvterrain "
+                      "fetch-bathymetry --dataset ...` adds them)")
+            else:
+                print(f"    NVE surveys: {lb.get('surveys_in_region', 0)} in region, "
+                      f"{sum(1 for e in surveyed if e['tier'] == 'surveyed')} fitted "
+                      f"to contours, "
+                      f"{sum(1 for e in surveyed if e['tier'] == 'summary')} scaled "
+                      f"to max/mean depth")
+                for e in surveyed:
+                    print(f"      {e.get('name') or e['vatnlnr']}: {e['tier']}, max "
+                          f"{e.get('model_max_depth_m')} m (survey "
+                          f"{e.get('survey_max_depth_m')} m), mean "
+                          f"{e.get('model_mean_depth_m')} m (survey "
+                          f"{e.get('survey_mean_depth_m')} m)")
+        else:
+            print(f"  + lake beds carved on a straight ramp to {a.lake_max_depth:.1f} m "
+                  f"over {lb.get('shore_ramp_m', 0.0):.0f} m of shore "
+                  f"({a.lake_shore_slope:g} m per m, min {a.lake_min_depth:.1f} m)")
+        print(f"  + river beds carved at the Q-derived hydraulic width "
+              f"(order still sets depth, × {a.river_depth_scale:g}); the surface is level across each "
               f"channel and holds water within {a.river_bank_tolerance:.1f} m of it")
+        hierarchy = res.manifest.get("hierarchy", {})
+        hypso = hierarchy.get("hypsometry")
+        if hypso:
+            print(f"  + {hypso['file']}: {hypso['node_count']} fixed "
+                  f"{hypso['samples_per_node']}-sample absolute-axis curves "
+                  f"({hypso['bytes'] / 1e6:.1f} MB)")
+        flow = res.manifest.get("flow_direction")
+        catch = hierarchy.get("catchments")
+        if flow and catch:
+            print(f"  + {flow['file']}: level-0 flat-resolved D8 directions "
+                  f"({flow['bytes'] / 1e6:.1f} MB)")
+            print(f"  + {catch['file']}: {catch['node_count']} f64 node "
+                  f"catchments ({catch['bytes'] / 1e6:.1f} MB)")
 
 
 def _print_water_report(rep: dict) -> None:
-    """Validation is advisory: the tool reports and never corrects."""
-    print("\n  water network validation (advisory — nothing was corrected):")
+    """Validation is advisory: these numbers are reported, never used to correct."""
+    print("\n  water network validation (advisory; bilinear z, reads the banks too):")
     print(f"    descent      : {rep['descent_rising_vertices']} of "
           f"{rep['descent_vertices_checked']} vertices rise downstream "
           f"({rep['descent_rising_pct']:.2f}%), worst "
@@ -343,7 +486,7 @@ def cmd_validate_atlas(a):
             print(f"[{entry['kind']}] {entry['error']}")
             continue
         print(f"[{entry['kind']}] {entry['file']}: {entry['bytes']} bytes, expected "
-              f"{rep['expected_bytes']} -> "
+              f"{entry['expected_bytes']} ({entry['bytes_per_sample']} bytes/sample) -> "
               f"{'OK' if entry['size_ok'] else 'MISMATCH (grid not dense!)'}")
         if not entry["size_ok"]:
             continue
@@ -397,6 +540,19 @@ def cmd_validate_water(a):
     if wid:
         print(f"[water_id] {wid['bytes']} bytes, expected {wid['expected_bytes']} "
               f"-> {'OK' if wid['ok'] else 'MISMATCH'}")
+    islands = rep.get("lake_islands")
+    if islands:
+        if islands.get("ok"):
+            print(f"[lake_islands] {islands['count']} cells, {islands['bytes']} bytes "
+                  "-> OK")
+        else:
+            print(f"[lake_islands] {islands.get('error', 'invalid')} -> MISMATCH")
+    hydro = rep.get("river_hydrology")
+    if hydro:
+        print(f"[river hydrology] widths {hydro['width_exact']}/"
+              f"{hydro['segments']} exact, "
+              f"{hydro['discharge_decreases_downstream']} Q decreases, "
+              f"{hydro['segments_without_hierarchy_node']} missing node ids")
 
     for note in rep.get("notes", []):
         print(f"    NOTE: {note}")
@@ -405,6 +561,73 @@ def cmd_validate_water(a):
     if rep.get("validation"):
         _print_water_report(rep["validation"])
 
+    print("\nRESULT:", "PASS" if rep["ok"] else "FAIL")
+    sys.exit(0 if rep["ok"] else 1)
+
+
+def cmd_lake_indexes(a):
+    """Write the level-0 lake indexes into an existing export, no re-export."""
+    from . import lakeindex
+
+    t0 = time.time()
+    blocks = lakeindex.write_lake_indexes(a.export)
+    lc = blocks["lake_cells"]
+    print(f"  + {lc['file']}: {lc['lake_count']} lakes, {lc['run_count']} runs, "
+          f"{lc['sample_count']} samples, {lc['bytes']} bytes")
+    ls = blocks.get("lake_samples")
+    if ls:
+        print(f"  + {ls['file']}: {ls['record_count']} records over {ls['lakes']} "
+              f"authored lakes, {ls['sample_count']} samples, {ls['bytes']} bytes")
+    else:
+        print("  - lake_samples.bin skipped: the export has no labels atlas")
+    print(f"done in {time.time() - t0:.1f} s")
+
+
+def cmd_validate_hierarchy(a):
+    """
+    Check hierarchy.bin, labels.atlas and hypsometry.bin against the manifest and heights.atlas:
+    tree structure, stored codes, saddle placement, label counts, and every
+    coarse label level recomputed from the one below. The checking is in
+    `exports.check_hierarchy`.
+    """
+    from . import exports as kvexports
+
+    rep = kvexports.check_hierarchy(kvexports.load(a.out))
+    if rep.get("skipped"):
+        print(rep["skipped"])
+        sys.exit(1)
+    st = rep.get("stats") or {}
+    if st:
+        print(f"[hierarchy] {st['nodes']} nodes, {st['leaves']} leaves, "
+              f"{st['minor']} minor, {st['with_lake']} matched to a lake, "
+              f"{st['spilling_off_map']} spilling off the map")
+    heads = rep.get("outflow_heads")
+    if heads:
+        print(f"[outflow head] {heads['exact']}/{heads['nodes']} exact, "
+              f"{heads['within_one_surface_code']} within one code step, "
+              f"{heads['mismatched']} mismatched")
+    hypso = rep.get("hypsometry")
+    if hypso:
+        print(f"[hypsometry] {hypso['exact']}/{hypso['nodes']} records exact, "
+              f"{hypso['mismatched']} mismatched "
+              f"({hypso['samples_per_node']} samples/node)")
+    flow = rep.get("flow_direction")
+    if flow:
+        print(f"[flow direction] {flow['exact']}/{flow['samples']} exact, "
+              f"{flow['mismatched']} mismatched")
+    catch = rep.get("catchments")
+    if catch:
+        print(f"[catchments] {catch['exact']}/{catch['nodes']} exact, "
+              f"{catch['mismatched']} mismatched; root "
+              f"{catch['root_area_m2'] / 1e6:.3f} km²")
+    summ = rep.get("audit_summary")
+    if summ:
+        print(f"[audit] lakes {summ.get('lakes_by_status')}; rivers "
+              f"{summ.get('river_findings_by_status')} of "
+              f"{summ.get('river_segments_walked')} walked; "
+              f"{summ.get('unexplained_depressions')} unexplained depressions")
+    for err in rep["errors"]:
+        print(f"    ERROR: {err}")
     print("\nRESULT:", "PASS" if rep["ok"] else "FAIL")
     sys.exit(0 if rep["ok"] else 1)
 
@@ -463,7 +686,15 @@ def _add_area_args(p):
     p.add_argument("--epsg", type=int, default=None)
     p.add_argument("--source", choices=["DTM", "DOM"], default="DTM")
     p.add_argument("--max-px", type=int, default=core.DEFAULT_MAX_FETCH_PX, dest="max_px",
-                   help="largest exportImage request, in pixels per axis")
+                   help="largest exportImage request, in pixels per axis (a "
+                        "remainder under 1/8 of it is shared out rather than sent "
+                        "as a sliver request of its own)")
+    p.add_argument("--fetch-workers", type=int, default=core.DEFAULT_FETCH_WORKERS,
+                   dest="fetch_workers",
+                   help="exportImage requests in flight at once (default "
+                        f"{core.DEFAULT_FETCH_WORKERS}). A chunk that keeps failing "
+                        "is split in four and retried; `fetch` also caches chunks so "
+                        "an interrupted run resumes when repeated")
     p.add_argument("--demo", action="store_true",
                    help="synthetic surface + synthetic rivers/lakes, no network")
 
@@ -494,16 +725,87 @@ def _add_process_args(p):
                         "covered by the water surface (their own terrain hides it) "
                         "because the polygon/raster misalignment otherwise leaves a "
                         "one-texel dry moat around every island.")
+    p.add_argument("--lake-bed", choices=["terrain", "ramp"], default="terrain",
+                   dest="lake_bed",
+                   help="how lake beds are built. 'terrain' (default) continues the "
+                        "land around each lake under the water — deep under cliffs, "
+                        "shallow in bogs, deepest furthest from shore, with noise — "
+                        "and follows NVE depth surveys where the dataset has them. "
+                        "'ramp' is the legacy straight ramp to --lake-max-depth.")
+    p.add_argument("--lake-surveys", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_surveys",
+                   help="use NVE lake surveys (contours, spot depths, max/mean "
+                        "depth) where the dataset has them (default: on; terrain "
+                        "model only)")
+    p.add_argument("--river-mouths", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_mouths",
+                   help="carry each river's channel on into its lake: a delta at "
+                        "inflows, a funnel and a riffle at outlets that holds the "
+                        "lake by the river's depth (default: on; terrain model "
+                        "only)")
+    p.add_argument("--river-depth-model", choices=["discharge", "order"],
+                   default="discharge", dest="river_depth_model",
+                   help="how deep a river channel is carved: 'discharge' (default) "
+                        "2.0*Q^0.3 m clamped to 0.5-5 m; 'order' is the legacy table by stream order (1.5 m to "
+                        "11 m). Both times --river-depth-scale")
+    p.add_argument("--river-n50-widths", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_n50_widths",
+                   help="draw rivers at Kartverket N50's widths where the dataset "
+                        "has them: the mapped river areas of wide rivers, width "
+                        "classes elsewhere; writes river_widths.bin (default: on). "
+                        "The hydraulic width in rivers.bin is unchanged")
+    p.add_argument("--river-thalweg-snap", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_thalweg_snap",
+                   help="move each stream's line up to 15 m sideways onto the "
+                        "valley bottom the scan shows, instead of trenching the "
+                        "valley side where the mapped line runs (default: on)")
+    p.add_argument("--river-side-channels", action=argparse.BooleanOptionalAction,
+                   default=True, dest="river_side_channels",
+                   help="trace a line down the side arms and extra delta mouths "
+                        "N50 maps as river area but no mapped line runs through; "
+                        "writes river_branches.bin (default: on)")
+    p.add_argument("--lake-shoreline", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_shoreline",
+                   help="let the scan decide where each lake's water ends: scanned "
+                        "land above the level stays land, scanned ground below it "
+                        "is flooded as it is, and only the scanned water gets a "
+                        "modelled bed, with no line of zero depth at its edge "
+                        "(default: on; terrain model only)")
+    p.add_argument("--lake-slope-ratio", type=float, default=None,
+                   dest="lake_slope_ratio",
+                   help="terrain model: underwater slope at the shore as a fraction "
+                        "of the land slope around the lake")
+    p.add_argument("--lake-bed-curvature", type=float, default=None,
+                   dest="lake_bed_curvature",
+                   help="terrain model: how soon the bed bends over toward the "
+                        "centre. Small = bowl with a gentle floor; large = cone")
+    p.add_argument("--lake-ring-fraction", type=float, default=None,
+                   dest="lake_ring_fraction",
+                   help="terrain model: width of the land ring the slope is read "
+                        "from, as a fraction of the lake's max distance from shore")
+    p.add_argument("--lake-bed-noise", type=float, default=None, dest="lake_bed_noise",
+                   help="terrain model: multiplicative noise amplitude (0..0.95); "
+                        "depth *= 1 + a*n. Cannot move the shoreline or reach the "
+                        "surface")
+    p.add_argument("--lake-bed-noise-wavelength", type=float, default=None,
+                   dest="lake_bed_noise_wavelength",
+                   help="terrain model: longest noise wavelength in metres")
+    p.add_argument("--lake-bed-seed", type=int, default=None, dest="lake_bed_seed",
+                   help="terrain model: noise seed")
+    p.add_argument("--lake-bed-max-depth", type=float, default=None,
+                   dest="lake_bed_max_depth",
+                   help="terrain model: optional ceiling on synthetic depth (m). "
+                        "Default: none")
     p.add_argument("--lake-shore-slope", type=float, default=1.0, dest="lake_shore_slope",
-                   help="metres of lake depth gained per metre of shore, on a "
+                   help="ramp model: metres of lake depth gained per metre of shore, on a "
                         "STRAIGHT ramp. At the default 1.0 a --lake-max-depth of 20 m "
                         "is reached 20 m from shore (four texels at 5 m spacing). "
                         "Lower = gentler sides over a longer ramp.")
     p.add_argument("--lake-ramp-radius", type=float, default=0.0, dest="lake_ramp_radius",
-                   help="set the ramp length in metres directly, overriding "
+                   help="ramp model: set the ramp length in metres directly, overriding "
                         "--lake-shore-slope. 0 (default) derives it from the slope.")
     p.add_argument("--lake-max-depth", type=float, default=20.0, dest="lake_max_depth",
-                   help="maximum synthetic lake depth in metres, reached only by "
+                   help="ramp model: maximum lake depth in metres, reached only by "
                         "lakes big enough to ramp that far")
     p.add_argument("--lake-min-depth", type=float, default=2.0, dest="lake_min_depth",
                    help="depth every lake reaches at its deepest sample, however "
@@ -524,6 +826,11 @@ def _add_process_args(p):
                    help="spacing to densify river polylines to before sampling Z "
                         "(default: leaf spacing). Denser follows the channel more "
                         "closely; coarser shrinks rivers.bin.")
+    p.add_argument("--river-runoff-m-per-year", type=float, default=1.0,
+                   dest="river_runoff_m_per_year",
+                   help="uniform effective annual runoff used for modelled mean "
+                        "river discharge (default: 1.0 m/year; recorded verbatim "
+                        "in the manifest)")
     p.add_argument("--estimate-lake-levels", action=argparse.BooleanOptionalAction,
                    default=True, dest="estimate_lake_levels",
                    help="fill in a water level for lakes NVE gives no 'hoyde' for, "
@@ -536,6 +843,57 @@ def _add_process_args(p):
                         "just outside the polygon, so a lake NVE gives no 'hoyde' "
                         "for cannot end up standing above the terrain around it "
                         "(default: on). A published hoyde is never capped.")
+    p.add_argument("--correct-lake-levels", action=argparse.BooleanOptionalAction,
+                   default=True, dest="correct_lake_levels",
+                   help="replace a published NVE lake level that stands more than "
+                        "--lake-level-max-above-shore above the 90th percentile of "
+                        "the land ringing the lake, more than "
+                        "--lake-level-max-above-scan above both its own flown water "
+                        "and the 10th percentile of that ring, or more than "
+                        "--lake-level-max-below-scan below its own flown water, "
+                        "with the DTM estimate; and give a lake without hoyde the "
+                        "level of a touching NVE lake with the same flown water "
+                        "(default: on). The raw value stays in lakes.json as "
+                        "hoyde_moh.")
+    p.add_argument("--lake-level-max-above-shore", type=float, default=2.0,
+                   dest="lake_level_max_above_shore",
+                   help="metres a published lake level may stand above the 90th "
+                        "percentile of its shore ring before it counts as wrong "
+                        "(default: 2)")
+    p.add_argument("--lake-level-max-below-scan", type=float, default=0.5,
+                   dest="lake_level_max_below_scan",
+                   help="metres a published lake level may stand below the lake's "
+                        "own flown water (capped at its shore) before it is raised "
+                        "to it; regulated reservoirs are never raised (default: 0.5)")
+    p.add_argument("--lake-level-max-above-scan", type=float, default=1.0,
+                   dest="lake_level_max_above_scan",
+                   help="metres a published lake level may stand above both the "
+                        "lake's own flown water and the 10th percentile of its "
+                        "shore ring before it is lowered to the flown water; "
+                        "regulated reservoirs are never lowered by this (default: 1)")
+    p.add_argument("--downhill-river-bed", action=argparse.BooleanOptionalAction,
+                   default=True, dest="downhill_river_bed",
+                   help="shape each densified river profile below its dry banks, "
+                        "smooth the downstream running minimum, and tie "
+                        "confluences/lake inlets before carving the matching bed "
+                        "(default: on). This changes heights.atlas.")
+    p.add_argument("--lake-edge-is-shore", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_edge_is_shore",
+                   help="treat the map edge as shore when carving a lake the "
+                        "export boundary cuts through, so the bed ramps back up to "
+                        "the waterline there and the lake does not drain off the "
+                        "map in the depression hierarchy (default: on)")
+    p.add_argument("--lake-shore-8-connected", action=argparse.BooleanOptionalAction,
+                   default=True, dest="lake_shore_8_connected",
+                   help="put every lake sample with a dry neighbour, diagonal ones "
+                        "included, on the waterline, so the 8-connected hierarchy "
+                        "cannot drain a lake through a corner of its shore "
+                        "(default: on)")
+    p.add_argument("--hierarchy", action=argparse.BooleanOptionalAction,
+                   default=True, dest="hierarchy",
+                   help="build the depression hierarchy and the water audit: "
+                        "labels.atlas, hierarchy.bin, water_audit.json "
+                        "(default: on)")
     p.add_argument("--emit-geojson", action="store_true", dest="emit_geojson",
                    help="also write rivers.geojson (debug sidecar for QGIS; "
                         "rivers.bin is the runtime format)")
@@ -576,6 +934,21 @@ def main(argv=None):
                         "roughly half, which is still finer than Kartverket's own "
                         "DTM accuracy but is LOSSY.")
     f.set_defaults(func=cmd_fetch)
+
+    fb = sub.add_parser("fetch-bathymetry",
+                        help="add NVE lake surveys to a dataset fetched before they "
+                             "were part of every fetch (heights are not refetched)")
+    fb.add_argument("--dataset", required=True)
+    fb.add_argument("--root", default=None)
+    fb.set_defaults(func=cmd_fetch_bathymetry)
+
+    fn = sub.add_parser("fetch-n50",
+                        help="add Kartverket N50 river widths to a dataset fetched "
+                             "before they were part of every fetch (heights are not "
+                             "refetched)")
+    fn.add_argument("--dataset", required=True)
+    fn.add_argument("--root", default=None)
+    fn.set_defaults(func=cmd_fetch_n50)
 
     dl = sub.add_parser("datasets", help="list the datasets already fetched")
     dl.add_argument("--root", default=None)
@@ -633,6 +1006,33 @@ def main(argv=None):
                              "water_id.atlas against the manifest")
     vw.add_argument("--out", required=True)
     vw.set_defaults(func=cmd_validate_water)
+
+    li = sub.add_parser("lake-indexes",
+                        help="(re)write lake_cells.bin and lake_samples.bin into an "
+                             "existing export from its water_id and labels atlases")
+    li.add_argument("--export", required=True, dest="export")
+    li.set_defaults(func=cmd_lake_indexes)
+
+    vh = sub.add_parser("validate-hierarchy",
+                        help="check hierarchy, labels, hypsometry, flow directions "
+                             "and catchments against the packed export")
+    vh.add_argument("--out", required=True)
+    vh.set_defaults(func=cmd_validate_hierarchy)
+
+    cl = sub.add_parser("calibrate-lake-beds",
+                        help="score the synthetic lake bed against NVE-surveyed lakes "
+                             "and sweep its parameters (network on first run, "
+                             "cached after)")
+    cl.add_argument("--n", type=int, default=80, help="lakes to sample")
+    cl.add_argument("--seed", type=int, default=1, help="lake sampling seed")
+    cl.add_argument("--max-area", type=float, default=25.0, dest="max_area",
+                    help="skip surveyed lakes larger than this (km²)")
+    cl.add_argument("--cache", default=None,
+                    help="per-lake cache directory (default: data/lakecalib)")
+    cl.add_argument("--json", default=None, help="write the full results here")
+    cl.add_argument("--cache-only", action="store_true", dest="cache_only",
+                    help="use only lakes already in the cache (no DTM downloads)")
+    cl.set_defaults(func=cmd_calibrate_lake_beds)
 
     a = p.parse_args(argv)
     a.func(a)

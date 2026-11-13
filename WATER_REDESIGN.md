@@ -1,0 +1,374 @@
+# Water Redesign — Exporter Design Document
+
+> **STATUS: HIERARCHY, HYPSOMETRY, CATCHMENTS AND RIVER HYDROLOGY IMPLEMENTED.**
+>
+> Implemented, on branch `water/hierarchy`: §4.1 downhill-only river bed, §4.2 depression
+> hierarchy (node table and labels), §4.4 lake matching and the audit (without catchment),
+> §4.3 flat-resolved D8 directions and node catchments, §4.5 composable absolute-axis
+> hypsometry, and §4.6 graph discharge/width. The `labels.atlas` / `flowdir.atlas` /
+> `hierarchy.bin` / `catchments.bin` / `hypsometry.bin` / `water_audit.json` exports have a `validate-hierarchy`
+> check. `readme.md` documents them as they run, including formats and Lierne numbers; where it
+> and this document differ, the readme describes the code. Each section below is marked
+> IMPLEMENTED, PARTLY IMPLEMENTED or NOT IMPLEMENTED. Everything unmarked or marked not
+> implemented is a PROPOSAL.
+>
+> The runtime half of this design lives in the Terraform repository: `WATER_REDESIGN.md` (branch
+> `water/redesign`). Read its §1–§4 first. This document only covers what the exporter must do.
+
+---
+
+## 0. Decisions and first milestone (owner, 2026-09-17)
+
+These are settled; the rest of the document is read in their light.
+
+1. **Heights may change.** The downhill-only river bed (§4.1) applies to every export by default,
+   so `heights.atlas` (and anything carved from it) is no longer byte-identical to earlier exports.
+   The current runtime keeps consuming the existing products; nothing is removed. When this lands,
+   update `readme.md`, whose "Two tools" section still promises the export is unchanged byte for
+   byte.
+2. **Labels are a 4-byte atlas.** Measured on the Lierne export (8193², 5 m): about **324 000 leaf
+   pits**, so roughly 650k hierarchy nodes. That does not fit u16. Generalise the `core.atlas_*`
+   helpers to take a bytes-per-sample parameter (default 2, so existing atlases are unaffected) and
+   write `labels.atlas` as little-endian u32. Offsets stay pure arithmetic from the header; the
+   manifest records each atlas's bytes per sample. A label tile is then NOT at the same byte offset
+   as its height twin, only at the same tile index.
+3. **Numba** for Priority-Flood and the hierarchy. Our own implementation; no C++ toolchain and no
+   third-party licence question. Add it to `requirements.txt`.
+4. **First milestone = hierarchy + audit.** In scope:
+   - §4.1 downhill-only river bed, integrated in `process.py`.
+   - §4.2 Priority-Flood depression hierarchy on the final carved heights: node table and per-cell
+     labels.
+   - Coarse label levels by a simple, deterministic rule: the label of the **lowest** child in the
+     same corner-anchored 3×3 gather `waterid` uses (ties by lowest label). Revisit only when the
+     runtime needs something else.
+   - §4.4 matching authored lakes to nodes, and the audit as `water_audit.json` plus a Process page
+     panel. River corridor checks may use steepest descent on the heights directly, since the flow
+     direction atlas is not in this milestone.
+   - Export `labels.atlas` and `hierarchy.bin` (node table only), with manifest descriptors and a
+     `validate-*` check in `exports.py`, following the existing pattern.
+   - §6 synthetic tests and the hierarchy-vs-brute-force test.
+
+   Out of scope for now: embankment treatment (§7). Flat-resolved D8 directions and node
+   catchments ship as `flowdir.atlas` and `catchments.bin` (§4.3); composable hypsometry ships
+   in `hypsometry.bin` (§4.5);
+   modelled mean-annual discharge, hydraulic width and
+   the hierarchy attachment now ship in `rivers.bin` v2 (§4.6).
+
+5. **Edges and lake spans (owner, 2026-09-17, while implementing).** Every map-edge sample is an
+   outlet, and partially cropped lakes must not empty: the lake carve now treats the map edge as
+   shore so a cropped lake ramps back up to its level at the edge (it did not before: 26 Lierne
+   lakes were 20 m deep at the edge). The downhill running minimum is carried straight through lake
+   spans; an outlet channel that cuts a lake's rim is accepted.
+6. **Lakes stand above their spill by the outflow's depth (owner, 2026-09-17).** A spill is only
+   where a lake is stable up to; while water leaves, the lake stands higher by the depth of the
+   outflow river at the spill point, because everything leaving has to pass through there. The
+   authored level is right and guides it: each node carries `outflow_head_m` and holds water up to
+   `spill_m + outflow_head_m`.
+7. **A published level the terrain contradicts is corrected (owner, 2026-09-17).** An NVE level more
+   than 2 m above the 90th percentile of the land ringing the lake is replaced by the DTM estimate
+   before carving.
+
+### What the first milestone found (Lierne, 2026-09-17)
+
+- **Leaf pits:** 227 762 with every default on (268 466 nodes, 3.4 s). The "about 324 000" in §0.2
+  came from a looser pit definition; flats that drain are not pits here.
+- **Downhill bed:** rises along the polylines' own samples went from 21.0 % of open-channel steps to
+  1 in 3.28 M. That needed a burn along each polyline's sample path as well as the channel carve:
+  at 5 m spacing small streams rasterise to gappy masks the carve never touches.
+- **The lake carve was not watertight in 8-connectivity.** A lake sample whose only dry neighbour is
+  diagonal was carved 2.07 m deep, and the 8-connected hierarchy drained the lake through that
+  corner: about 1 580 lakes appeared to stand up to exactly 2.08 m above their spill (1 190 of them
+  "through their outflow trench", which is what prompted decision 6). With the shoreline
+  watertight, 2 173 of 2 180 lakes are consistent with their authored level and none needs the
+  outflow head on Lierne; the head is kept for lakes whose outflow does cut below the level, and
+  for derived lakes at runtime.
+- **Level correction:** 46 published levels corrected (median 8.0 m, max 14.0 m), all consistent
+  with the hierarchy afterwards.
+- **Remaining findings:** 4 lakes above spill + head, 3 504 river pits of 0.5 m or more, 1 493
+  rivers leaving their corridor, 796 unexplained depressions (plus 374 that fill into an authored
+  lake and are not listed).
+
+---
+
+## 1. Context in one paragraph
+
+The runtime is moving from "solve hydrology for the whole world at runtime from rasters, then
+reconcile with authored water" to "the authored water graph is the truth, and each terrain edit
+locally repairs it". Lakes become **implicit** (a depression label per cell plus a level per
+depression node). Rivers stay **explicit** polylines in a graph with discharge. Everything that is
+expensive and global (the depression hierarchy, flow directions, catchment areas, hypsometry) is
+computed **once, here, offline**, and the runtime only rebuilds it inside edited regions.
+
+**Terrain is the source of truth.** The exporter's job is to make the carved terrain and the
+authored water agree well enough that the depression hierarchy built on that terrain reproduces
+the authored water, and to report every place where it does not.
+
+---
+
+## 2. What already exists and stays
+
+The current pipeline already does much of the hard, data-specific work. Keep it:
+
+- **Fetch / dataset split.** The new stages are all `process` stages and need no new network data,
+  with one possible exception (culverts, §7).
+- **Void repair** (`bathymetry.fill_lake_surface`) before anything reads the bed.
+- **Shoreline snap** (`water.snap_lakes_to_flat_water`).
+- **Lake level resolution** (`water.apply_estimated_levels`): NVE `hoyde` verbatim, else the DTM
+  interior estimate with the perimeter cap.
+- **Lake carve** (`bathymetry.carve_lake_beds`): ramp from the waterline, max depth.
+- **River surface from the uncarved centreline** (`watersurface.river_surface_moh`) and the **river
+  carve** (`bathymetry.carve_river_beds`).
+- **The river polyline graph** (`rivernet`): densified vertices, upstream/downstream links, lake
+  spans, junctions, bed `z` and surface `level`, and the descent / flow-direction / connectivity
+  validators.
+
+A correction to the runtime-side discussion: rivers are **already** exported as a linked polyline
+graph (`rivers.bin`). What the export lacks is lake **geometry** (lakes.json carries records and a
+bbox; identity lives only in `water_id.atlas`), plus everything hierarchy-related. Under the new
+model lake geometry is still not needed as output, because a lake is a hierarchy node, but keeping
+the NVE polygon available (e.g. as optional GeoJSON) helps debugging and matching.
+
+---
+
+## 3. New pipeline
+
+Current order (`process.run_process`): rasterise → void repair → shore snap → snapshot → lake
+levels → river surface → carve rivers → snapshot → carve lakes → surface pyramid → water id →
+river network → pack.
+
+Proposed order. Steps marked **NEW** do not exist; everything else is today's step, possibly
+reshaped:
+
+1. Rasterise authored water (still needed as a working mask for carving and matching).
+2. Void repair.
+3. Shore snap.
+4. Snapshot the uncarved bed.
+5. Lake levels.
+6. River surface from the uncarved centreline.
+7. **NEW: monotone river bed.** Enforce a downstream running minimum on each densified polyline's
+   bed profile, through junctions and lake spans, **before** carving. See §4.1.
+8. Carve rivers against the monotone profile.
+9. Carve lakes.
+10. **NEW: embankment treatment** (optional, §7).
+11. **NEW: Priority-Flood + depression hierarchy** on the final carved terrain. §4.2.
+12. **NEW: flat-resolved flow directions and flow accumulation.** §4.3.
+13. **NEW: match authored water to hierarchy nodes, and audit.** §4.4.
+14. **NEW: hypsometry per node.** §4.5.
+15. **NEW: discharge and width per river segment.** §4.6.
+16. River network (extended with `Q`, width, node links).
+17. Pack: heights, **label atlas**, **flow direction atlas**, **hierarchy table**, river graph,
+    lakes, audit report. During the transition also the current `surface.atlas` and
+    `water_id.atlas`.
+
+**The ordering rule that matters:** the hierarchy (11) must be built on exactly the heights that
+are packed (17). Any step that touches heights after 11 invalidates it.
+
+---
+
+## 4. The new stages
+
+### 4.1 Monotone river bed
+
+**IMPLEMENTED** (`kvterrain/riverbed.py`, `--downhill-river-bed`). As designed, plus a burn along
+each polyline's own 8-connected sample path after the carve, and the carve pulls samples toward
+the downhill bed rather than cutting extra depth from each sample's ground.
+
+The runtime currently enforces descent itself: `rivernet` reports non-monotonic descent and
+leaves the running minimum to the runtime burn. Under the redesign there is no runtime burn, so
+the enforcement moves here.
+
+- **Keep densification.** The earlier PAVA fit failed because sparse Elvenett chords cut across
+  banks and the fit pooled surface levels metres above the bed (see `rivernet` module docstring).
+  That was a fitting-on-chords problem. A running minimum over a **densified** bed profile is what
+  the runtime burn already does successfully.
+- Apply it to the **bed** `z` along each segment, carrying the minimum across `downstream` links so
+  a junction never steps up.
+- Carve to that profile. Any remaining pit along a mapped channel is then an audit finding, not a
+  hierarchy node the runtime has to reason about.
+- Keep the surface `level` rule as today (levelled across the channel, descending along it), and
+  clamp it to never rise downstream either.
+
+### 4.2 Priority-Flood and the depression hierarchy
+
+**IMPLEMENTED**, including sidecar hydrologic `catchment_m2` and `outflow_head_m`
+(decision 6). Node layout, ids and flags are in `readme.md`. Every edge sample is an outlet; merges
+happen during the flood.
+
+Build Barnes' depression hierarchy (Barnes, Callaghan & Wickert 2020) on the carved lattice.
+
+Per node:
+
+| Field | Meaning |
+|---|---|
+| `id`, `parent` | Tree structure. Leaves are single pits; the root is the ocean/outside |
+| `floor_m` | Lowest cell |
+| `spill_m` | Elevation of the lowest saddle out of the node |
+| `spill_cell` | Where it overflows |
+| `overflow_to` | The node on the other side of the saddle |
+| `cell_count`, `area_m2` | Own cells |
+| `catchment_m2` | Total draining area (from §4.3) |
+| `lake_id` | Authored lake matched to it, or none (§4.4) |
+| `authored_level_m` | From lake levels, when matched |
+| `hypso` | Offset into the hypsometry blob (§4.5) |
+
+Plus a **per-cell leaf label**.
+
+**Ocean.** Today's `waterid.ocean_mask_from_edges` flood-fills from the map edges; the hierarchy
+needs the same idea as its root: seed Priority-Flood from edge cells at or below ocean level. Decide
+explicitly how **inland depressions cropped by the export boundary** are treated; the runtime
+already has a recorded defect where a boundary-cropped lake cannot fill.
+
+**Scale.** 40 km at 5 m spacing is roughly 8193² ≈ 67M cells, with about 324k leaf pits on Lierne.
+Pure Python with `heapq` is not viable; the implementation is **Numba** (§0.3). Barnes' papers and
+reference code are the algorithmic reference, not a dependency. Offline minutes are acceptable; tens
+of minutes on a laptop are probably not. Note the carved heights are packed to u16 steps (~1.5 cm on
+Lierne). Build the hierarchy on the heights **as packed** (quantise, then dequantise), because
+that is what the runtime reads and §3's ordering rule requires it. Quantisation creates flats, so
+tie-breaking in the priority queue must be deterministic (e.g. by elevation, then cell index).
+
+**Noise pits.** The hierarchy will contain enormous numbers of tiny depressions. Keep them all in
+the tree (the runtime walk needs their spill points to escape pits), compute the same fixed-size
+hypsometry record for deterministic rebuilding, and mark nodes below a depth/area threshold as
+never-displayed.
+
+### 4.3 Flow directions and accumulation
+
+**IMPLEMENTED (2026-09-20) as `flowdir.atlas` and `catchments.bin`.**
+
+- D8 directions on the carved, packed terrain. Strict slopes take the steepest descent (integer
+  `drop²/distance²`, ties by clockwise code from north). Equal-code components use a deterministic
+  multi-source breadth-first resolve from their edge/lower outlets; a closed component terminates
+  at its lowest row-major cell. The complete convention is in the manifest.
+- Directions inside a depression point toward its floor; the walk jumps via `spill_cell` from
+  there.
+- Flow accumulation gives catchment area per cell and hence `catchment_m2` per hierarchy node.
+  Authored river Q remains the separate graph accumulation described in §4.6.
+- Pack directions as a level-0-only 1-byte-per-sample atlas, in the same dense north-up tile order
+  as the other atlases. `0` is a pit or off-map terminal; `1..8` are N, NE, E, SE, S, SW, W, NW.
+- `catchments.bin` is one f64 square-metre value per hierarchy node. A leaf is the source area of
+  every sample whose D8 chain terminates in that pit, including the terminal. An internal node is
+  exactly the sum of its immediate children. Root additionally owns the direct off-map trees.
+
+### 4.4 Matching authored water, and the audit
+
+**PARTLY IMPLEMENTED.** Lakes and rivers as described (rivers by steepest descent on the packed
+heights). Node catchments now ship, but the existing unexplained-depression audit remains
+geometrically ranked for result continuity.
+
+**Lakes.** For each authored lake, find the node whose cells best cover its rasterised mask at its
+authored level. Check:
+
+- **Level above spill** (`authored_level_m > spill_m + tol`): the lake should be leaking. Either the
+  level is wrong, the carve broke the rim, or there is an outlet the DEM does not see (a dam, a
+  weir). Report it with its location.
+- **Level well below spill** with a matched inflow river: plausible for a regulated lake. Report
+  but do not flag.
+- **No node found** (a lake on a slope in the DEM): report.
+
+**Rivers.** For each segment, check that the steepest-descent path from its upstream end stays
+inside the carved corridor. Report where it leaves.
+
+**Unexplained depressions.** Nodes that are deep and large enough to display, with no authored lake
+and a catchment large enough to fill under the export rainfall. Sorted by visual severity. In
+Norway these will largely be road and rail embankments over culverts (§7).
+
+The audit is a first-class product. Write it as JSON (with coordinates) and show it in the Process
+page, like the existing lake-level breakdown and network validation.
+
+### 4.5 Hypsometry
+
+**IMPLEMENTED (2026-09-20) as `hypsometry.bin`.**
+
+For every non-root node: a cumulative area-by-elevation curve including its descendants' cells.
+This lets the runtime solve
+`L = min(spill, Area⁻¹(Q / E))` with a lookup.
+
+- The axis is **absolute packed elevation**, never an offset from the node floor. Each record has
+  64 f32 area samples: 48 inclusive integer-half-up u16-code samples from floor to spill, then 16
+  samples from spill toward the maximum code in the subtree (including that maximum). The upper
+  support lets a child be queried at a parent's higher axis without rescanning cells.
+- Leaves are derived from level-0 `heights.atlas` and `labels.atlas`. Every internal curve is
+  defined as the sum of its immediate child curves at that absolute code (piecewise-linear
+  interpolation, ascending child id, f64 accumulation then f32 storage). Consequently a rebuilt
+  internal node is composed from untouched children by exactly the same operation as the exporter.
+- `hypsometry.bin` is a fixed-record sidecar indexed directly by hierarchy node id, so
+  `hierarchy.bin` remains layout-compatible. Root record 0 is invalid because it also owns cells
+  draining directly off-map and is not a depression.
+- The area above the shoreline comes from LiDAR. The area below an authored lake's surface comes
+  from the **invented carved bowl**. That does not affect levels at or above the authored level,
+  but it does affect what a breached, drained lake looks like. Record it per node
+  (`bed_is_carved`).
+
+### 4.6 Discharge and width
+
+**IMPLEMENTED (2026-09-20).**
+
+Elvenett has no width or discharge; today width is a heuristic on Strahler order.
+
+- **`Q` per segment = accumulated modelled catchment area × export effective runoff.** ELVIS ships
+  local REGINE-unit area rather than D8 accumulation, so each unique unit area is apportioned once
+  over its emitted segments by length and accumulated on the authored graph. The manifest records
+  the default 1.0 m/year effective runoff and labels Q as modelled mean annual, not gauged.
+- **Width = f(Q)**, e.g. `w = a · Q^0.5` (Leopold & Maddock). **This function must be identical in
+  exporter and runtime.** Write its constants into the manifest and have the runtime read them
+  rather than duplicating them.
+- Keep Strahler order as metadata and as a fallback; compare the two width models on a real export
+  before switching.
+
+---
+
+## 5. Export format additions (sketch)
+
+**IMPLEMENTED:** `labels.atlas`, `flowdir.atlas`, `hierarchy.bin`, the `catchments.bin` and
+`hypsometry.bin` sidecars, `rivers.bin` v2, `water_audit.json`, and their manifest descriptors.
+
+| File | Contents |
+|---|---|
+| `labels.atlas` | u32 leaf node id per sample (4 bytes/sample atlas, §0.2); coarse levels take the lowest child's label |
+| `flowdir.atlas` | u8 D8 direction per sample, flats resolved |
+| `hierarchy.bin` | Node table (§4.2), unchanged fixed record layout |
+| `catchments.bin` | One f64 upstream contributing area per hierarchy node (§4.3) |
+| `hypsometry.bin` | Fixed 64-sample absolute-axis record per hierarchy node (§4.5) |
+| `rivers.bin` v2 | v1 + per-segment `Q`, width, `node_id`; bed profile monotone |
+| `lakes.json` | + `node_id`, `spill_m`, audit flags |
+| `water_audit.json` | §4.4 findings with coordinates |
+| `manifest.json` | + hierarchy/label/flowdir descriptors, export rainfall, width model constants |
+
+Row order, corner-centred sampling and shared edges follow the existing conventions. Label and
+direction atlases must be sliced from one assembled array like everything else, so tile edges
+agree.
+
+---
+
+## 6. Testing
+
+**PARTLY IMPLEMENTED** (`tests/`): synthetic bowls, saddles, flats, cropped bowls and a river
+through a pit, and the brute-force comparison. The round trip against `surface.atlas` and the
+in-place update prototype are not done.
+
+- **Synthetic worlds** (demo mode already exists): a bowl with a known spill level, two bowls
+  merging at a known saddle, a river through a pit, a flat, an embankment with a culvert. Assert
+  node counts, spill levels, labels and overflow targets exactly.
+- **Hierarchy vs brute force:** on small random heightfields, compare the hierarchy's spill levels
+  to a naive flood-fill per depression.
+- **Round trip:** the flattened level table on unedited terrain must reproduce the current
+  `surface.atlas` for lakes within tolerance. This is the "authored stays authored" check, and the
+  same kind of baseline the runtime already uses (FLAT-authored 85.5% within 1 unit on the Norway
+  export).
+- **The in-place update prototype** (runtime doc §6) should use hierarchies produced by this code as
+  its reference, so exporter and runtime cannot disagree about what a hierarchy is.
+
+---
+
+## 7. Open questions
+
+- **Culverts and embankments.** Options: breach narrow embankments automatically (Lindsay 2016
+  least-cost breaching, capped by length and depth); fetch culvert locations if a source exists
+  (NVDB may carry them; unverified); or leave them in and rely on the audit plus a runtime minimum
+  display depth. Probably the most visible artifact in a Norwegian export, so decide with a real
+  export in hand.
+- **Bridges** in DTM vs DOM. DTM should already remove them; verify on a real export.
+- **Regulated lakes** whose authored level sits below the DTM's flown surface or above the spill.
+- **Hypsometry threshold:** which nodes get curves.
+- **Transition:** how long both old and new products are exported side by side.
+- **Lake polygons:** export NVE geometry as optional GeoJSON for debugging and matching, or not.

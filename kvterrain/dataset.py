@@ -26,6 +26,15 @@ Layout
       water/rivers.geojson.gz    NVE elvenett  — raw GeoJSON features
       water/main_rivers.geojson.gz  NVE hovedelv — raw GeoJSON features
       water/lakes.geojson.gz     NVE Innsjødatabase — raw GeoJSON features
+      water/bathymetry.geojson.gz  NVE lake surveys — {"surveys", "contours",
+                                 "points", "shores"}, raw GeoJSON features. Absent
+                                 in datasets fetched before it existed; those
+                                 process with synthetic lake beds only.
+      water/n50_rivers.geojson.gz  Kartverket N50 river centrelines (width
+                                 class) and river-area polygons — {"features",
+                                 "municipalities"}. Absent in datasets fetched
+                                 before it existed; rivers then keep their
+                                 modelled widths.
 
 Design decisions worth knowing
 ------------------------------
@@ -86,6 +95,9 @@ WATER_DIR = "water"
 RIVERS_NAME = "water/rivers.geojson.gz"
 MAIN_RIVERS_NAME = "water/main_rivers.geojson.gz"
 LAKES_NAME = "water/lakes.geojson.gz"
+BATHYMETRY_NAME = "water/bathymetry.geojson.gz"
+BATHYMETRY_KEYS = ("surveys", "contours", "points", "shores")
+N50_NAME = "water/n50_rivers.geojson.gz"
 
 # Where datasets live by default: project-relative, so a checkout is
 # self-contained and the picker always has one place to look.
@@ -509,6 +521,34 @@ class Dataset:
         rivers, main_rivers, lakes = self.water_geojson()
         return water.features_from_geojson(rivers, main_rivers, lakes)
 
+    @property
+    def has_bathymetry(self) -> bool:
+        """Whether the fetch asked NVE for lake surveys — not whether it found any.
+        A dataset with the block and zero surveys simply has no surveyed lakes."""
+        return bool((self.manifest.get("water", {}).get("bathymetry") or {}).get("file"))
+
+    def bathymetry_geojson(self) -> Optional[dict]:
+        """The raw survey layers (see BATHYMETRY_KEYS), or None for a dataset
+        fetched before bathymetry was part of a fetch."""
+        if not self.has_bathymetry:
+            return None
+        raw = read_gz_json(os.path.join(self.root, BATHYMETRY_NAME)) or {}
+        return {k: list(raw.get(k) or []) for k in BATHYMETRY_KEYS}
+
+    @property
+    def has_n50(self) -> bool:
+        """Whether the fetch asked Kartverket for N50 river widths."""
+        return bool((self.manifest.get("water", {}).get("n50") or {}).get("file"))
+
+    def n50_rivers(self) -> Optional[dict]:
+        """The raw N50 river features ({"features", "municipalities"}), or None for
+        a dataset fetched before N50 was part of a fetch."""
+        if not self.has_n50:
+            return None
+        raw = read_gz_json(os.path.join(self.root, N50_NAME)) or {}
+        return {"features": list(raw.get("features") or []),
+                "municipalities": list(raw.get("municipalities") or [])}
+
     def preview_path(self) -> Optional[str]:
         p = os.path.join(self.root, PREVIEW_NAME)
         return p if os.path.exists(p) else None
@@ -542,6 +582,8 @@ class Dataset:
             "rivers": w.get("rivers", {}).get("count", 0),
             "main_rivers": w.get("main_rivers", {}).get("count", 0),
             "lakes": w.get("lakes", {}).get("count", 0),
+            "lake_surveys": ((w.get("bathymetry") or {}).get("counts") or {}).get("surveys"),
+            "n50_river_features": (w.get("n50") or {}).get("count"),
             "tile_cells": self.default_tile_cells,
             "valid_tile_cells": lat.valid_tile_cells(),
         }
@@ -632,6 +674,8 @@ def write(
     rivers: Optional[list] = None,
     main_rivers: Optional[list] = None,
     lakes: Optional[list] = None,
+    bathymetry: Optional[dict] = None,
+    n50: Optional[dict] = None,
     include_water: bool = True,
     include_main_rivers: bool = True,
     compression: str = DEFAULT_COMPRESSION,
@@ -678,6 +722,10 @@ def write(
             "lakes": {"file": LAKES_NAME, "layer": "Innsjodatabase",
                       "count": len(lakes or []), "bytes": l_bytes},
         }
+        if bathymetry is not None:
+            water_block["bathymetry"] = _write_bathymetry(dest, bathymetry)
+        if n50 is not None:
+            water_block["n50"] = _write_n50(dest, n50)
 
     if preview_png:
         with open(os.path.join(dest, PREVIEW_NAME), "wb") as f:
@@ -719,3 +767,66 @@ def write(
         json.dump(man, f, indent=2, ensure_ascii=False)
 
     return Dataset(root=os.path.abspath(dest), manifest=man)
+
+
+def _write_bathymetry(dest: str, bathymetry: dict) -> dict:
+    raw = {k: list(bathymetry.get(k) or []) for k in BATHYMETRY_KEYS}
+    nbytes = write_gz_json(os.path.join(dest, BATHYMETRY_NAME), raw)
+    return {
+        "file": BATHYMETRY_NAME,
+        "layers": "Innsjodatabase2: 4 Dybdekart, 2 DybdeKurve, 1 DybdePunkt, "
+                  "3 Innsjo_ved_dybdemaling",
+        "counts": {k: len(v) for k, v in raw.items()},
+        "bytes": nbytes,
+    }
+
+
+def _write_n50(dest: str, n50: dict) -> dict:
+    from . import n50 as _n50
+    raw = {"features": list(n50.get("features") or []),
+           "municipalities": list(n50.get("municipalities") or [])}
+    nbytes = write_gz_json(os.path.join(dest, N50_NAME), raw)
+    kinds: dict = {}
+    for f in raw["features"]:
+        p = f.get("properties") or {}
+        key = f"{p.get('objtype')}" + (f"_{p['vannbredde']}" if "vannbredde" in p else "")
+        kinds[key] = kinds.get(key, 0) + 1
+    return {"file": N50_NAME, "product": "N50 Kartdata, N50Arealdekke: ElvBekk, Elv",
+            "attribution": _n50.ATTRIBUTION, "license": _n50.LICENSE,
+            "municipalities": raw["municipalities"], "count": len(raw["features"]),
+            "counts": kinds, "bytes": nbytes}
+
+
+def write_n50(ds: Dataset, n50: dict) -> Dataset:
+    """Add (or replace) the N50 river layer of an EXISTING dataset in place — a
+    fetch-stage write, like `write_bathymetry`."""
+    if not ds.has_water:
+        raise ValueError(f"dataset {ds.name!r} has no water; fetch it with water first")
+    man = dict(ds.manifest)
+    water = dict(man.get("water") or {})
+    water["n50"] = _write_n50(ds.root, n50)
+    man["water"] = water
+    man["bytes_total"] = dir_bytes(ds.root)
+    with open(os.path.join(ds.root, MANIFEST_NAME), "w") as f:
+        json.dump(man, f, indent=2, ensure_ascii=False)
+    return Dataset(root=ds.root, manifest=man)
+
+
+def write_bathymetry(ds: Dataset, bathymetry: dict) -> Dataset:
+    """
+    Add (or replace) the lake-survey layers of an EXISTING dataset in place.
+
+    Still a fetch-stage write — the bytes are raw NVE features, nothing is
+    interpreted — it just spares a region fetched before bathymetry existed from
+    re-downloading its whole height lattice for four small vector layers.
+    """
+    if not ds.has_water:
+        raise ValueError(f"dataset {ds.name!r} has no water; fetch it with water first")
+    man = dict(ds.manifest)
+    water = dict(man.get("water") or {})
+    water["bathymetry"] = _write_bathymetry(ds.root, bathymetry)
+    man["water"] = water
+    man["bytes_total"] = dir_bytes(ds.root)
+    with open(os.path.join(ds.root, MANIFEST_NAME), "w") as f:
+        json.dump(man, f, indent=2, ensure_ascii=False)
+    return Dataset(root=ds.root, manifest=man)

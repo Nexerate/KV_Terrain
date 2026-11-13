@@ -41,9 +41,10 @@ class and identity are merged into one u16:
     THIS                  =              2 bytes/sample
 
 and, more valuably, 2 bytes/sample is exactly what the height and surface atlases
-use. So `core.atlas_*` needs no generalisation beyond its hardcoded 2 bytes, and
-a water-id tile sits at the IDENTICAL byte offset as its height and surface
-twins: three file handles, one offset computation, no format-contract change.
+use, so a water-id tile sits at the IDENTICAL byte offset as its height and
+surface twins: one offset computation for all three. (`core.atlas_*` later gained
+a bytes-per-sample parameter for the 4-byte `labels.atlas`; its default of 2 is
+this atlas's.)
 
 This is a deliberate deviation from the letter of the spec'd uint8 enum. It
 satisfies every stated USE of that enum and adds the identity the pin requires.
@@ -55,11 +56,17 @@ rasteriser's lake > river priority; among lakes the id held by the most children
 wins. The gather is the same corner-anchored 3x3 as
 `watersurface.downsample_surface_water_only`, so a water-id sample and its height
 twin stay on the same world point at every level.
+
+Lake polygon holes deliberately stay lake-coded so the rendered surface can run
+through them while their uncarved terrain hides the water.  `lake_islands.bin`
+lists those level-0 samples separately for consumers that need the authored lake
+mask rather than its rendering footprint.
 """
 
 from __future__ import annotations
 
 import os
+import struct
 from typing import Optional
 
 import numpy as np
@@ -74,6 +81,7 @@ LAKE_ID_BASE = 16          # first code used by lakes; 3..15 reserved
 
 WATER_ID_FILE = "water_id.atlas"
 WATER_ID_NODATA = CODE_DRY
+LAKE_ISLANDS_FILE = "lake_islands.bin"
 
 # Kartverket heights are metres above sea level, so real sea level is 0. (The
 # consuming world renders its ocean plane at a different height in ITS units;
@@ -273,3 +281,62 @@ def export_water_id_tiles(
                       "majority lake id; never averaged",
         "tiles_written": tiles_written,
     }
+
+
+def export_lake_islands(island: Optional[np.ndarray], out_dir: str, *,
+                        file_name: str = LAKE_ISLANDS_FILE) -> dict:
+    """Write the level-0 lake-island samples as sorted row-major cell indices.
+
+    The compact sidecar lets hierarchy consumers exclude islands from authored
+    lake masks without reading or changing the dense water-id atlas.  Its wire
+    layout is one little-endian u32 count followed by that many little-endian
+    u32 indices, where ``index = row * samples_x + col`` and row 0 is north.
+    """
+    if island is None:
+        shape = (0, 0)
+        indices = np.empty(0, dtype="<u4")
+    else:
+        mask = np.asarray(island, dtype=bool)
+        if mask.ndim != 2:
+            raise ValueError("lake island mask must be a 2D level-0 grid")
+        if mask.size > np.iinfo(np.uint32).max:
+            raise ValueError("lake island mask is too large for u32 cell indices")
+        shape = mask.shape
+        # flatnonzero walks C-order, so the wire indices are already ascending.
+        indices = np.flatnonzero(mask.ravel(order="C")).astype("<u4", copy=False)
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, file_name)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<I", int(indices.size)))
+        indices.tofile(fh)
+
+    return {
+        "file": file_name,
+        "bytes": os.path.getsize(path),
+        "format": "u32_count_then_u32_cell_indices",
+        "byte_order": "little_endian",
+        "level": 0,
+        "count": int(indices.size),
+        "samples_x": int(shape[1]),
+        "samples_y": int(shape[0]),
+        "cell_index": "row * samples_x + col; row 0 is north",
+        "water_id_semantics": "listed cells remain lake-coded in water_id.atlas",
+    }
+
+
+def read_lake_islands(path: str) -> np.ndarray:
+    """Read and structurally validate a ``lake_islands.bin`` sidecar."""
+    with open(path, "rb") as fh:
+        raw_count = fh.read(4)
+        if len(raw_count) != 4:
+            raise ValueError("short lake-island count")
+        count = struct.unpack("<I", raw_count)[0]
+        raw = fh.read()
+    if len(raw) != count * 4:
+        raise ValueError(
+            f"lake-island payload is {len(raw)} bytes, expected {count * 4}")
+    indices = np.frombuffer(raw, dtype="<u4").copy()
+    if indices.size > 1 and np.any(indices[1:] <= indices[:-1]):
+        raise ValueError("lake-island cell indices are not strictly ascending")
+    return indices

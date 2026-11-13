@@ -85,6 +85,26 @@ RIVER_LAYER_MAIN = 1       # 'hovedelv'  — main rivers only (polyline)
 LAKE_SERVICE = "https://kart.nve.no/enterprise/rest/services/Innsjodatabase2/MapServer"
 LAKE_LAYER = 5             # 'Innsjodatabase' — lake polygons
 
+# Surveyed lake bathymetry, in the SAME service (group layer 0 'Batymetri'). About
+# 690 lakes nationally carry a survey. Every layer keys on `vatnlnr`, the lake
+# number `LAKE_ID_FIELDS` resolves, so a survey joins to its lake without geometry.
+#
+#   4 Dybdekart               one polygon per survey: maksdyp_m, middeldyp_m, and
+#                             `oppmaltvannstand_m` — the water level the depths are
+#                             measured FROM, which is not always today's `hoyde`
+#                             (regulated lakes especially). Some surveys stop here:
+#                             Tunnsjøen has its max and mean depth but no contours.
+#   2 DybdeKurve              depth contours, `dybde_m` (positive down)
+#   1 DybdePunkt              spot depths, `dybde_m`
+#   3 Innsjo_ved_dybdemaling  the shoreline as surveyed
+BATHY_SURVEY_LAYER = 4
+BATHY_CONTOUR_LAYER = 2
+BATHY_POINT_LAYER = 1
+BATHY_SHORE_LAYER = 3
+# Layers 1-3 are queried by lake number, not by bbox, so a survey that the region
+# only clips still arrives whole. This many numbers go in one `IN (...)` clause.
+BATHY_IDS_PER_QUERY = 40
+
 # Attribute names, tried in order; the FIRST entry of each tuple is the name the
 # live service actually uses, verified against the layer's own `?f=json` metadata
 # (see `describe_layer` / `kvterrain describe-services`). The rest are historical
@@ -117,6 +137,8 @@ RIVER_ELVID_FIELDS = ("elvid", "elvId", "ELVID", "elv_id")
 RIVER_VASSDRAG_FIELDS = ("vassdragsnr", "vassdragNr", "VASSDRAGSNR", "vassdragsnummer")
 RIVER_VATNLNR_FIELDS = ("vatnlnr", "vatnLnr", "VATNLNR", "vatn_lnr")
 RIVER_CATCHMENT_FIELDS = ("vnrnfelt", "vnrNfelt", "VNRNFELT")
+RIVER_REGINE_AREA_FIELDS = ("arealregineenhet_km2", "arealRegineenhet_km2",
+                            "AREALREGINEENHET_KM2", "arealregine_km2")
 LAKE_ID_FIELDS = ("vatnLnr", "vatnlnr", "lopenr", "LOPENR", "vassdragLnr", "objektNr")
 LAKE_NAME_FIELDS = ("navn", "NAVN", "sjonavn", "objektNavn", "vatnNavn")
 LAKE_AREA_FIELDS = ("areal_km2", "arealKm2", "areal", "AREAL")   # km² if *_km2, else m²
@@ -193,8 +215,15 @@ class RiverSeg:
     vassdragsnr: Optional[str] = None   # REGINE catchment key
     vatnlnr: Optional[int] = None       # lake serial, when the segment touches one
     vnrnfelt: Optional[str] = None      # parent catchment's vassdragsnr
-    part_index: int = 0                 # part number within a MultiLineString
-    feature_index: int = -1             # index of the parent GeoJSON feature
+    regine_area_km2: Optional[float] = None  # local REGINE unit area, not accumulated
+    width_m: Optional[float] = None     # optional hydraulic width override
+    # Optional full width per vertex (the visual width, `riverwidth`); overrides
+    # width_m piece by piece where given.
+    vertex_width_m: Optional[np.ndarray] = None
+    depth_m: Optional[float] = None     # modelled channel depth (unscaled)
+    part_index: int = 0                # part number within a MultiLineString
+    feature_index: int = -1             # index of the parent GeoJSON feature in the
+                                        # RAW layer (before repeated copies are dropped)
 
 
 @dataclass
@@ -205,6 +234,7 @@ class LakePoly:
     navn: Optional[str]
     area_m2: Optional[float]
     hoyde_moh: Optional[float] = None   # lake surface elevation (m.o.h.), if present
+    regulated: bool = False    # NVE marks it a regulated reservoir (objekttype/magasinnr)
 
 
 @dataclass
@@ -256,6 +286,12 @@ class WaterGrid:
     # `rasterize_water`) but they are dry land: the carve leaves their DTM height
     # alone and treats them as shore, and the level estimator ignores them.
     lake_island: np.ndarray = None     # bool
+    # Full modelled width on river samples.  This is an intermediate used by the
+    # surface/carve; the runtime reads the same per-segment width from rivers.bin.
+    width_m: np.ndarray = None         # f4, 0 off-river
+    # Modelled channel depth from discharge on river samples (unscaled); 0 off-river
+    # and wherever a segment has none (the order table then applies).
+    depth_m: np.ndarray = None         # f4
 
     def lake_level(self, info: dict):
         """
@@ -334,33 +370,38 @@ WaterFetcher = Callable[[core.GridPlan], WaterFeatures]
 
 
 def _arcgis_query_geojson(
-    server: str, layer: int, epsg: int, bbox: tuple[float, float, float, float],
-    *, session=None, out_fields: str = "*", page: int = DEFAULT_PAGE,
+    server: str, layer: int, epsg: int,
+    bbox: Optional[tuple[float, float, float, float]],
+    *, where: str = "1=1", session=None, out_fields: str = "*", page: int = DEFAULT_PAGE,
     timeout: int = 120, retries: int = 4, pause: float = 1.5,
     progress: Optional[Callable[[int, int, str], None]] = None, label: str = "",
 ) -> list:
     """
     Page through an ArcGIS MapServer feature layer's /query endpoint, asking the
     server for GeoJSON already projected into `epsg` (outSR). Returns the raw list
-    of GeoJSON feature dicts intersecting `bbox`.
+    of GeoJSON feature dicts intersecting `bbox` (every feature matching `where`
+    when `bbox` is None).
     """
     import requests
 
     url = f"{server.rstrip('/')}/{layer}/query"
-    xmin, ymin, xmax, ymax = bbox
     base = {
-        "geometry": f"{xmin},{ymin},{xmax},{ymax}",
-        "geometryType": "esriGeometryEnvelope",
-        "inSR": str(epsg),
         "outSR": str(epsg),
-        "spatialRel": "esriSpatialRelIntersects",
-        "where": "1=1",
+        "where": where,
         "outFields": out_fields,
         "returnGeometry": "true",
         "geometryPrecision": "2",
         "f": "geojson",
         "resultRecordCount": str(page),
     }
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        base.update({
+            "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": str(epsg),
+            "spatialRel": "esriSpatialRelIntersects",
+        })
     sess = session or requests.Session()
     feats: list = []
     offset = 0
@@ -417,6 +458,7 @@ RIVER_FIELD_CANDIDATES = {
     "vassdragsnr": RIVER_VASSDRAG_FIELDS,
     "vatnlnr": RIVER_VATNLNR_FIELDS,
     "vnrnfelt": RIVER_CATCHMENT_FIELDS,
+    "regine_area_km2": RIVER_REGINE_AREA_FIELDS,
 }
 LAKE_FIELD_CANDIDATES = {
     "lopenr": LAKE_ID_FIELDS,
@@ -542,6 +584,63 @@ def _iter_polygon_rings(geom: dict):
             yield poly
 
 
+# NVE's Elvenett layers hold the same stream several times: on Lierne 16 669 of the
+# 20 437 elvenett geometries come back FIVE times, each copy its own `objectid` with
+# identical coordinates and attributes, differing only in `statusdatofra`
+# (2022-08-12, 2024-03-11, and three at 2024-11-14; in 399 groups also in a name
+# hierarchy, a catchment area or `vassdragsnr`). No field marks one copy current
+# (`skaarsversjon` and `tilinnsyn` are the same on all), so the layer is a stack of
+# loads rather than a versioned table. Every copy used to become its own river
+# segment: rivers.bin carried 87 126 segments for 20 437 streams, and the runtime
+# drew each one five times. hovedelv has the same pattern (56 features, 25 distinct).
+VERSION_DATE_FIELD = "statusdatofra"
+VERSION_ID_FIELD = "objectid"
+
+
+def dedupe_feature_versions(feats: list, label: str = "") -> list:
+    """
+    One (raw index, feature) per distinct geometry, keeping the copy with the
+    latest `statusdatofra` (then the highest `objectid`) and placing it where the
+    geometry FIRST occurred, so the surviving order follows the source order.
+
+    Keyed on the exact coordinates, which are what every downstream step reads:
+    two records with the same coordinates would rasterise, link and carve
+    identically, so dropping one cannot change the terrain, only stop repeating it.
+    """
+    import json as _json
+
+    def rank(f):
+        p = f.get("properties") or {}
+        d, o = p.get(VERSION_DATE_FIELD), p.get(VERSION_ID_FIELD)
+        try:
+            d = float(d) if d is not None else float("-inf")
+        except (TypeError, ValueError):
+            d = float("-inf")
+        try:
+            o = float(o) if o is not None else float("-inf")
+        except (TypeError, ValueError):
+            o = float("-inf")
+        return (d, o)
+
+    slot: dict = {}          # geometry key -> index into `kept`
+    kept: list = []          # [raw_index, feature]
+    for i, f in enumerate(feats or []):
+        key = _json.dumps((f.get("geometry") or {}).get("coordinates"),
+                          separators=(",", ":"))
+        j = slot.get(key)
+        if j is None:
+            slot[key] = len(kept)
+            kept.append([i, f])
+        elif rank(f) > rank(kept[j][1]):
+            kept[j] = [i, f]
+    dropped = len(feats or []) - len(kept)
+    if dropped:
+        print(f"[kvterrain.water] {label}: {len(feats)} records, {len(kept)} distinct "
+              f"geometries; dropped {dropped} repeated copies (kept the latest "
+              f"{VERSION_DATE_FIELD})")
+    return [(i, f) for i, f in kept]
+
+
 def features_from_geojson(
     river_all: list, river_main: list, lakes: list,
     *, order_fields=RIVER_ORDER_FIELDS,
@@ -568,6 +667,13 @@ def features_from_geojson(
         s = str(v).strip()
         return s or None
 
+    def _to_float(v):
+        try:
+            x = float(v) if v is not None else None
+            return x if x is not None and np.isfinite(x) else None
+        except (TypeError, ValueError):
+            return None
+
     def _parse_rivers(feats, default_order, keep_identity: bool, label: str) -> list:
         out: list = []
         # Resolve the schema ONCE per layer instead of re-scanning every property
@@ -586,7 +692,7 @@ def features_from_geojson(
                 note=None if keep_identity else HOVEDELV_NO_ORDER)
         f_order = fmap.get("order")
 
-        for fi, f in enumerate(feats or []):
+        for fi, f in dedupe_feature_versions(feats, label):
             props = f.get("properties", {}) or {}
             ov = props.get(f_order) if f_order else None
             try:
@@ -601,8 +707,11 @@ def features_from_geojson(
                 vdrag = _to_str(props.get(fmap["vassdragsnr"]) if fmap["vassdragsnr"] else None)
                 vatn = _to_int(props.get(fmap["vatnlnr"]) if fmap["vatnlnr"] else None)
                 nfelt = _to_str(props.get(fmap["vnrnfelt"]) if fmap["vnrnfelt"] else None)
+                regine_area = _to_float(
+                    props.get(fmap["regine_area_km2"])
+                    if fmap["regine_area_km2"] else None)
             else:
-                strekn = elvid = vdrag = vatn = nfelt = None
+                strekn = elvid = vdrag = vatn = nfelt = regine_area = None
 
             # A MultiLineString is several parts of ONE feature. Each part becomes
             # its own RiverSeg (they are geometrically disjoint) but all of them
@@ -615,6 +724,7 @@ def features_from_geojson(
                         order=order,
                         strekn_lnr=strekn, elvid=elvid, vassdragsnr=vdrag,
                         vatnlnr=vatn, vnrnfelt=nfelt,
+                        regine_area_km2=regine_area,
                         part_index=pi, feature_index=fi,
                     ))
         return out
@@ -657,16 +767,52 @@ def features_from_geojson(
                 hoyde_moh = float(hv)
             except (TypeError, ValueError):
                 hoyde_moh = None
+        regulated = ("regulert" in str(props.get("objekttype") or "").lower()
+                     or props.get("magasinnr") not in (None, ""))
         for rings in _iter_polygon_rings(f.get("geometry") or {}):
             arr_rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings if len(r) >= 4]
             if arr_rings:
-                lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh))
+                lake_polys.append(LakePoly(arr_rings, lopenr, navn, area_m2, hoyde_moh,
+                                           regulated))
 
     return WaterFeatures(rivers=rivers, main_rivers=main_rivers, lakes=lake_polys)
 
 
 LEVEL_SOURCE_NVE = "nve_hoyde"
 LEVEL_SOURCE_ESTIMATED = "dtm_interior_low"
+LEVEL_SOURCE_CORRECTED = "dtm_corrected"
+LEVEL_SOURCE_RAISED = "dtm_raised"
+LEVEL_SOURCE_TWIN = "nve_neighbour"
+
+# A published NVE level more than this far above the RING_PERCENTILE of the land
+# just outside the polygon is contradicted by the terrain, and is replaced by the
+# DTM estimate (owner's decision, 2026-09-17: "above all the surrounding terrain").
+DEFAULT_LEVEL_MAX_ABOVE_SHORE_M = 2.0
+LEVEL_CHECK_RING_PERCENTILE = 90.0
+# The mirror: a published level more than this far below the lake's own flown
+# water, with the land ringing it standing above that water too, is raised to the
+# DTM estimate. A lake cannot have been flown metres above its level; NVE's
+# whole-metre hoyde explains up to half a metre (owner's decision, 2026-10-01: 77
+# Lierne lakes, 254 ha, drew their water a metre or more below their own shore).
+# Regulated reservoirs keep their published level: they can be flown full.
+# 2026-10-02 the owner lowered it to 0.5 m: across Lierne's NVE lakes the flown
+# water sits a median 0.23 m BELOW the published level, so half a metre above it
+# is past both the whole-metre rounding and the usual offset.
+DEFAULT_LEVEL_MAX_BELOW_SCAN_M = 0.5
+# The other side of the p90 check (owner's decision, 2026-10-02): a published level
+# more than this far above BOTH the lake's own flown water and the LOW side of its
+# shore ring (LEVEL_LOW_RING_PERCENTILE) is lowered to the DTM estimate. The p90
+# check alone cannot see a lake on a slope, whose high bank keeps its p90 up: on
+# Lierne 67 of 74 lakes standing over a metre above their water and their low
+# shore never tripped it, some by 7 m. A drawn-down lake is still safe, because
+# its shore stands above its level. Regulated reservoirs are left alone.
+DEFAULT_LEVEL_MAX_ABOVE_SCAN_M = 1.0
+LEVEL_LOW_RING_PERCENTILE = 10.0
+# A lake NVE gives no level for that touches an NVE lake whose flown water is the
+# same surface (within this) takes that lake's published level: they are one
+# body of water split into two polygons, and the estimate would leave a step of
+# up to NVE's rounding between them (Småtjørnin / Småtjønnin, 0.44 m).
+DEFAULT_LEVEL_TWIN_MAX_SCAN_DIFF_M = 0.25
 
 # How far outside its polygon a lake may claim samples that are still its own flat
 # water surface in the DTM, and how close to that surface they have to be.
@@ -774,10 +920,30 @@ def snap_lakes_to_flat_water(wg: WaterGrid, height_repaired: np.ndarray, *,
 # THOSE.
 
 
+def touching_lakes(lake_id: np.ndarray) -> set:
+    """{(a, b), a < b}: pairs of lake ids with 8-connected samples side by side."""
+    ids = np.asarray(lake_id)
+    pairs: set = set()
+    H, W = ids.shape
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        a = ids[0:H - dy, max(0, -dx):W - max(0, dx)]
+        b = ids[dy:H, max(0, dx):W - max(0, -dx)]
+        m = (a > 0) & (b > 0) & (a != b)
+        if m.any():
+            u = np.unique(np.stack([np.minimum(a[m], b[m]), np.maximum(a[m], b[m])], 1), axis=0)
+            pairs.update((int(x), int(y)) for x, y in u)
+    return pairs
+
+
 def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                            enabled: bool = True, margin_m: Optional[float] = None,
                            island: Optional[np.ndarray] = None,
-                           perimeter_cap: bool = True) -> dict:
+                           perimeter_cap: bool = True,
+                           max_above_shore_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SHORE_M,
+                           max_below_scan_m: Optional[float] = DEFAULT_LEVEL_MAX_BELOW_SCAN_M,
+                           max_above_scan_m: Optional[float] = DEFAULT_LEVEL_MAX_ABOVE_SCAN_M,
+                           twin_max_scan_diff_m: Optional[float] = DEFAULT_LEVEL_TWIN_MAX_SCAN_DIFF_M,
+                           ) -> dict:
     """
     Stamp every lake in `wg.lake_table` with a resolved `level_m` + `level_source`,
     estimating a level from the DTM for the lakes NVE gives no `hoyde` for.
@@ -800,12 +966,46 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     the caller MUST also stop carving them (`estimate_missing=False`) — otherwise
     it recreates the dry-pit bug this function was written to remove.
 
-    A PUBLISHED `hoyde` IS USED EXACTLY AS PUBLISHED. It is not averaged with the
-    DTM, not lowered to it, not sanity-checked against it. NVE is the authority on
-    what a lake's level is; the DTM is one flight's opinion of where the water was
-    that day, and on a regulated lake that is metres of drawdown below the level
-    the place actually has. See the note above `apply_estimated_levels` for the
-    version of this function that got that backwards.
+    A PUBLISHED `hoyde` IS USED AS PUBLISHED — unless the terrain flatly contradicts
+    it. It is not averaged with the DTM and not lowered to the flown water surface:
+    NVE is the authority on what a lake's level is, and on a regulated lake the
+    flight can have caught metres of drawdown. See the note above
+    `apply_estimated_levels` for the version of this function that got that
+    backwards.
+
+    The one exception (`max_above_shore_m`, 2 m by default; None disables it): a
+    `hoyde` standing more than that above the 90th percentile of the land ring just
+    outside the polygon is above practically ALL the surrounding terrain, which no
+    lake can be. On Lierne that is 46 lakes, mostly small ponds published 5-14 m
+    above both their shore and their own flown surface; left alone, the carve
+    builds their bowl from a waterline hanging in the air. Such a level is replaced
+    by the same DTM estimate a lake without `hoyde` gets (perimeter cap included),
+    with `level_source = "dtm_corrected"`; `hoyde_moh` keeps the published value. A
+    drawn-down reservoir is not caught by this, because its shore rises above its
+    real level: the 12 largest Lierne lakes all sit at or below their ring.
+
+    The same lowering also applies (`max_above_scan_m`, 1 m by default; None
+    disables it) to a `hoyde` more than that above BOTH the DTM estimate (before the
+    perimeter cap) and the
+    10th percentile of the same ring: water standing over its own flown surface
+    and over the low side of its shore. The p90 test cannot see a lake on a slope,
+    whose high bank holds the p90 up. A drawn-down lake has its shore above its
+    level, so it still passes; regulated reservoirs are skipped.
+
+    The mirror exception (`max_below_scan_m`, 0.5 m by default; None disables it): a
+    `hoyde` more than that BELOW the same DTM estimate, capped at the shore ring as
+    always, puts the water below the lake's own flown surface and below its whole
+    shoreline, a raised rim round the lake. On Lierne that is 134 lakes, mostly
+    small tarns published several metres low. The level is raised to the estimate,
+    with `level_source = "dtm_raised"` and `hoyde_moh` kept. A regulated reservoir
+    (NVE `objekttype` InnsjøRegulert or a `magasinnr`) is left as published: it can
+    have been flown full.
+
+    TWINS (`twin_max_scan_diff_m`, 0.25 m; None disables it): a lake with no
+    `hoyde` that touches a lake keeping its NVE level, with both flown water
+    surfaces within that of each other, is one body of water split in two
+    polygons. It takes the neighbour's published level
+    (`level_source = "nve_neighbour"`) instead of its own estimate.
 
     THE PERIMETER CAP (`perimeter_cap`, on by default) therefore applies to
     ESTIMATED levels only. Those come from the polygon's interior, so the one
@@ -831,14 +1031,107 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
     estimated = 0
     capped = 0
     cap_max_m = 0.0
+    corrected: list = []
+    if island is None:
+        island = wg.lake_island
+    kw = {} if margin_m is None else {"margin_m": float(margin_m)}
+    lazy: dict = {}
+
+    def est_and_cap():
+        if not lazy:
+            lazy["est"] = bathymetry.estimate_levels_from_interior(
+                height_repaired, wg.lake_id, exclude=island, **kw)
+            lazy["cap"] = (bathymetry.perimeter_levels(
+                height_repaired, wg.lake_id, wg.type) if perimeter_cap else {})
+        return lazy["est"], lazy["cap"]
+
+    if max_above_shore_m is not None and table:
+        ring = bathymetry.perimeter_levels(
+            height_repaired, wg.lake_id, wg.type,
+            percentile=LEVEL_CHECK_RING_PERCENTILE)
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            r = ring.get(lid)
+            if h is None or r is None or not np.isfinite(r):
+                continue
+            if float(h) <= float(r) + float(max_above_shore_m):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            c = cap.get(lid)
+            if v is None or not np.isfinite(v):
+                v = c if c is not None and np.isfinite(c) else float(r)
+            elif c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            v = min(float(v), float(h))
+            info["level_m"] = v
+            info["level_source"] = LEVEL_SOURCE_CORRECTED
+            corrected.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                              "navn": info.get("navn"), "hoyde_moh": float(h),
+                              "test": "above_shore_p90",
+                              "ring_p90_m": round(float(r), 3),
+                              "level_m": round(v, 3),
+                              "lowered_m": round(float(h) - v, 3)})
+
+    if max_above_scan_m is not None and table:
+        low_ring = bathymetry.perimeter_levels(
+            height_repaired, wg.lake_id, wg.type,
+            percentile=LEVEL_LOW_RING_PERCENTILE)
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            r = low_ring.get(lid)
+            if (h is None or info.get("level_source") != LEVEL_SOURCE_NVE
+                    or info.get("regulated") or r is None or not np.isfinite(r)):
+                continue
+            if float(h) <= float(r) + float(max_above_scan_m):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            if v is None or not np.isfinite(v):
+                continue
+            # Tested against the flown water itself: the shore cap below can sit
+            # under it on a small lake, and must not be what makes a level that
+            # matches its own water look too high.
+            if float(h) <= float(v) + float(max_above_scan_m):
+                continue
+            c = cap.get(lid)
+            if c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            v = float(v)
+            info["level_m"] = v
+            info["level_source"] = LEVEL_SOURCE_CORRECTED
+            corrected.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                              "navn": info.get("navn"), "hoyde_moh": float(h),
+                              "test": "above_scan_and_shore_p10",
+                              "ring_p10_m": round(float(r), 3),
+                              "level_m": round(v, 3),
+                              "lowered_m": round(float(h) - v, 3)})
+
+    raised: list = []
+    if max_below_scan_m is not None and table:
+        for lid, info in table.items():
+            h = info.get("hoyde_moh")
+            if (h is None or info.get("level_source") != LEVEL_SOURCE_NVE
+                    or info.get("regulated")):
+                continue
+            est, cap = est_and_cap()
+            v = est.get(lid)
+            if v is None or not np.isfinite(v):
+                continue
+            c = cap.get(lid)
+            if c is not None and np.isfinite(c) and float(c) < float(v):
+                v = float(c)
+            if float(v) <= float(h) + float(max_below_scan_m):
+                continue
+            info["level_m"] = float(v)
+            info["level_source"] = LEVEL_SOURCE_RAISED
+            raised.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                           "navn": info.get("navn"), "hoyde_moh": float(h),
+                           "level_m": round(float(v), 3),
+                           "raised_m": round(float(v) - float(h), 3)})
+
     if enabled and missing:
-        kw = {} if margin_m is None else {"margin_m": float(margin_m)}
-        if island is None:
-            island = wg.lake_island
-        est = bathymetry.estimate_levels_from_interior(
-            height_repaired, wg.lake_id, exclude=island, **kw)
-        cap = (bathymetry.perimeter_levels(height_repaired, wg.lake_id, wg.type)
-               if perimeter_cap else {})
+        est, cap = est_and_cap()
         for lid in missing:
             v = est.get(lid)
             if v is None or not np.isfinite(v):
@@ -852,8 +1145,87 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
             table[lid]["level_source"] = LEVEL_SOURCE_ESTIMATED
             estimated += 1
 
+    twins: list = []
+    if twin_max_scan_diff_m is not None and estimated:
+        est, _ = est_and_cap()
+        for a, b in touching_lakes(wg.lake_id):
+            for lid, nb in ((a, b), (b, a)):
+                info, other = table.get(lid), table.get(nb)
+                if (info is None or other is None
+                        or info.get("level_source") != LEVEL_SOURCE_ESTIMATED
+                        or other.get("level_source") != LEVEL_SOURCE_NVE):
+                    continue
+                va, vb = est.get(lid), est.get(nb)
+                if va is None or vb is None or not (np.isfinite(va) and np.isfinite(vb)):
+                    continue
+                d = abs(float(va) - float(vb))
+                if d > float(twin_max_scan_diff_m):
+                    continue
+                prev = info.get("_twin_d")
+                if prev is not None and prev <= d:
+                    continue
+                info["_twin_d"] = d
+                info["_twin_of"] = nb
+        for lid, info in table.items():
+            if "_twin_of" not in info:
+                continue
+            nb, d = info.pop("_twin_of"), info.pop("_twin_d")
+            old = float(info["level_m"])
+            info["level_m"] = float(table[nb]["level_m"])
+            info["level_source"] = LEVEL_SOURCE_TWIN
+            estimated -= 1
+            twins.append({"lake_id": int(lid), "vatn_lnr": info.get("lopenr"),
+                          "navn": info.get("navn"), "twin_lake_id": int(nb),
+                          "twin_vatn_lnr": table[nb].get("lopenr"),
+                          "scan_diff_m": round(d, 3), "estimate_m": round(old, 3),
+                          "level_m": info["level_m"],
+                          "shift_m": round(info["level_m"] - old, 3)})
+
     unresolved = sum(1 for i in table.values() if i.get("level_m") is None)
+    drops = [c["lowered_m"] for c in corrected]
     return {
+        "levels_corrected": len(corrected),
+        "levels_corrected_max_drop_m": float(max(drops)) if drops else 0.0,
+        "levels_corrected_median_drop_m": float(np.median(drops)) if drops else 0.0,
+        "correction": {
+            "enabled": max_above_shore_m is not None,
+            "max_above_shore_m": max_above_shore_m,
+            "ring_percentile": LEVEL_CHECK_RING_PERCENTILE,
+            "max_above_scan_m": max_above_scan_m,
+            "low_ring_percentile": LEVEL_LOW_RING_PERCENTILE,
+            "rule": "a published hoyde more than max_above_shore_m above "
+                    "ring_percentile of the land ring just outside the polygon "
+                    "(test above_shore_p90), or, on an unregulated lake, more than "
+                    "max_above_scan_m above both the DTM estimate and "
+                    "low_ring_percentile of that ring (test "
+                    "above_scan_and_shore_p10), is replaced by the DTM estimate "
+                    "(perimeter cap included), never raised; hoyde_moh keeps the "
+                    "published value",
+            "lakes": sorted(corrected, key=lambda c: -c["lowered_m"]),
+        },
+        "levels_raised": len(raised),
+        "levels_raised_max_m": float(max(r["raised_m"] for r in raised)) if raised else 0.0,
+        "levels_raised_median_m": (float(np.median([r["raised_m"] for r in raised]))
+                                   if raised else 0.0),
+        "raise": {
+            "enabled": max_below_scan_m is not None,
+            "max_below_scan_m": max_below_scan_m,
+            "rule": "a published hoyde more than max_below_scan_m below the DTM "
+                    "estimate (perimeter cap included) is raised to it, never "
+                    "lowered; regulated reservoirs are left as published; "
+                    "hoyde_moh keeps the published value",
+            "regulated_kept": sum(1 for i in table.values() if i.get("regulated")),
+            "lakes": sorted(raised, key=lambda r: -r["raised_m"]),
+        },
+        "levels_from_twin": len(twins),
+        "twins": {
+            "enabled": twin_max_scan_diff_m is not None,
+            "max_scan_diff_m": twin_max_scan_diff_m,
+            "rule": "a lake without hoyde that touches a lake keeping its NVE "
+                    "level, both flown water surfaces within max_scan_diff_m, "
+                    "takes that published level",
+            "lakes": twins,
+        },
         "lakes_total": len(table),
         "levels_from_nve": sum(1 for i in table.values()
                                if i.get("level_source") == LEVEL_SOURCE_NVE),
@@ -867,7 +1239,8 @@ def apply_estimated_levels(wg: WaterGrid, height_repaired: np.ndarray, *,
                      if margin_m is None else float(margin_m)),
         "band_pct": [bathymetry.DEFAULT_LEVEL_TRIM_PCT,
                      bathymetry.DEFAULT_LEVEL_BAND_PCT],
-        "method": (f"a published NVE hoyde is used verbatim. For a lake without "
+        "method": (f"a published NVE hoyde is used verbatim unless the terrain "
+                   f"contradicts it (see correction and raise). For a lake without "
                    f"one: the mean of the "
                    f"{bathymetry.DEFAULT_LEVEL_TRIM_PCT:g}-"
                    f"{bathymetry.DEFAULT_LEVEL_BAND_PCT:g}th percentile band of the "
@@ -987,6 +1360,40 @@ def fetch_water_geojson(
     return got.get("rivers", []), got.get("main-rivers", []), got.get("lakes", [])
 
 
+def fetch_bathymetry_geojson(
+    plan: core.GridPlan, *, session=None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> dict:
+    """
+    Every NVE lake survey that intersects the plan bbox, RAW:
+    `{"surveys", "contours", "points", "shores"}` as GeoJSON feature lists in the
+    plan's CRS (see BATHY_*_LAYER for what each holds).
+
+    The surveys are found by bbox; their contours, points and surveyed shorelines
+    are then fetched by lake number, so a lake the region only clips still arrives
+    whole and interpolates the same at the crop line as it would uncropped.
+    """
+    import requests
+    sess = session or requests.Session()
+    surveys = _arcgis_query_geojson(LAKE_SERVICE, BATHY_SURVEY_LAYER, plan.epsg,
+                                    plan.bbox_utm, session=sess, progress=progress,
+                                    label="lake-surveys")
+    ids = sorted({int(v) for v in (
+        (f.get("properties") or {}).get("vatnlnr") for f in surveys)
+        if v is not None})
+    out = {"surveys": surveys, "contours": [], "points": [], "shores": []}
+    for key, layer, label in (("contours", BATHY_CONTOUR_LAYER, "depth-contours"),
+                              ("points", BATHY_POINT_LAYER, "depth-points"),
+                              ("shores", BATHY_SHORE_LAYER, "survey-shores")):
+        for i in range(0, len(ids), BATHY_IDS_PER_QUERY):
+            chunk = ids[i:i + BATHY_IDS_PER_QUERY]
+            where = f"vatnlnr IN ({','.join(str(v) for v in chunk)})"
+            out[key].extend(_arcgis_query_geojson(
+                LAKE_SERVICE, layer, plan.epsg, None, where=where, session=sess,
+                progress=progress, label=label))
+    return out
+
+
 def fetch_water_features(
     plan: core.GridPlan, *, include_main_rivers: bool = True,
     session=None, progress: Optional[Callable[[int, int, str], None]] = None,
@@ -1034,8 +1441,12 @@ def rasterize_water(
     plan: core.GridPlan, feats: WaterFeatures, *,
     width_by_order: Optional[dict] = None, width_scale: float = 1.0,
     all_touched_rivers: bool = True, fill_lake_holes: bool = True,
+    clip_water=None,
 ) -> WaterGrid:
     """
+    `clip_water` (a shapely geometry, see `riverwidth.water_areas`) holds any river
+    piece drawn wider than its segment's own width to that area.
+
     Rasterise rivers (buffered by size) and lakes onto the leaf (SY,SX) grid.
     Priority at overlaps is lake > river; among rivers the larger (higher order)
     wins, and its weight (stream order) is the one kept.
@@ -1072,31 +1483,71 @@ def rasterize_water(
     # They deliberately overlap; the sort below burns higher orders last, so a main
     # river upgrades the order of the pixels it shares with its elvenett twin.
     # Only `feats.rivers` is serialised as polylines — see WaterFeatures.
-    weight_shapes = []   # (polygon, order)
+    weight_shapes = []   # (polygon, order, full width metres)
+    clip_tree = clip_parts = None
+    if clip_water is not None and not clip_water.is_empty:
+        import shapely
+        clip_parts = np.asarray(getattr(clip_water, "geoms", [clip_water]), dtype=object)
+        clip_tree = shapely.STRtree(clip_parts)
     for seg in list(feats.rivers) + list(feats.main_rivers):
         xy = seg.xy
         if xy.shape[0] < 2:
             continue
-        half = 0.5 * order_to_width_m(seg.order, width_by_order, width_scale)
+        explicit = getattr(seg, "width_m", None)
+        full_width = (float(explicit) if explicit is not None and
+                      np.isfinite(explicit) and explicit > 0 else
+                      order_to_width_m(seg.order, width_by_order, width_scale))
+        half = 0.5 * full_width
         half = max(half, 0.51 * plan.spacing_m)  # ensure at least ~1 sample wide
+        vw = getattr(seg, "vertex_width_m", None)
+        if vw is not None and len(vw) != xy.shape[0]:
+            vw = None
         for k in range(xy.shape[0] - 1):
             (x0, y0), (x1, y1) = xy[k], xy[k + 1]
             if x0 == x1 and y0 == y1:
                 continue
-            poly = LineString([(x0, y0), (x1, y1)]).buffer(
-                half, cap_style=2, join_style=2)  # flat caps, mitre joins
+            piece_w = full_width
+            if vw is not None:
+                piece_w = float(max(vw[k], vw[k + 1]))
+            piece_half = max(0.5 * piece_w, 0.51 * plan.spacing_m)
+            line = LineString([(x0, y0), (x1, y1)])
+            poly = line.buffer(piece_half, cap_style=2, join_style=2)  # flat caps
+            if clip_tree is not None and piece_w > full_width:
+                # A width taken from N50's river areas stays inside them (plus a
+                # margin), whatever a confluence or a bend did to the measurement;
+                # the modelled channel is always kept.
+                # Our centreline need not run down the middle of N50's river area,
+                # so reach the full width out on EACH side and let the area itself
+                # decide where the banks are.
+                wide = line.buffer(2.0 * piece_half, cap_style=2, join_style=2)
+                hits = clip_tree.query(wide)
+                local = (clip_parts[hits[0]] if len(hits) == 1 else
+                         shapely.union_all(clip_parts[hits]) if len(hits) else None)
+                base = line.buffer(half, cap_style=2, join_style=2)
+                poly = base if local is None else wide.intersection(local).union(base)
             if poly.is_empty:
                 continue
-            weight_shapes.append((poly, int(seg.order)))
+            weight_shapes.append((poly, int(seg.order), float(piece_w),
+                                  float(getattr(seg, "depth_m", None) or 0.0)))
 
     # Burn larger rivers LAST so they win (rasterize is last-write per pixel).
-    order_sort = np.argsort([w for _, w in weight_shapes], kind="stable") \
-        if weight_shapes else np.array([], dtype=int)
+    order_sort = np.asarray(sorted(
+        range(len(weight_shapes)),
+        key=lambda i: (weight_shapes[i][2], weight_shapes[i][1], i)), dtype=int)
     weight_arr = np.zeros(shape, dtype=np.uint8)
+    width_arr = np.zeros(shape, dtype=np.float32)
+    depth_arr = np.zeros(shape, dtype=np.float32)
     if len(order_sort):
-        w_sorted = [weight_shapes[i] for i in order_sort]
+        w_sorted = [(weight_shapes[i][0], weight_shapes[i][1]) for i in order_sort]
+        width_sorted = [(weight_shapes[i][0], weight_shapes[i][2]) for i in order_sort]
         rasterize(w_sorted, out=weight_arr, transform=transform,
                   all_touched=all_touched_rivers, merge_alg=_replace())
+        rasterize(width_sorted, out=width_arr, transform=transform,
+                  all_touched=all_touched_rivers, merge_alg=_replace())
+        if any(weight_shapes[i][3] > 0 for i in order_sort):
+            depth_sorted = [(weight_shapes[i][0], weight_shapes[i][3]) for i in order_sort]
+            rasterize(depth_sorted, out=depth_arr, transform=transform,
+                      all_touched=all_touched_rivers, merge_alg=_replace())
 
     type_arr = np.where(weight_arr > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
 
@@ -1122,7 +1573,7 @@ def rasterize_water(
             lopenr_to_local[key] = local
             lake_table[local] = {
                 "lopenr": lk.lopenr, "navn": lk.navn, "area_m2": lk.area_m2,
-                "hoyde_moh": lk.hoyde_moh,
+                "hoyde_moh": lk.hoyde_moh, "regulated": bool(lk.regulated),
             }
         shell = lk.rings[0]
         holes = lk.rings[1:] if len(lk.rings) > 1 else None
@@ -1160,9 +1611,41 @@ def rasterize_water(
     lake_mask = lake_id_arr > 0
     type_arr[lake_mask] = TYPE_LAKE
     weight_arr[lake_mask] = 0
+    width_arr[lake_mask] = 0.0
 
     return WaterGrid(type_arr, weight_arr, lake_id_arr, lake_table,
-                     weight_raw=weight_raw, lake_island=island_mask)
+                     weight_raw=weight_raw, lake_island=island_mask,
+                     width_m=width_arr,
+                     depth_m=depth_arr if depth_arr.any() else None)
+
+
+def rerasterize_rivers(plan: core.GridPlan, wg: WaterGrid, segments: list,
+                       *, all_touched_rivers: bool = True, clip_water=None) -> None:
+    """Replace only the river footprint with hydraulically sized segments — or, per
+    vertex, with their visual width where `vertex_width_m` is set (`riverwidth`).
+
+    Lake ids, snapped shore pixels, resolved levels and island cells stay exactly
+    as they are.  The provisional order-width raster exists only to recover the
+    hovedelv order overlay before discharge is known; this second pass is the
+    final river mask used by the surface and carve.
+    """
+    feats = WaterFeatures(rivers=[RiverSeg(
+        xy=s.xy, order=int(s.order), width_m=float(s.width_m),
+        vertex_width_m=getattr(s, "vertex_width_m", None),
+        depth_m=getattr(s, "depth_m", None)) for s in segments])
+    river_only = rasterize_water(
+        plan, feats, all_touched_rivers=all_touched_rivers,
+        fill_lake_holes=False, clip_water=clip_water)
+    lake = wg.lake_id > 0
+    wg.weight_raw = river_only.weight_raw
+    wg.type[~lake] = np.where(
+        river_only.weight_raw[~lake] > 0, TYPE_RIVER, TYPE_LAND).astype(np.uint8)
+    wg.weight[~lake] = river_only.weight_raw[~lake]
+    wg.width_m = river_only.width_m
+    wg.width_m[lake] = 0.0
+    wg.depth_m = river_only.depth_m
+    if wg.depth_m is not None:
+        wg.depth_m[lake] = 0.0
 
 
 def _replace():
