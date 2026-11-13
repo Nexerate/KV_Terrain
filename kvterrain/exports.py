@@ -588,6 +588,29 @@ def check_water(exp: Export) -> dict:
     elif exp.manifest.get("water_id"):
         report["errors"].append("water_id manifest has no lake_islands sidecar")
 
+    # ---- lake_cells.bin / lake_samples.bin (optional post-processing) ------ #
+    from . import lakeindex
+    for key, reader in (("lake_cells", lakeindex.read_lake_cells),
+                        ("lake_samples", lakeindex.read_lake_samples)):
+        info = exp.manifest.get("water_id", {}).get(key)
+        if not info:
+            continue
+        try:
+            path = os.path.join(exp.root, info["file"])
+            if info.get("bytes") != os.path.getsize(path):
+                raise ValueError(f"manifest bytes {info.get('bytes')} != file bytes "
+                                 f"{os.path.getsize(path)}")
+            got = reader(path)
+            n = len(got) if key == "lake_cells" else int(got.size)
+            want = info.get("lake_count" if key == "lake_cells" else "record_count")
+            if n != want:
+                raise ValueError(f"manifest count {want} != file count {n}")
+            report[key] = {"file": info["file"], "count": n,
+                           "bytes": info["bytes"], "ok": True}
+        except Exception as e:      # noqa: BLE001
+            report[key] = {"ok": False, "error": str(e)}
+            report["errors"].append(f"{key}: {e}")
+
     report["ok"] = not report["errors"]
     return report
 

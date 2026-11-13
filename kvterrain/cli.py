@@ -17,6 +17,7 @@ import json
 import math
 import os
 import sys
+import time
 
 
 from . import core
@@ -564,6 +565,24 @@ def cmd_validate_water(a):
     sys.exit(0 if rep["ok"] else 1)
 
 
+def cmd_lake_indexes(a):
+    """Write the level-0 lake indexes into an existing export, no re-export."""
+    from . import lakeindex
+
+    t0 = time.time()
+    blocks = lakeindex.write_lake_indexes(a.export)
+    lc = blocks["lake_cells"]
+    print(f"  + {lc['file']}: {lc['lake_count']} lakes, {lc['run_count']} runs, "
+          f"{lc['sample_count']} samples, {lc['bytes']} bytes")
+    ls = blocks.get("lake_samples")
+    if ls:
+        print(f"  + {ls['file']}: {ls['record_count']} records over {ls['lakes']} "
+              f"authored lakes, {ls['sample_count']} samples, {ls['bytes']} bytes")
+    else:
+        print("  - lake_samples.bin skipped: the export has no labels atlas")
+    print(f"done in {time.time() - t0:.1f} s")
+
+
 def cmd_validate_hierarchy(a):
     """
     Check hierarchy.bin, labels.atlas and hypsometry.bin against the manifest and heights.atlas:
@@ -987,6 +1006,12 @@ def main(argv=None):
                              "water_id.atlas against the manifest")
     vw.add_argument("--out", required=True)
     vw.set_defaults(func=cmd_validate_water)
+
+    li = sub.add_parser("lake-indexes",
+                        help="(re)write lake_cells.bin and lake_samples.bin into an "
+                             "existing export from its water_id and labels atlases")
+    li.add_argument("--export", required=True, dest="export")
+    li.set_defaults(func=cmd_lake_indexes)
 
     vh = sub.add_parser("validate-hierarchy",
                         help="check hierarchy, labels, hypsometry, flow directions "

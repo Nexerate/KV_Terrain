@@ -17,7 +17,8 @@ the map edge ramp back up to their level there, and a published lake level the
 terrain contradicts is replaced, so `heights.atlas` (and what is carved from it)
 differs from earlier exports. The new products beside the old ones are:
 `labels.atlas`, `flowdir.atlas`, `hierarchy.bin`, `hypsometry.bin`,
-`catchments.bin`, `water_audit.json` and `lake_islands.bin`. With
+`catchments.bin`, `water_audit.json`, `lake_islands.bin`, and the lake
+indexes `lake_cells.bin` and `lake_samples.bin` (`kvterrain.lakeindex`). With
 `downhill_river_bed`, `lake_edge_is_shore`, `lake_shore_8_connected` and
 `hierarchy` remain independently switchable; the v2 river graph contract is not.
 
@@ -889,6 +890,11 @@ def run_process(
 
         with open(os.path.join(out_dir, "manifest.json"), "w") as f:
             json.dump(res.manifest, f, indent=2)
+
+        # Post-processing: reads water_id/labels back from the finished atlases
+        # (so it also runs on an old export) and rewrites the manifest.
+        from . import lakeindex
+        lakeindex.write_lake_indexes(out_dir, res.manifest)
     else:
         from . import rivernet
         res.manifest["generator"] = rivernet.generator_metadata(plan, {

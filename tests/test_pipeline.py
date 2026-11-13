@@ -54,6 +54,12 @@ def test_new_products_and_manifest(export_dir):
     islands = m["water_id"]["lake_islands"]
     assert islands["file"] == "lake_islands.bin"
     assert islands["bytes"] == 4 + 4 * islands["count"]
+    cells = m["water_id"]["lake_cells"]
+    assert cells["file"] == "lake_cells.bin"
+    assert cells["bytes"] == 4 + 8 * cells["lake_count"] + 8 * cells["run_count"]
+    samples = m["water_id"]["lake_samples"]
+    assert samples["file"] == "lake_samples.bin"
+    assert samples["bytes"] == 4 + 12 * samples["record_count"]
     audit = json.load(open(os.path.join(export_dir, "water_audit.json")))
     assert audit["summary"]["lakes"] == len(audit["lakes"])
 
