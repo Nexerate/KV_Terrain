@@ -762,9 +762,11 @@ def run_process(
         res.manifest["atlas"]["labels_file"] = labels_info["atlas_file"]
         res.manifest["atlas"]["bytes_per_sample"][labels_info["atlas_file"]] = \
             hierarchy.LABELS_BYTES_PER_SAMPLE
+        _note_atlas_file(res.manifest, labels_info["atlas_file"], labels_info["bytes"])
         res.manifest["atlas"]["flowdir_file"] = flow_info["file"]
         res.manifest["atlas"]["bytes_per_sample"][flow_info["file"]] = \
             flowdir.FLOWDIR_BYTES_PER_SAMPLE
+        _note_atlas_file(res.manifest, flow_info["file"], flow_info["bytes"])
         res.manifest["hierarchy"] = hierarchy.manifest_block(
             hier, hier_file=hier_info, labels=labels_info,
             minor_depth_m=hierarchy.DEFAULT_MINOR_DEPTH_M,
@@ -788,6 +790,7 @@ def run_process(
         # Name the surface atlas in the header so the runtime opens the second handle.
         res.manifest["atlas"]["surface_file"] = wsurf["atlas_file"]
         res.manifest["atlas"]["bytes_per_sample"][wsurf["atlas_file"]] = 2
+        _note_atlas_file(res.manifest, wsurf["atlas_file"], wsurf["bytes"])
         wsurf["lake_count"] = lake_count
         wsurf["lake_levels"] = level_report
         wsurf["discharge"] = river_net.report.get("hydrology", {})
@@ -874,6 +877,7 @@ def run_process(
             water_leaf.lake_island, out_dir)
         res.manifest["atlas"]["water_id_file"] = wid["atlas_file"]
         res.manifest["atlas"]["bytes_per_sample"][wid["atlas_file"]] = 2
+        _note_atlas_file(res.manifest, wid["atlas_file"], wid["bytes"])
         res.manifest["water_id"] = wid
 
         res.manifest["water_vector"] = rivernet.export_river_network(
@@ -916,6 +920,15 @@ def run_process(
 # --------------------------------------------------------------------------- #
 # Dataset entry point                                                          #
 # --------------------------------------------------------------------------- #
+
+def _note_atlas_file(manifest: dict, file_name: str, file_bytes: int) -> None:
+    """Record an unfiltered kvtiles_v1 atlas's size on disk in the atlas block."""
+    from . import tilepack
+    atlas = manifest["atlas"]
+    atlas.setdefault("file_bytes", {})[file_name] = int(file_bytes)
+    atlas.setdefault("tile_filter", {})[file_name] = \
+        tilepack.FILTER_NAMES[tilepack.FILTER_NONE]
+
 
 def _lake_bathymetry_block(model: str, rep: dict, snap_report: dict,
                            water_params: dict) -> dict:

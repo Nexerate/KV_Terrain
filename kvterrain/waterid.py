@@ -235,9 +235,13 @@ def export_water_id_tiles(
     TC = plan.tile_cells
     TS = TC + 1
 
+    from . import tilepack
+
     os.makedirs(out_dir, exist_ok=True)
-    tiles_written = 0
-    with open(os.path.join(out_dir, atlas_name), "wb") as fh:
+    tile_count = core.atlas_tile_count(plan.leaf_tiles_x, plan.leaf_tiles_y,
+                                       plan.num_levels)
+    with tilepack.TileWriter(os.path.join(out_dir, atlas_name), tile_count,
+                             core.atlas_tile_bytes(TS), 2) as w:
         for lvl, arr in enumerate(id_levels):
             tiles_x, tiles_y = core.tiles_at_level(
                 plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
@@ -249,20 +253,14 @@ def export_water_id_tiles(
                         arr[r0:r0 + TS, c0:c0 + TS], dtype="<u2")
                     assert tile.shape == (TS, TS), \
                         f"bad water_id slice {tile.shape} L{lvl} {tx},{ty}"
-                    tile.tofile(fh)
-                    tiles_written += 1
-
-    expect = core.atlas_total_bytes(
-        plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
+                    w.write(tile)
+    tiles_written = tile_count
     actual = os.path.getsize(os.path.join(out_dir, atlas_name))
-    if actual != expect:
-        raise RuntimeError(
-            f"dense water_id atlas size mismatch: {atlas_name} is {actual} "
-            f"bytes, expected {expect}. The water_id tile grid was not dense.")
 
     return {
         "atlas_file": atlas_name,
         "atlas_format": core.ATLAS_FORMAT,
+        "bytes": actual,
         "dtype": "u16le",
         "row_order": "north_to_south",
         "encoding": {

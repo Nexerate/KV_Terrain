@@ -323,8 +323,11 @@ def _report_export(a, res, want_water: bool) -> None:
     print(f"packed {res.tiles_written} tiles to {a.out}  "
           f"range [{res.height_min:.1f}, {res.height_max:.1f}] m")
     atlas = res.manifest["atlas"]
+    on_disk = (atlas.get("file_bytes") or {}).get(atlas["height_file"],
+                                                  atlas["height_bytes"])
     line = (f"  + {atlas['height_file']} "
-            f"({atlas['height_bytes'] / 1e6:.1f} MB, {atlas['tile_bytes']}-byte tiles)")
+            f"({on_disk / 1e6:.1f} MB on disk, {atlas['height_bytes'] / 1e6:.1f} MB raw, "
+            f"{atlas['tile_bytes']}-byte tiles)")
     if atlas.get("surface_file"):
         line += f" + {atlas['surface_file']}"
     print(line)
@@ -471,8 +474,10 @@ def cmd_validate(a):
 
 
 def cmd_validate_atlas(a):
-    """Verify each dense atlas against the manifest header: exact file size, and
-    that a sample of computed tile offsets each land on a full tileBytes block.
+    """Verify each atlas against the manifest header. dense_v1: exact file size,
+    and a sample of computed tile offsets each land on a full tileBytes block.
+    kvtiles_v1: header and offset index agree with the manifest, and a sample of
+    tiles per level decodes to a full raw tile.
 
     The checking lives in `exports.check_atlas` so the UI runs the same code —
     this function only prints the report it hands back."""
@@ -485,19 +490,45 @@ def cmd_validate_atlas(a):
         if entry.get("error"):
             print(f"[{entry['kind']}] {entry['error']}")
             continue
-        print(f"[{entry['kind']}] {entry['file']}: {entry['bytes']} bytes, expected "
-              f"{entry['expected_bytes']} ({entry['bytes_per_sample']} bytes/sample) -> "
-              f"{'OK' if entry['size_ok'] else 'MISMATCH (grid not dense!)'}")
+        if entry.get("format") == "kvtiles_v1":
+            print(f"[{entry['kind']}] {entry['file']}: kvtiles_v1, {entry['bytes']} bytes "
+                  f"on disk, {entry['raw_bytes']} raw ({entry['bytes_per_sample']} "
+                  f"bytes/sample, filter {entry.get('filter', '?')}) -> "
+                  f"{'OK' if entry['size_ok'] else 'BAD HEADER/INDEX'}")
+        else:
+            print(f"[{entry['kind']}] {entry['file']}: {entry['bytes']} bytes, expected "
+                  f"{entry['expected_bytes']} ({entry['bytes_per_sample']} bytes/sample) -> "
+                  f"{'OK' if entry['size_ok'] else 'MISMATCH (grid not dense!)'}")
         if not entry["size_ok"]:
             continue
         for sr in entry["short_reads"]:
-            print(f"    L{sr['level']} {sr['x']},{sr['y']}: short read at offset "
-                  f"{sr['offset']}")
-        print(f"    sampled {entry['offsets_checked']} tile offsets, "
-              f"{'all full-length' if not entry['short_reads'] else 'SHORT READS ABOVE'}")
+            where = (f"offset {sr['offset']}" if "offset" in sr
+                     else f"tile {sr['tile']}")
+            print(f"    L{sr['level']} {sr['x']},{sr['y']}: bad read at {where}")
+        print(f"    sampled {entry['offsets_checked']} tiles, "
+              f"{'all full-length' if not entry['short_reads'] else 'BAD READS ABOVE'}")
 
     print("RESULT:", "PASS" if rep["ok"] else "FAIL")
     sys.exit(0 if rep["ok"] else 1)
+
+
+def cmd_pack_atlases(a):
+    """Copy an export with every atlas rewritten as kvtiles_v1 and each tile
+    verified byte-identical to its source. The source is only read."""
+    from . import tilepack
+
+    def prog(fn, rep):
+        print(f"  {fn}: {rep['src_bytes']:,} -> {rep['dst_bytes']:,} bytes "
+              f"({rep['dst_bytes'] / max(rep['src_bytes'], 1):.1%}), "
+              f"{rep['tiles']} tiles ({rep['tiles_stored_raw']} stored raw), "
+              f"filter {rep['filter']}, verified, {rep['seconds']} s", flush=True)
+
+    rep = tilepack.pack_export(a.src, a.dst, progress=prog)
+    src = sum(r["src_bytes"] for r in rep["atlases"].values())
+    dst = sum(r["dst_bytes"] for r in rep["atlases"].values())
+    print(f"atlases {src:,} -> {dst:,} bytes ({dst / max(src, 1):.1%}); "
+          f"{rep['copied_files']} other files copied; {rep['seconds']} s")
+    print("RESULT: PASS (every tile decodes byte-identical to the source)")
 
 
 def cmd_validate_water(a):
@@ -1012,6 +1043,13 @@ def main(argv=None):
                              "existing export from its water_id and labels atlases")
     li.add_argument("--export", required=True, dest="export")
     li.set_defaults(func=cmd_lake_indexes)
+
+    pa = sub.add_parser("pack-atlases",
+                        help="copy an export with every atlas rewritten as "
+                             "kvtiles_v1 (lz4 per tile) and verified tile for tile")
+    pa.add_argument("src", help="existing export directory (only read)")
+    pa.add_argument("dst", help="new, empty directory to write")
+    pa.set_defaults(func=cmd_pack_atlases)
 
     vh = sub.add_parser("validate-hierarchy",
                         help="check hierarchy, labels, hypsometry, flow directions "

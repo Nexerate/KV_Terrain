@@ -7,8 +7,9 @@ is intact.
 
 Every other module in this package *writes* the export. This one is the only one
 that opens it again from the outside, which is exactly why it is worth having —
-it exercises the same arithmetic a consumer has to implement (the dense-atlas
-offset formula, the u16 unpacking, the `rivers.bin` layout) against the bytes
+it exercises the same steps a consumer has to implement (the atlas tile index,
+the kvtiles_v1 offset index and lz4 decode — or the older dense_v1 offset
+formula — the u16 unpacking, the `rivers.bin` layout) against the bytes
 that were actually written, rather than against the arrays that were in memory
 at the time. A preview drawn by this module is proof the offsets are right;
 a preview drawn from `PackResult` is not.
@@ -30,7 +31,7 @@ from typing import Optional
 
 import numpy as np
 
-from . import core
+from . import core, tilepack
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ROOT = os.path.join(PROJECT_ROOT, "exports")
@@ -118,6 +119,35 @@ class Export:
             return int(self.manifest.get("flow_direction", {}).get("levels", 1))
         return self.num_levels
 
+    def atlas_tile_raw_bytes(self, kind: str) -> int:
+        return core.atlas_tile_bytes(self.tile_samples, self.bytes_per_sample(kind))
+
+    def atlas_tile_count(self, kind: str) -> int:
+        lx, ly = self.leaf_tiles
+        return core.atlas_tile_count(lx, ly, self.atlas_levels(kind))
+
+    def open_atlas(self, kind: str) -> "tilepack.AtlasReader":
+        """A tile reader for either atlas layout (dense_v1 or kvtiles_v1),
+        checked against the tile count and tile size this manifest implies."""
+        path = self.atlas_path(kind)
+        if path is None:
+            raise FileNotFoundError(f"export has no {kind} atlas")
+        return tilepack.AtlasReader(path, self.atlas_tile_raw_bytes(kind),
+                                    self.bytes_per_sample(kind),
+                                    self.atlas_tile_count(kind))
+
+    def tile_index(self, kind: str, level: int, x: int, y: int) -> int:
+        levels = self.atlas_levels(kind)
+        if level < 0 or level >= levels:
+            raise ValueError(f"{kind} atlas has {levels} level(s), not level {level}")
+        lx, ly = self.leaf_tiles
+        return core.atlas_tile_index(lx, ly, level, x, y)
+
+    def read_tile(self, kind: str, level: int, x: int, y: int) -> np.ndarray:
+        """One (tile_samples, tile_samples) tile, rows north to south."""
+        with self.open_atlas(kind) as r:
+            return r.read_tile(self.tile_index(kind, level, x, y))
+
     @property
     def has_hierarchy(self) -> bool:
         return bool(self.manifest.get("hierarchy"))
@@ -188,40 +218,25 @@ class Export:
 
     def read_level(self, kind: str, level: int) -> np.ndarray:
         """
-        Reassemble a whole pyramid level from an atlas, by computed byte offset.
+        Reassemble a whole pyramid level from an atlas, tile by tile.
 
         This is the consumer's job done in reverse, and it is the point of the
-        module: every tile is located with `core.atlas_tile_offset` and nothing
-        else, so if the header and the file disagree the picture comes out wrong
-        rather than quietly plausible.
+        module: every tile is located by its index (`core.atlas_tile_index`) and
+        the file's own layout (the kvtiles_v1 offset index, or the dense_v1 offset
+        formula) and nothing else, so if the header and the file disagree the
+        picture comes out wrong rather than quietly plausible.
         """
-        path = self.atlas_path(kind)
-        if path is None:
-            raise FileNotFoundError(f"export has no {kind} atlas")
-        levels = self.atlas_levels(kind)
-        if level < 0 or level >= levels:
-            raise ValueError(f"{kind} atlas has {levels} level(s), not level {level}")
         lx, ly = self.leaf_tiles
         ts, tc = self.tile_samples, self.tile_cells
         tiles_x, tiles_y = core.tiles_at_level(lx, ly, level)
         SY, SX = self.level_shape(level)
-        bps = self.bytes_per_sample(kind)
-        dtype = _DTYPE_BY_BYTES[bps]
+        dtype = _DTYPE_BY_BYTES[self.bytes_per_sample(kind)]
         out = np.zeros((SY, SX), dtype=dtype)
-        tile_bytes = core.atlas_tile_bytes(ts, bps)
 
-        with open(path, "rb") as fh:
+        with self.open_atlas(kind) as r:
             for ty in range(tiles_y):
                 for tx in range(tiles_x):
-                    off = core.atlas_tile_offset(lx, ly, levels, ts,
-                                                 level, tx, ty, bps)
-                    fh.seek(off)
-                    buf = fh.read(tile_bytes)
-                    if len(buf) != tile_bytes:
-                        raise ValueError(
-                            f"{kind} atlas: short read for L{level} tile {tx},{ty} "
-                            f"at offset {off} — the file does not match the header")
-                    tile = np.frombuffer(buf, dtype=dtype).reshape(ts, ts)
+                    tile = r.read_tile(self.tile_index(kind, level, tx, ty))
                     r0, c0, _ = core.north_up_tile_slice(SY, tc, tx, ty)
                     out[r0:r0 + ts, c0:c0 + ts] = tile
         return out
@@ -302,10 +317,16 @@ def list_exports(root: Optional[str] = None) -> list:
 
 def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
     """
-    Verify each atlas against the manifest header: exact file size, and that a
-    sample of computed tile offsets each yield a full tileBytes block inside the
-    file. A size mismatch means the tile grid was not dense, which would silently
-    misalign every tile past the gap for a reader using pure arithmetic.
+    Verify each atlas against the manifest header.
+
+    dense_v1: exact file size, and that a sample of computed tile offsets each
+    yield a full tileBytes block inside the file. A size mismatch means the tile
+    grid was not dense, which would silently misalign every tile past the gap for
+    a reader using pure arithmetic.
+
+    kvtiles_v1: the header agrees with the manifest (tile count, raw tile bytes,
+    bytes per sample), the offset index is monotonic and ends at the file length,
+    and a sample of tiles per level decodes to a full raw tile.
     """
     lx, ly = exp.leaf_tiles
     ts = exp.tile_samples
@@ -313,7 +334,7 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
     expect = core.atlas_total_bytes(lx, ly, exp.num_levels, ts)
 
     rng = np.random.default_rng(0)
-    # `expected_bytes` / `tile_bytes` describe the 2-byte atlases; each entry
+    # `expected_bytes` / `tile_bytes` describe the RAW 2-byte atlases; each entry
     # carries its own, since labels.atlas is 4 bytes per sample.
     report = {"expected_bytes": expect, "tile_bytes": tile_bytes,
               "atlases": [], "ok": True}
@@ -335,28 +356,59 @@ def check_atlas(exp: Export, *, samples_per_level: int = 8) -> dict:
         actual = os.path.getsize(path)
         entry["bytes"] = actual
         entry["bytes_per_sample"] = bps
-        entry["expected_bytes"] = a_expect
-        entry["size_ok"] = (actual == a_expect)
+        entry["raw_bytes"] = a_expect
         entry["offsets_checked"] = 0
         entry["short_reads"] = []
+        kvtiles = tilepack.is_kvtiles(path)
+        entry["format"] = tilepack.FORMAT if kvtiles else tilepack.DENSE_FORMAT
 
-        if entry["size_ok"]:
-            with open(path, "rb") as fh:
-                for lvl in range(levels):
-                    tx, ty = core.tiles_at_level(lx, ly, lvl)
-                    coords = [(x, y) for y in range(ty) for x in range(tx)]
-                    pick = rng.choice(len(coords),
-                                      size=min(samples_per_level, len(coords)),
-                                      replace=False)
-                    for idx in pick:
-                        x, y = coords[int(idx)]
-                        off = core.atlas_tile_offset(lx, ly, levels, ts,
-                                                     lvl, x, y, bps)
-                        fh.seek(off)
-                        if len(fh.read(a_tile_bytes)) != a_tile_bytes:
-                            entry["short_reads"].append(
-                                {"level": lvl, "x": x, "y": y, "offset": off})
-                        entry["offsets_checked"] += 1
+        if kvtiles:
+            try:
+                reader = exp.open_atlas(kind)
+            except Exception as e:      # noqa: BLE001
+                entry["error"] = str(e)
+                entry["size_ok"] = False
+            else:
+                entry["size_ok"] = True
+                entry["filter"] = tilepack.FILTER_NAMES[reader.filter]
+                with reader:
+                    for lvl in range(levels):
+                        tx, ty = core.tiles_at_level(lx, ly, lvl)
+                        coords = [(x, y) for y in range(ty) for x in range(tx)]
+                        pick = rng.choice(len(coords),
+                                          size=min(samples_per_level, len(coords)),
+                                          replace=False)
+                        for idx in pick:
+                            x, y = coords[int(idx)]
+                            i = core.atlas_tile_index(lx, ly, lvl, x, y)
+                            try:
+                                ok = len(reader.read_tile_bytes(i)) == a_tile_bytes
+                            except Exception:      # noqa: BLE001
+                                ok = False
+                            if not ok:
+                                entry["short_reads"].append(
+                                    {"level": lvl, "x": x, "y": y, "tile": i})
+                            entry["offsets_checked"] += 1
+        else:
+            entry["expected_bytes"] = a_expect
+            entry["size_ok"] = (actual == a_expect)
+            if entry["size_ok"]:
+                with open(path, "rb") as fh:
+                    for lvl in range(levels):
+                        tx, ty = core.tiles_at_level(lx, ly, lvl)
+                        coords = [(x, y) for y in range(ty) for x in range(tx)]
+                        pick = rng.choice(len(coords),
+                                          size=min(samples_per_level, len(coords)),
+                                          replace=False)
+                        for idx in pick:
+                            x, y = coords[int(idx)]
+                            off = core.atlas_tile_offset(lx, ly, levels, ts,
+                                                         lvl, x, y, bps)
+                            fh.seek(off)
+                            if len(fh.read(a_tile_bytes)) != a_tile_bytes:
+                                entry["short_reads"].append(
+                                    {"level": lvl, "x": x, "y": y, "offset": off})
+                            entry["offsets_checked"] += 1
 
         entry["ok"] = entry["size_ok"] and not entry["short_reads"]
         report["ok"] &= entry["ok"]
@@ -546,15 +598,27 @@ def check_water(exp: Export) -> dict:
 
     # ---- water_id atlas ----------------------------------------------------- #
     wid_path = exp.atlas_path("water_id")
-    if wid_path:
+    if wid_path and not tilepack.is_kvtiles(wid_path):
         lx, ly = exp.leaf_tiles
         expect = core.atlas_total_bytes(lx, ly, exp.num_levels, exp.tile_samples)
         actual = os.path.getsize(wid_path)
         report["water_id"] = {"bytes": actual, "expected_bytes": expect,
-                              "ok": actual == expect}
+                              "format": tilepack.DENSE_FORMAT, "ok": actual == expect}
         if actual != expect:
             report["errors"].append(
                 f"water_id atlas is {actual} bytes, expected {expect}")
+    elif wid_path:
+        actual = os.path.getsize(wid_path)
+        try:
+            exp.open_atlas("water_id").close()
+        except Exception as e:      # noqa: BLE001
+            report["water_id"] = {"bytes": actual, "format": tilepack.FORMAT,
+                                  "ok": False}
+            report["errors"].append(f"water_id atlas: {e}")
+        else:
+            report["water_id"] = {"bytes": actual, "format": tilepack.FORMAT,
+                                  "tiles": exp.atlas_tile_count("water_id"),
+                                  "ok": True}
     elif exp.manifest.get("water_id"):
         report["errors"].append("manifest names a water_id atlas that is not there")
 
@@ -954,16 +1018,13 @@ def check_against_point_api(exp: Export, *, n: int = 12, session=None,
     pick = rng.choice(len(coords), min(n, len(coords)), replace=False)
 
     sess = session or requests.Session()
-    tile_bytes = core.atlas_tile_bytes(ts)
     out = {"quantisation_m": (hmax - hmin) / 65535.0, "samples": [],
            "errors": [], "ok": True}
 
-    with open(path, "rb") as fh:
+    with exp.open_atlas("height") as reader:
         for k, idx in enumerate(pick):
             x, y = coords[int(idx)]
-            off = core.atlas_tile_offset(lx, ly, exp.num_levels, ts, 0, x, y)
-            fh.seek(off)
-            a16 = np.frombuffer(fh.read(tile_bytes), dtype="<u2").reshape(ts, ts)
+            a16 = reader.read_tile(core.atlas_tile_index(lx, ly, 0, x, y))
 
             i = int(rng.integers(0, tc + 1))
             j = int(rng.integers(0, tc + 1))
@@ -1015,12 +1076,8 @@ def _class_at(exp: Export, X: float, Y: float) -> str:
     if not (0 <= i <= lx * tc and 0 <= j <= ly * tc):
         return "outside"
     tx, ty = min(i // tc, lx - 1), min(j // tc, ly - 1)
-    off = core.atlas_tile_offset(lx, ly, exp.num_levels, ts, 0, tx, ty)
     try:
-        with open(path, "rb") as fh:
-            fh.seek(off)
-            tile = np.frombuffer(fh.read(core.atlas_tile_bytes(ts)),
-                                 dtype="<u2").reshape(ts, ts)
+        tile = exp.read_tile("water_id", 0, tx, ty)
     except Exception:      # noqa: BLE001
         return "unknown"
     from . import waterid

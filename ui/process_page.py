@@ -806,8 +806,10 @@ def render() -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Tiles", f"{state['tiles']:,}")
     c2.metric("Vertical range", f"{state['hmin']:.0f} – {state['hmax']:.0f} m")
-    c3.metric("Atlas", W.fmt_bytes(atlas["height_bytes"]),
-              help="heights.atlas; surface.atlas and water_id.atlas are the same size")
+    c3.metric("Atlas", W.fmt_bytes((atlas.get("file_bytes") or {}).get(
+                  atlas["height_file"], atlas["height_bytes"])),
+              help="heights.atlas on disk (lz4 per tile); "
+                   f"{W.fmt_bytes(atlas['height_bytes'])} decoded")
     c4.metric("Took", f"{state['elapsed']:.0f} s")
     st.success(f"Written to `{state['out_dir']}`")
 

@@ -78,14 +78,92 @@ def test_check_hierarchy_catches_a_corrupt_label(export_dir, tmp_path):
     shutil.copytree(export_dir, bad)
     exp = exports.load(bad)
     lx, ly = exp.leaf_tiles
-    off = core.atlas_tile_offset(lx, ly, exp.num_levels, exp.tile_samples, 1, 0, 0, 4)
-    with open(os.path.join(bad, "labels.atlas"), "r+b") as fh:
-        fh.seek(off + 4 * (exp.tile_samples + 1))
-        v = np.frombuffer(fh.read(4), "<u4")[0]
-        fh.seek(off + 4 * (exp.tile_samples + 1))
-        fh.write(np.uint32(v + 1).tobytes())
+    # Bump one level-1 label, writing the atlas back in the dense_v1 layout
+    # (which the reader still accepts) so the edit is a plain byte change.
+    target = core.atlas_tile_index(lx, ly, 1, 0, 0)
+    with exp.open_atlas("labels") as r:
+        tiles = [r.read_tile(i).copy() for i in range(r.tile_count)]
+    tiles[target].flat[exp.tile_samples + 1] += 1
+    with open(os.path.join(bad, "labels.atlas"), "wb") as fh:
+        for t in tiles:
+            fh.write(t.astype("<u4").tobytes())
     rep = exports.check_hierarchy(exports.load(bad))
     assert not rep["ok"]
+
+
+def test_atlases_are_kvtiles(export_dir):
+    from kvterrain import tilepack
+    m = json.load(open(os.path.join(export_dir, "manifest.json")))
+    atlas = m["atlas"]
+    assert atlas["format"] == "kvtiles_v1"
+    assert m["flow_direction"]["format"] == "kvtiles_v1_level0"
+    assert "offset index" in m["flow_direction"]["tile_offset"]
+    assert atlas["tile_filter"]["heights.atlas"] == "delta_split"
+    for fn in atlas["bytes_per_sample"]:
+        path = os.path.join(export_dir, fn)
+        assert tilepack.is_kvtiles(path)
+        assert atlas["file_bytes"][fn] == os.path.getsize(path)
+        if fn != "heights.atlas":
+            assert atlas["tile_filter"][fn] == "none"
+    assert atlas["height_bytes"] == core.atlas_total_bytes(
+        *m["leaf_tiles"], m["num_levels"], m["tile_samples"])
+
+
+def _write_dense_copy(src, dst):
+    """The same export with every atlas written in the old dense_v1 layout."""
+    import shutil
+    from kvterrain import tilepack
+    shutil.copytree(src, dst)
+    exp = exports.load(dst)
+    for kind in exports.ATLAS_KINDS:
+        path = exp.atlas_path(kind)
+        if not path:
+            continue
+        with exp.open_atlas(kind) as r:
+            raw = b"".join(r.read_tile_bytes(i) for i in range(r.tile_count))
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        assert not tilepack.is_kvtiles(path)
+    return exp
+
+
+def test_dense_exports_still_read_and_pack_back(export_dir, tmp_path):
+    from kvterrain import tilepack
+    dense = _write_dense_copy(export_dir, str(tmp_path / "dense"))
+    assert exports.check_atlas(dense)["ok"]
+    assert exports.check_water(dense)["ok"]
+    assert exports.check_hierarchy(dense)["ok"]
+    new = exports.load(export_dir)
+    for kind in exports.ATLAS_KINDS:
+        if new.atlas_path(kind):
+            for lvl in range(new.atlas_levels(kind)):
+                assert np.array_equal(dense.read_level(kind, lvl), new.read_level(kind, lvl))
+
+    # A Unity-style sidecar must ride along unchanged.
+    with open(os.path.join(dense.root, "heights.atlas.meta"), "w") as fh:
+        fh.write("guid: 0123\n")
+    before = {fn: open(os.path.join(dense.root, fn), "rb").read()
+              for fn in os.listdir(dense.root)}
+    out = str(tmp_path / "packed")
+    rep = tilepack.pack_export(dense.root, out)
+    after = {fn: open(os.path.join(dense.root, fn), "rb").read()
+             for fn in os.listdir(dense.root)}
+    assert before == after                                  # the source is untouched
+    assert set(rep["atlases"]) == set(dense.manifest["atlas"]["bytes_per_sample"])
+    for fn, data in before.items():
+        if fn in rep["atlases"] or fn == "manifest.json":
+            continue
+        assert open(os.path.join(out, fn), "rb").read() == data
+    packed = exports.load(out)
+    assert packed.manifest["atlas"]["format"] == "kvtiles_v1"
+    assert packed.manifest["flow_direction"]["format"] == "kvtiles_v1_level0"
+    assert exports.check_atlas(packed)["ok"]
+    assert exports.check_water(packed)["ok"]
+    assert exports.check_hierarchy(packed)["ok"]
+    for fn in rep["atlases"]:
+        assert tilepack.is_kvtiles(os.path.join(out, fn))
+    with pytest.raises(ValueError):
+        tilepack.pack_export(dense.root, out)               # refuses a non-empty dst
 
 
 def test_cropped_lake_ramps_to_its_level_at_the_map_edge():

@@ -941,8 +941,11 @@ def export_labels_atlas(plan: core.GridPlan, label_levels: list, out_dir: str,
     TS = TC + 1
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, atlas_name)
-    tiles = 0
-    with open(path, "wb") as fh:
+    from . import tilepack
+    tiles = core.atlas_tile_count(plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels)
+    with tilepack.TileWriter(path, tiles,
+                             core.atlas_tile_bytes(TS, LABELS_BYTES_PER_SAMPLE),
+                             LABELS_BYTES_PER_SAMPLE) as w:
         for lvl, arr in enumerate(label_levels):
             tx_n, ty_n = core.tiles_at_level(plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
             SY = arr.shape[0]
@@ -951,13 +954,8 @@ def export_labels_atlas(plan: core.GridPlan, label_levels: list, out_dir: str,
                     r0, c0, _ = core.north_up_tile_slice(SY, TC, tx, ty)
                     tile = np.ascontiguousarray(arr[r0:r0 + TS, c0:c0 + TS], dtype="<u4")
                     assert tile.shape == (TS, TS), f"bad labels slice L{lvl} {tx},{ty}"
-                    tile.tofile(fh)
-                    tiles += 1
-    expect = core.atlas_total_bytes(plan.leaf_tiles_x, plan.leaf_tiles_y,
-                                    plan.num_levels, TS, LABELS_BYTES_PER_SAMPLE)
+                    w.write(tile)
     actual = os.path.getsize(path)
-    if actual != expect:
-        raise RuntimeError(f"dense labels atlas size mismatch: {actual} != {expect}")
     return {"atlas_file": atlas_name, "bytes": actual, "tiles_written": tiles}
 
 
@@ -1042,9 +1040,9 @@ def manifest_block(h: Hierarchy, *, hier_file: dict, labels: dict,
             "row_order": "north_to_south",
             "value": "leaf node id the sample drains into; 0 = drains straight off "
                      "the map",
-            "offsets": "same arithmetic as every atlas with bytes_per_sample = 4: a "
-                       "label tile has the same TILE INDEX as its height twin but "
-                       "not the same byte offset",
+            "offsets": "a label tile has the same TILE INDEX as its height twin; "
+                       "its byte range comes from the file's kvtiles_v1 offset "
+                       "index, and it decodes to tile_samples^2 * 4 bytes",
             "downsample": "level L sample = label of the child with the lowest "
                           "heights.atlas code at level L-1 in the corner-anchored "
                           "3x3 gather (edge-clamped), ties to the lower label",

@@ -329,15 +329,18 @@ def test_labels_atlas_round_trip(tmp_path):
     code_levels = [codes, codes[::2, ::2]]
     levels = H.build_label_pyramid(h.labels, code_levels)
     info = H.export_labels_atlas(plan, levels, str(tmp_path))
+    from kvterrain import tilepack
     ts = plan.tile_cells + 1
-    raw = np.fromfile(tmp_path / H.LABELS_FILE, dtype="<u4")
-    for lvl, arr in enumerate(levels):
-        tx_n, ty_n = core.tiles_at_level(plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
-        for ty in range(ty_n):
-            for tx in range(tx_n):
-                off = core.atlas_tile_offset(plan.leaf_tiles_x, plan.leaf_tiles_y,
-                                             plan.num_levels, ts, lvl, tx, ty, 4)
-                tile = raw[off // 4: off // 4 + ts * ts].reshape(ts, ts)
-                r0, c0, _ = core.north_up_tile_slice(arr.shape[0], plan.tile_cells, tx, ty)
-                assert (tile == arr[r0:r0 + ts, c0:c0 + ts]).all()
-    assert info["bytes"] == raw.nbytes
+    path = str(tmp_path / H.LABELS_FILE)
+    assert tilepack.is_kvtiles(path)
+    count = core.atlas_tile_count(plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels)
+    with tilepack.AtlasReader(path, core.atlas_tile_bytes(ts, 4), 4, count) as r:
+        for lvl, arr in enumerate(levels):
+            tx_n, ty_n = core.tiles_at_level(plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
+            for ty in range(ty_n):
+                for tx in range(tx_n):
+                    tile = r.read_tile(core.atlas_tile_index(
+                        plan.leaf_tiles_x, plan.leaf_tiles_y, lvl, tx, ty))
+                    r0, c0, _ = core.north_up_tile_slice(arr.shape[0], plan.tile_cells, tx, ty)
+                    assert (tile == arr[r0:r0 + ts, c0:c0 + ts]).all()
+    assert info["bytes"] == os.path.getsize(path)
