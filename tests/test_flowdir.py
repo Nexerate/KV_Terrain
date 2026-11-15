@@ -1,5 +1,7 @@
 """Flat-resolved D8 directions, accumulation and wire formats."""
 
+import os
+
 import numpy as np
 
 from kvterrain import core, flowdir as F, hierarchy as H
@@ -73,7 +75,16 @@ def test_flowdir_atlas_and_catchments_round_trip(tmp_path):
     codes = (100 - r - c).astype(np.uint16)
     flow = F.build_flow_directions(codes)
     info = F.export_flowdir_atlas(plan, flow, str(tmp_path))
-    assert info["bytes"] == 4 * 5 * 5
+    from kvterrain import tilepack
+    path = str(tmp_path / F.FLOWDIR_FILE)
+    assert info["bytes"] == os.path.getsize(path)
+    assert info["format"] == "kvtiles_v1_level0"
+    with tilepack.AtlasReader(path, 5 * 5, 1, 4) as rd:
+        for ty in range(2):
+            for tx in range(2):
+                r0, c0, _ = core.north_up_tile_slice(plan.samples_y, 4, tx, ty)
+                assert np.array_equal(rd.read_tile(ty * 2 + tx),
+                                      flow[r0:r0 + 5, c0:c0 + 5])
 
     h = H.build_hierarchy(codes, 0.0, 65535.0, spacing_m=5.0)
     area, report = F.node_catchment_areas(flow, h.labels, h.nodes, 5.0)

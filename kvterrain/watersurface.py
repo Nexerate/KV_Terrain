@@ -438,9 +438,13 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
     TC = plan.tile_cells
     TS = TC + 1
 
+    from . import tilepack
+
     os.makedirs(out_dir, exist_ok=True)
-    tiles_written = 0
-    with open(os.path.join(out_dir, atlas_name), "wb") as atlas_fh:
+    tile_count = core.atlas_tile_count(plan.leaf_tiles_x, plan.leaf_tiles_y,
+                                       plan.num_levels)
+    with tilepack.TileWriter(os.path.join(out_dir, atlas_name), tile_count,
+                             core.atlas_tile_bytes(TS), 2) as atlas_w:
         for lvl, surf in enumerate(surface_levels):
             tiles_x, tiles_y = core.tiles_at_level(
                 plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
@@ -449,20 +453,16 @@ def export_surface_tiles(plan: core.GridPlan, surface_levels: list, out_dir: str
                 for tx in range(tiles_x):
                     r0, c0, _ = core.north_up_tile_slice(SY, TC, tx, ty)
                     tile = surf[r0:r0 + TS, c0:c0 + TS]
-                    pack_surface_u16(tile, hmin, hmax).tofile(atlas_fh)
-                    tiles_written += 1
-
-    expect = core.atlas_total_bytes(
-        plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
+                    if tile.shape != (TS, TS):
+                        raise RuntimeError(f"bad surface slice {tile.shape} L{lvl} {tx},{ty}")
+                    atlas_w.write(pack_surface_u16(tile, hmin, hmax))
+    tiles_written = tile_count
     actual = os.path.getsize(os.path.join(out_dir, atlas_name))
-    if actual != expect:
-        raise RuntimeError(
-            f"dense surface atlas size mismatch: {atlas_name} is {actual} "
-            f"bytes, expected {expect}. The surface tile grid was not dense.")
 
     manifest = {
         "atlas_file": atlas_name,
         "atlas_format": core.ATLAS_FORMAT,
+        "bytes": actual,
         "dtype": "u16le",
         "packing": "same [height_min_m, height_max_m] as the height atlas, mapped to [0,65534]",
         "nodata_code": int(SURFACE_NODATA_U16),

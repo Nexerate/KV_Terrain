@@ -504,7 +504,10 @@ def north_up_tile_slice(SY: int, tile_cells: int, tx: int, ty: int) -> tuple[int
 # the per-tile files (LE u16, tile_samples², north->south rows).               #
 # --------------------------------------------------------------------------- #
 
-ATLAS_FORMAT = "dense_v1"
+# Since kvtiles_v1 every atlas this tool writes is per-tile lz4 compressed with an
+# offset index (see `tilepack`); "dense_v1" exports are still read.
+ATLAS_FORMAT = "kvtiles_v1"
+DENSE_ATLAS_FORMAT = "dense_v1"
 ATLAS_HEIGHT_FILE = "heights.atlas"
 ATLAS_SURFACE_FILE = "surface.atlas"
 
@@ -571,6 +574,23 @@ def atlas_tile_offset(
     return base + (int(y) * tx + int(x)) * atlas_tile_bytes(tile_samples, bytes_per_sample)
 
 
+def atlas_tile_count(leaf_tiles_x: int, leaf_tiles_y: int, num_levels: int) -> int:
+    """Tiles in an atlas holding `num_levels` levels."""
+    n = 0
+    for lvl in range(int(num_levels)):
+        tx, ty = tiles_at_level(leaf_tiles_x, leaf_tiles_y, lvl)
+        n += tx * ty
+    return n
+
+
+def atlas_tile_index(leaf_tiles_x: int, leaf_tiles_y: int, level: int,
+                     x: int, y: int) -> int:
+    """Index of tile (x, y) at `level` in the atlas tile sequence (levels
+    ascending, row-major within a level). The same in every atlas and layout."""
+    tx, _ = tiles_at_level(leaf_tiles_x, leaf_tiles_y, level)
+    return atlas_tile_count(leaf_tiles_x, leaf_tiles_y, level) + int(y) * tx + int(x)
+
+
 def resolve_height_range(
     leaf: np.ndarray,
     height_min: Optional[float] = None,
@@ -625,13 +645,17 @@ def export_tiles(
     height_min, height_max = resolve_height_range(levels[0], height_min, height_max)
 
     os.makedirs(out_dir, exist_ok=True)
-    tiles_written = 0
+    from . import tilepack
 
-    # One dense blob for the whole export. Tiles are written in level-then-row-major order
-    # (L0 finest first; within a level, y outer, x inner), which is exactly the §4 offset
-    # layout — so a plain sequential append reproduces it with no seeking. The runtime reads
-    # any tile back by pure arithmetic (levelByteBase[L] + (y*tilesX + x)*tileBytes).
-    with open(os.path.join(out_dir, atlas_name), "wb") as atlas_fh:
+    # One atlas for the whole export. Tiles are written in level-then-row-major order
+    # (L0 finest first; within a level, y outer, x inner) — the tile index every
+    # reader computes with `atlas_tile_index`. Each tile is lz4-compressed after the
+    # delta_split filter; the file's offset index locates it (see `tilepack`).
+    expect = atlas_total_bytes(plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
+    tile_count = atlas_tile_count(plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels)
+    with tilepack.TileWriter(os.path.join(out_dir, atlas_name), tile_count,
+                             atlas_tile_bytes(TS), DEFAULT_BYTES_PER_SAMPLE,
+                             tilepack.FILTER_DELTA_SPLIT) as atlas_w:
         for lvl, arr in enumerate(levels):
             tiles_x, tiles_y = tiles_at_level(plan.leaf_tiles_x, plan.leaf_tiles_y, lvl)
             arr_filled = np.where(np.isfinite(arr), arr, nodata_fill_m)
@@ -641,20 +665,11 @@ def export_tiles(
                     r_lo, i0, _ = north_up_tile_slice(SY, TC, tx, ty)
                     sub = arr_filled[r_lo:r_lo + TS, i0:i0 + TS]
                     assert sub.shape == (TS, TS), f"bad slice {sub.shape} L{lvl} {tx},{ty}"
-                    pack_r16(sub, height_min, height_max).tofile(atlas_fh)
-                    tiles_written += 1
-
-    # Fail LOUDLY if the grid wasn't dense: the runtime reads by pure arithmetic and a
-    # short/long file would silently misalign every tile past the gap. Guardrail for the
-    # ragged-edge (border) case — though this exporter is dense by construction.
-    expect = atlas_total_bytes(plan.leaf_tiles_x, plan.leaf_tiles_y, plan.num_levels, TS)
-    actual = os.path.getsize(os.path.join(out_dir, atlas_name))
-    if actual != expect:
-        raise RuntimeError(
-            f"dense atlas size mismatch: {atlas_name} is {actual} bytes, expected "
-            f"{expect} (tileBytes={atlas_tile_bytes(TS)} * "
-            f"{expect // atlas_tile_bytes(TS)} tiles). The tile grid was not dense — "
-            f"the arithmetic offset path would misalign.")
+                    atlas_w.write(pack_r16(sub, height_min, height_max))
+        # The writer's close() refuses a file that did not get exactly tile_count
+        # tiles: a short grid would misalign every tile index past the gap.
+    tiles_written = tile_count
+    file_bytes = os.path.getsize(os.path.join(out_dir, atlas_name))
 
     manifest = {
         "format": "kvterrain-atlas-r16/1",
@@ -680,10 +695,17 @@ def export_tiles(
             "format": ATLAS_FORMAT,
             "height_file": atlas_name,
             "tile_bytes": atlas_tile_bytes(TS),
+            # RAW (decoded) bytes of the height atlas, as in dense_v1; the file
+            # itself is `file_bytes[height_file]`.
             "height_bytes": expect,
+            "tile_count": tile_count,
             # Per atlas file. Every atlas before labels.atlas is 2; readers must
             # use this, not tile_bytes, for any atlas they did not already know.
+            # Raw bytes per decoded sample.
             "bytes_per_sample": {atlas_name: DEFAULT_BYTES_PER_SAMPLE},
+            "file_bytes": {atlas_name: file_bytes},
+            "tile_filter": {atlas_name: tilepack.FILTER_NAMES[tilepack.FILTER_DELTA_SPLIT]},
+            "compression": tilepack.compression_block(),
         },
     }
 

@@ -89,29 +89,49 @@ out/
 The last three are written when water is processed and `--hierarchy` is on (the
 default).
 
-### The dense atlas format (`dense_v1`)
+### The atlas format (`kvtiles_v1`)
 
-Each `.atlas` file is **every tile of every pyramid level concatenated**, with no
-header and no offset table: the offsets follow from `manifest.json` alone. The
-helpers in `kvterrain/core.py` (`tiles_at_level`, `atlas_tile_offset`, …) ARE the
-format contract, and the runtime must match them exactly.
+Each `.atlas` file holds **every tile of every pyramid level** (flowdir: level 0
+only) in one fixed order — levels ascending (L0 finest first), row-major within a
+level — so a tile's **index** follows from `manifest.json` alone:
 
 ```
-tile_samples        = tile_cells + 1                       (default 129)
-tileBytes           = tile_samples * tile_samples * bytesPerSample
+tile_samples         = tile_cells + 1                      (default 129)
+tileRawBytes         = tile_samples * tile_samples * bytesPerSample
 tilesX(L), tilesY(L) = max(1, leaf_tiles >> L)
-levelByteBase(L)    = tileBytes * Σ_{l<L} tilesX(l) * tilesY(l)
-tileOffset(L, x, y) = levelByteBase(L) + (y * tilesX(L) + x) * tileBytes
+tileIndex(L, x, y)   = Σ_{l<L} tilesX(l) * tilesY(l) + y * tilesX(L) + x
 ```
 
-Levels ascend (L0 finest first); tiles within a level are row-major. Bytes per
-sample is recorded per file in `manifest.atlas.bytes_per_sample`. `heights`,
-`surface` and `water_id` are **2 bytes per sample**, so a tile sits at the
-**identical byte offset** in each of them. `labels.atlas` is **4 bytes per
-sample**: its tiles are at the same **tile index** but at twice the byte offset.
-The `core.atlas_*` helpers take `bytes_per_sample` (default 2). Offsets exceed 32
-bits on real exports, so use 64-bit arithmetic. Every atlas's size is checked
-against `atlas_total_bytes` when it is written.
+The tile index is the same in every atlas. Each tile is compressed on its own
+and the file says where it is (`kvterrain/tilepack.py` is the contract), all
+little-endian:
+
+```
+header, 32 bytes   magic "KVTILE01", u32 version = 1, u32 header_bytes = 32,
+                   u32 tile_count, u32 tile_raw_bytes, u32 bytes_per_sample,
+                   u32 filter (0 none, 1 delta_split)
+index              (tile_count + 1) u64 absolute file offsets; tile i is bytes
+                   [off[i], off[i+1]), off[tile_count] == file length
+payload            lz4 block (HC level 9, no size prefix) of the filtered tile,
+                   or the filtered tile itself when lz4 would not be smaller:
+                   a payload of exactly tile_raw_bytes is stored, shorter is lz4
+```
+
+Filter 1, `delta_split`, is used by `heights.atlas` only: over the tile's u16
+samples `a[r][c]` (rows north → south), `d[0][0] = a[0][0]`, `d[r][0] = a[r][0] −
+a[r−1][0]`, `d[r][c] = a[r][c] − a[r][c−1]`, all mod 2¹⁶; then every low byte of
+`d` in sample order, followed by every high byte. Every other atlas uses filter 0.
+`manifest.atlas.tile_filter` and `manifest.atlas.file_bytes` record both per file.
+
+Bytes per sample (of the **decoded** tile) is recorded per file in
+`manifest.atlas.bytes_per_sample`: `heights`, `surface` and `water_id` are 2,
+`labels` 4, `flowdir` 1. `atlas.height_bytes` stays the decoded size of the height
+atlas. Offsets exceed 32 bits on real exports, so use 64-bit arithmetic.
+
+Exports written before this (`atlas.format = "dense_v1"`) have no header and no
+index — tile i is simply at `i * tileRawBytes` — and are still read everywhere in
+this tool. `python -m kvterrain.cli pack-atlases <src> <dst>` converts one, copying
+every other file unchanged and checking every tile decodes byte-identical.
 
 - **`heights.atlas`** — little-endian **uint16**, `tile_samples²` per tile, rows
   **north → south**. Packed against one **global** `[height_min_m,

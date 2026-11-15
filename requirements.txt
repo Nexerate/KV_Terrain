@@ -6,6 +6,8 @@ requests>=2.31
 scipy>=1.11
 # depression hierarchy and water audit (Priority-Flood kernels)
 numba>=0.61
+# per-tile lz4 compression of the atlases (kvtiles_v1, see kvterrain/tilepack.py)
+lz4>=4.3
 # water pipeline (rivers/lakes -> raster masks); affine ships with rasterio
 shapely>=2.0
 # UI

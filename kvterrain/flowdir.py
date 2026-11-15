@@ -264,31 +264,30 @@ def export_flowdir_atlas(plan: core.GridPlan, flow: np.ndarray, out_dir: str,
     TS = TC + 1
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, file_name)
-    with open(path, "wb") as fh:
+    from . import tilepack
+    with tilepack.TileWriter(path, plan.leaf_tiles_x * plan.leaf_tiles_y, TS * TS,
+                             FLOWDIR_BYTES_PER_SAMPLE) as w:
         for ty in range(plan.leaf_tiles_y):
             for tx in range(plan.leaf_tiles_x):
                 r0, c0, _ = core.north_up_tile_slice(plan.samples_y, TC, tx, ty)
                 tile = np.ascontiguousarray(dirs[r0:r0 + TS, c0:c0 + TS], dtype=np.uint8)
                 if tile.shape != (TS, TS):
                     raise RuntimeError(f"bad flowdir tile {tile.shape} at {tx},{ty}")
-                tile.tofile(fh)
-    expected = (plan.leaf_tiles_x * plan.leaf_tiles_y * TS * TS)
+                w.write(tile)
     actual = os.path.getsize(path)
-    if actual != expected:
-        raise RuntimeError(f"flowdir atlas size mismatch: {actual} != {expected}")
     encoding = {"terminal_pit_or_off_map": FLOWDIR_TERMINAL}
     encoding.update({name: i + 1 for i, name in enumerate(D8_NAMES)})
     return {
         "file": file_name,
         "bytes": actual,
-        "format": "dense_v1_level0",
+        "format": tilepack.FORMAT + "_level0",
         "dtype": "u8",
         "bytes_per_sample": FLOWDIR_BYTES_PER_SAMPLE,
         "levels": 1,
         "level0_only": True,
         "row_order": "north_to_south",
         "tile_order": "row_major; tile index = tile_y * leaf_tiles_x + tile_x",
-        "tile_offset": "(tile_y * leaf_tiles_x + tile_x) * tile_samples^2",
+        "tile_offset": tilepack.flowdir_layout(actual)["tile_offset"],
         "encoding": encoding,
         "direction_order": "clockwise from north; row 0 is north",
         "terminal": "0 on every map-edge sample and on the lowest row-major "
